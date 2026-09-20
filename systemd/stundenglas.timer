@@ -1,0 +1,15 @@
+[Unit]
+Description=Check WebUntis for timetable changes
+
+[Timer]
+# Every 30 minutes, and once shortly after boot so a machine that was off
+# overnight catches up. Substitutions are usually published a day ahead, so
+# this is comfortably "live" without hammering the school's server.
+OnBootSec=3min
+OnUnitActiveSec=30min
+# Spread the load so every run doesn't hit exactly on the half hour.
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target

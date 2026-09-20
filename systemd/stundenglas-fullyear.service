@@ -1,0 +1,11 @@
+[Unit]
+Description=Sync the whole WebUntis school year
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/stundenglas --dir %h/.config/stundenglas --all-year
+TimeoutStartSec=10min
+Restart=on-failure
+RestartSec=300

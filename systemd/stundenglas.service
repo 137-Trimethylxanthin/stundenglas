@@ -1,0 +1,15 @@
+[Unit]
+Description=Keep the WebUntis timetable in step with Google Calendar
+Documentation=https://github.com/OWNER/stundenglas
+# Don't bother starting when the machine is offline.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/stundenglas --dir %h/.config/stundenglas --weeks 4
+# Untis or Google can be briefly unavailable; retry rather than wait for the
+# next timer tick.
+TimeoutStartSec=10min
+Restart=on-failure
+RestartSec=120

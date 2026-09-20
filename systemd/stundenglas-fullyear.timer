@@ -1,0 +1,12 @@
+[Unit]
+Description=Nightly full-school-year WebUntis sync
+
+[Timer]
+# The 30-minute timer only looks 4 weeks ahead. Once a night, pull the whole
+# school year so newly published future lessons appear.
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
