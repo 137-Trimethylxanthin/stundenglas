@@ -1,0 +1,6 @@
+/target
+.env
+credentials.json
+client_secret*.json
+token.json
+out/
