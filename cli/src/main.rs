@@ -1,9 +1,9 @@
 //! Bringeth the WebUntis timetable into Google Calendar, and keepeth it so.
 
 mod config;
-mod gcal;
 mod oauth;
-mod untis;
+
+use stundenglas_core::{gcal, untis};
 
 use anyhow::{Context, Result};
 use chrono::{Duration, Local, NaiveDate, NaiveTime, TimeZone};
@@ -56,6 +56,10 @@ struct Args {
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u16).range(1..=32))]
     lanes: u16,
 
+    /// Write an iCalendar file instead of touching Google at all.
+    #[arg(long, value_name = "FILE")]
+    ics: Option<PathBuf>,
+
     /// Directory holding .env, credentials.json and token.json.
     #[arg(long, default_value = ".")]
     dir: PathBuf,
@@ -77,7 +81,7 @@ async fn run() -> Result<usize> {
     let args = Args::parse();
 
     let settings = Settings::load(&args.dir.join(".env"))?;
-    let mut untis = untis::Client::new(settings)?;
+    let mut untis = untis::Client::new(settings.into())?;
     untis.login().await.context("logging in to WebUntis")?;
 
     let (from, to) = window(&args, untis.year);
@@ -108,6 +112,18 @@ async fn run() -> Result<usize> {
         "Fetched : {} lessons ({cancelled} cancelled, {changed} changed, {events} events)",
         lessons.len()
     );
+
+    if let Some(path) = &args.ics {
+        let feed = stundenglas_core::ics::Feed {
+            name: &format!("Stundenplan {}", untis.person_name),
+            refresh_minutes: 60,
+            keep_cancelled: true,
+        };
+        let body = feed.render(&lessons, chrono::Utc::now());
+        std::fs::write(path, &body).with_context(|| format!("writing {}", path.display()))?;
+        println!("Wrote   : {} ({} bytes, {} events)", path.display(), body.len(), lessons.len());
+        return Ok(0);
+    }
 
     let http = reqwest::Client::builder()
         .user_agent(concat!("stundenglas/", env!("CARGO_PKG_VERSION")))

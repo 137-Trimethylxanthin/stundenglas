@@ -5,8 +5,6 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone};
 use chrono_tz::{Europe::Vienna, Tz};
 use serde::Deserialize;
 
-use crate::config::Settings;
-
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:155.0) Gecko/20100101 Firefox/155.0";
 
 /// WebUntis yieldeth bare wall-clock strings; the school's own iCal export
@@ -158,9 +156,35 @@ impl Absence {
     }
 }
 
+/// What is needed to speak to one WebUntis account.
+#[derive(Clone)]
+pub struct Credentials {
+    pub server: String,
+    pub school: String,
+    pub user: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("server", &self.server)
+            .field("school", &self.school)
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Credentials {
+    pub fn base_url(&self) -> String {
+        format!("https://{}", self.server)
+    }
+}
+
 pub struct Client {
     http: reqwest::Client,
-    settings: Settings,
+    settings: Credentials,
     base: String,
     bearer: Option<String>,
     pub person_id: i64,
@@ -169,7 +193,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(settings: Settings) -> Result<Self> {
+    pub fn new(settings: Credentials) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .cookie_store(true)

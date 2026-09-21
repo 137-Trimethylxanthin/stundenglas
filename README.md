@@ -61,6 +61,7 @@ stundenglas --dir ~/.config/stundenglas --dry-run   # show the plan, write nothi
 stundenglas --dir ~/.config/stundenglas             # 7 days back, 4 weeks ahead
 stundenglas --dir ~/.config/stundenglas --all-year
 stundenglas --dir ~/.config/stundenglas --from 2026-09-21 --to 2026-10-16
+stundenglas --dir ~/.config/stundenglas --all-year --ics plan.ics   # a file, no Google
 ```
 
 Writes only to a secondary calendar — **"Schule (Untis)"** by default,
@@ -98,11 +99,9 @@ serves a whole school year in one request.
 
 | | |
 |---|---|
-| `src/untis.rs` | WebUntis client, lessons and absences |
-| `src/gcal.rs` | Google Calendar: diffing, writing, backoff |
-| `src/oauth.rs` | installed-app flow and token refresh |
-| `src/config.rs` | configuration |
-| `src/main.rs` | command line |
+| `core/` | WebUntis client, iCalendar rendering, Google Calendar syncing |
+| `cli/` | the headless binary: no database, one account, files on disk |
+| `server/` | the multi-user service (in progress) |
 
 ```sh
 cargo test       # offline: id shapes, markers, absence overlap, DST, fingerprints

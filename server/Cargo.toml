@@ -1,0 +1,13 @@
+[package]
+name = "stundenglas-server"
+description = "Multi-user WebUntis sync service with per-user calendar feeds"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+stundenglas-core = { path = "../core" }
+anyhow.workspace = true
+tokio.workspace = true

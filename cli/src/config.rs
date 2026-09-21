@@ -61,8 +61,10 @@ impl Settings {
         }
         Ok(Self { server, school, user, password })
     }
+}
 
-    pub fn base_url(&self) -> String {
-        format!("https://{}", self.server)
+impl From<Settings> for stundenglas_core::Credentials {
+    fn from(s: Settings) -> Self {
+        Self { server: s.server, school: s.school, user: s.user, password: s.password }
     }
 }
