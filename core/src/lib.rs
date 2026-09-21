@@ -5,4 +5,4 @@ pub mod gcal;
 pub mod ics;
 pub mod untis;
 
-pub use untis::{Absence, Credentials, Lesson, Status, TZ};
+pub use untis::{Absence, Credentials, DEFAULT_TZ, Lesson, Stamp, Status};

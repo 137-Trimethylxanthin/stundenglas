@@ -3,9 +3,10 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
+use chrono_tz::Tz;
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
-use stundenglas_core::{Credentials, Lesson};
+use stundenglas_core::{Credentials, DEFAULT_TZ, Lesson};
 use uuid::Uuid;
 
 use crate::crypto::{KEY_VERSION, Sealed, Sealer};
@@ -27,6 +28,7 @@ pub struct UntisAccount {
     pub username: String,
     pub display_name: Option<String>,
     pub enabled: bool,
+    pub timezone: Tz,
 }
 
 /// An account together with what is needed to log in as it.
@@ -43,37 +45,49 @@ fn account_from(row: &PgRow) -> UntisAccount {
         username: row.get("username"),
         display_name: row.try_get("display_name").ok().flatten(),
         enabled: row.get("enabled"),
+        // A zone the database accepted but chrono-tz doth not know is not
+        // worth failing a sync over; fall back and carry on.
+        timezone: row
+            .try_get::<String, _>("timezone")
+            .ok()
+            .and_then(|name| name.parse().ok())
+            .unwrap_or(DEFAULT_TZ),
     }
 }
 
-pub async fn add_account(
-    pool: &PgPool,
-    sealer: &Sealer,
-    user_id: Uuid,
-    server: &str,
-    school: &str,
-    username: &str,
-    password: &str,
-) -> Result<UntisAccount> {
-    let sealed = sealer.seal(password)?;
+/// What a user giveth when linking a school, whether by form or by command.
+#[derive(Debug, Clone)]
+pub struct NewAccount {
+    pub user_id: Uuid,
+    pub server: String,
+    pub school: String,
+    pub username: String,
+    pub password: String,
+    pub timezone: Tz,
+}
+
+pub async fn add_account(pool: &PgPool, sealer: &Sealer, new: &NewAccount) -> Result<UntisAccount> {
+    let sealed = sealer.seal(&new.password)?;
     let row = sqlx::query(
         "insert into untis_accounts
-            (user_id, server, school, username, secret, nonce, key_version)
-         values ($1, $2, $3, $4, $5, $6, $7)
+            (user_id, server, school, username, secret, nonce, key_version, timezone)
+         values ($1, $2, $3, $4, $5, $6, $7, $8)
          on conflict (user_id, server, school, username) do update
             set secret = excluded.secret,
                 nonce = excluded.nonce,
                 key_version = excluded.key_version,
+                timezone = excluded.timezone,
                 enabled = true
-         returning id, user_id, server, school, username, display_name, enabled",
+         returning id, server, school, username, display_name, enabled, timezone",
     )
-    .bind(user_id)
-    .bind(server)
-    .bind(school)
-    .bind(username)
+    .bind(new.user_id)
+    .bind(&new.server)
+    .bind(&new.school)
+    .bind(&new.username)
     .bind(&sealed.ciphertext)
     .bind(&sealed.nonce)
     .bind(KEY_VERSION)
+    .bind(new.timezone.name())
     .fetch_one(pool)
     .await
     .context("storing the account")?;
@@ -82,7 +96,7 @@ pub async fn add_account(
 
 pub async fn accounts_of(pool: &PgPool, user_id: Uuid) -> Result<Vec<UntisAccount>> {
     let rows = sqlx::query(
-        "select id, user_id, server, school, username, display_name, enabled
+        "select id, server, school, username, display_name, enabled, timezone
            from untis_accounts where user_id = $1 order by created_at",
     )
     .bind(user_id)
@@ -94,7 +108,7 @@ pub async fn accounts_of(pool: &PgPool, user_id: Uuid) -> Result<Vec<UntisAccoun
 /// Every account the scheduler should refresh, with its password unsealed.
 pub async fn accounts_to_sync(pool: &PgPool, sealer: &Sealer) -> Result<Vec<AccountWithSecret>> {
     let rows = sqlx::query(
-        "select id, user_id, server, school, username, display_name, enabled, secret, nonce
+        "select id, server, school, username, display_name, enabled, timezone, secret, nonce
            from untis_accounts where enabled order by created_at",
     )
     .fetch_all(pool)
@@ -111,6 +125,7 @@ pub async fn accounts_to_sync(pool: &PgPool, sealer: &Sealer) -> Result<Vec<Acco
                     school: account.school.clone(),
                     user: account.username.clone(),
                     password,
+                    timezone: account.timezone,
                 },
                 account,
             }),
@@ -290,4 +305,46 @@ pub async fn store_failure(pool: &PgPool, account: Uuid, why: &str) -> Result<()
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Whether this user owneth that school link. Asked before anything is changed.
+pub async fn owns(pool: &PgPool, user_id: Uuid, account: Uuid) -> Result<bool> {
+    let found = sqlx::query("select 1 from untis_accounts where id = $1 and user_id = $2")
+        .bind(account)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(found.is_some())
+}
+
+/// Deleting by owner as well as id: another user's id then matcheth nothing,
+/// and there is no separate check to forget.
+pub async fn delete_account(pool: &PgPool, user_id: Uuid, account: Uuid) -> Result<u64> {
+    let done = sqlx::query("delete from untis_accounts where id = $1 and user_id = $2")
+        .bind(account)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected())
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncStatus {
+    pub lesson_count: i32,
+    pub last_ok_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+}
+
+pub async fn sync_status(pool: &PgPool, account: Uuid) -> Result<Option<SyncStatus>> {
+    let row = sqlx::query(
+        "select lesson_count, last_ok_at, last_error from sync_state where untis_account_id = $1",
+    )
+    .bind(account)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| SyncStatus {
+        lesson_count: r.get("lesson_count"),
+        last_ok_at: r.try_get("last_ok_at").ok().flatten(),
+        last_error: r.try_get("last_error").ok().flatten(),
+    }))
 }

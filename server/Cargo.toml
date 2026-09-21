@@ -16,6 +16,7 @@ stundenglas-core = { path = "../core" }
 aes-gcm = "0.10"
 anyhow.workspace = true
 axum = { version = "0.8", features = ["macros"] }
+axum-extra = { version = "0.10", features = ["cookie"] }
 base64 = "0.22"
 chrono = { workspace = true, features = ["serde"] }
 chrono-tz.workspace = true
@@ -36,6 +37,7 @@ sqlx = { version = "0.8", default-features = false, features = [
     "uuid",
 ] }
 thiserror = "2"
+time = "0.3"
 tokio = { workspace = true, features = ["signal", "time"] }
 tower-http = { version = "0.6", features = ["trace", "limit"] }
 sha2.workspace = true

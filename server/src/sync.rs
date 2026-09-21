@@ -16,6 +16,7 @@ pub async fn run(state: AppState) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
+        crate::auth::sweep(&state.pool).await;
         if let Err(err) = once(&state).await {
             tracing::error!("sync round failed: {err:#}");
         }

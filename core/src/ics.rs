@@ -136,7 +136,7 @@ fn line(out: &mut String, content: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::untis::{Lesson, Status, TZ};
+    use crate::untis::{DEFAULT_TZ, Lesson, Status};
     use chrono::{NaiveDate, TimeZone};
 
     pub(super) fn sample_lesson() -> Lesson {
@@ -149,11 +149,13 @@ mod tests {
 
     fn lesson(status: Status, subject: &str) -> Lesson {
         let at = |h: u32| {
-            TZ.from_local_datetime(
-                &NaiveDate::from_ymd_opt(2026, 9, 21).unwrap().and_hms_opt(h, 0, 0).unwrap(),
-            )
-            .earliest()
-            .unwrap()
+            DEFAULT_TZ
+                .from_local_datetime(
+                    &NaiveDate::from_ymd_opt(2026, 9, 21).unwrap().and_hms_opt(h, 0, 0).unwrap(),
+                )
+                .earliest()
+                .unwrap()
+                .fixed_offset()
         };
         Lesson {
             ids: vec![5_856_529, 5_856_532],

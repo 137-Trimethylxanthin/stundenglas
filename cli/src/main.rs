@@ -11,7 +11,6 @@ use clap::Parser;
 use std::path::PathBuf;
 
 use config::Settings;
-use untis::TZ;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -81,6 +80,7 @@ async fn run() -> Result<usize> {
     let args = Args::parse();
 
     let settings = Settings::load(&args.dir.join(".env"))?;
+    let zone = settings.timezone;
     let mut untis = untis::Client::new(settings.into())?;
     untis.login().await.context("logging in to WebUntis")?;
 
@@ -136,21 +136,23 @@ async fn run() -> Result<usize> {
     let token = authoriser.access_token().await.context("authorising with Google")?;
     let calendar = gcal::Calendar::new(http, token);
 
-    let calendar_id = calendar.find_or_create(&args.calendar).await?;
+    let calendar_id = calendar.find_or_create(&args.calendar, zone).await?;
     println!("Calendar: {}  ({calendar_id})", args.calendar);
 
     let midnight = NaiveTime::from_hms_opt(0, 0, 0).expect("midnight existeth");
-    let since = TZ
+    let since = zone
         .from_local_datetime(&from.and_time(midnight))
         .earliest()
-        .context("start of window falleth in no valid hour")?;
-    let until = TZ
+        .context("start of window falleth in no valid hour")?
+        .fixed_offset();
+    let until = zone
         .from_local_datetime(&(to + Duration::days(1)).and_time(midnight))
         .earliest()
-        .context("end of window falleth in no valid hour")?;
+        .context("end of window falleth in no valid hour")?
+        .fixed_offset();
 
     let existing = calendar.existing(&calendar_id, since, until).await?;
-    let plan = gcal::plan(&lessons, &existing);
+    let plan = gcal::plan(&lessons, &existing, zone);
 
     println!(
         "\nPlan    : +{} new  ~{} changed  -{} removed  ={} unchanged",

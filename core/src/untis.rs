@@ -1,15 +1,22 @@
 //! Readeth the personal timetable from the selfsame endpoint the web client useth.
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
 use chrono_tz::{Europe::Vienna, Tz};
 use serde::{Deserialize, Serialize};
 
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:155.0) Gecko/20100101 Firefox/155.0";
 
-/// WebUntis yieldeth bare wall-clock strings; the school's own iCal export
-/// stampeth every hour TZID=Europe/Vienna, so herein lieth the zone.
-pub const TZ: Tz = Vienna;
+/// WebUntis yieldeth bare wall-clock strings with no offset at all, so the
+/// school's own zone must be supplied; this is merely a sensible default for
+/// Austrian schools. Each account chooseth its own.
+pub const DEFAULT_TZ: Tz = Vienna;
+
+/// Lessons carry a fixed offset rather than a named zone: the offset is
+/// computed from the school's zone at that very instant, which is all that
+/// rendering, comparing and pushing require -- and, unlike a named zone,
+/// chrono can read one back from JSON.
+pub type Stamp = DateTime<FixedOffset>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
@@ -31,10 +38,8 @@ impl Status {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lesson {
     pub ids: Vec<i64>,
-    #[serde(with = "stamp_rfc3339")]
-    pub start: DateTime<Tz>,
-    #[serde(with = "stamp_rfc3339")]
-    pub end: DateTime<Tz>,
+    pub start: Stamp,
+    pub end: Stamp,
     pub status: Status,
     pub is_event: bool,
     pub subjects: Vec<String>,
@@ -136,28 +141,10 @@ impl Lesson {
     }
 }
 
-/// chrono can write a `DateTime<Tz>` but will not read one back, so the wire
-/// form is RFC 3339 and the zone is restored on the way in. The instant
-/// surviveth exactly; only the zone's name is re-attached.
-mod stamp_rfc3339 {
-    use super::{TZ, Tz};
-    use chrono::{DateTime, SecondsFormat};
-    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
-
-    pub fn serialize<S: Serializer>(when: &DateTime<Tz>, out: S) -> Result<S::Ok, S::Error> {
-        out.serialize_str(&when.to_rfc3339_opts(SecondsFormat::Secs, false))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(input: D) -> Result<DateTime<Tz>, D::Error> {
-        let raw = String::deserialize(input)?;
-        DateTime::parse_from_rfc3339(&raw).map(|t| t.with_timezone(&TZ)).map_err(D::Error::custom)
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Absence {
-    pub start: DateTime<Tz>,
-    pub end: DateTime<Tz>,
+    pub start: Stamp,
+    pub end: Stamp,
     pub reason: String,
     pub text: String,
 }
@@ -183,6 +170,8 @@ pub struct Credentials {
     pub school: String,
     pub user: String,
     pub password: String,
+    /// The zone the school keepeth its clocks in.
+    pub timezone: Tz,
 }
 
 impl std::fmt::Debug for Credentials {
@@ -192,6 +181,7 @@ impl std::fmt::Debug for Credentials {
             .field("school", &self.school)
             .field("user", &self.user)
             .field("password", &"<redacted>")
+            .field("timezone", &self.timezone.name())
             .finish()
     }
 }
@@ -326,6 +316,10 @@ impl Client {
         serde_json::from_str(&body).with_context(|| format!("decoding the reply of {path}"))
     }
 
+    pub fn timezone(&self) -> Tz {
+        self.settings.timezone
+    }
+
     pub async fn fetch(&self, from: NaiveDate, to: NaiveDate) -> Result<Vec<Lesson>> {
         let entries: Entries = self
             .rest(
@@ -349,7 +343,7 @@ impl Client {
         let mut lessons = Vec::new();
         for day in entries.days {
             for entry in day.grid_entries.unwrap_or_default() {
-                lessons.push(entry.into_lesson()?);
+                lessons.push(entry.into_lesson(self.settings.timezone)?);
             }
         }
         lessons.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.title().cmp(&b.title())));
@@ -386,8 +380,12 @@ impl Client {
             .into_iter()
             .map(|raw| {
                 Ok(Absence {
-                    start: stamp(raw.start_date, raw.start_time)?,
-                    end: stamp(raw.end_date, if raw.end_time == 0 { 2359 } else { raw.end_time })?,
+                    start: stamp(raw.start_date, raw.start_time, self.settings.timezone)?,
+                    end: stamp(
+                        raw.end_date,
+                        if raw.end_time == 0 { 2359 } else { raw.end_time },
+                        self.settings.timezone,
+                    )?,
                     reason: raw.reason.unwrap_or_default(),
                     text: raw.text.unwrap_or_default(),
                 })
@@ -401,7 +399,7 @@ fn itoa(value: i64) -> String {
 }
 
 /// Untis keepeth dates as 20260914 and hours as 800 or 2155.
-fn stamp(date: i64, time: i64) -> Result<DateTime<Tz>> {
+fn stamp(date: i64, time: i64, zone: Tz) -> Result<Stamp> {
     let date = NaiveDate::from_ymd_opt(
         (date / 10_000) as i32,
         ((date / 100) % 100) as u32,
@@ -411,20 +409,25 @@ fn stamp(date: i64, time: i64) -> Result<DateTime<Tz>> {
     let naive = date
         .and_hms_opt((time / 100) as u32, (time % 100) as u32, 0)
         .ok_or_else(|| anyhow!("nonsensical time {time}"))?;
-    localise(naive)
+    localise(naive, zone)
 }
 
-fn localise(naive: NaiveDateTime) -> Result<DateTime<Tz>> {
-    TZ.from_local_datetime(&naive)
+/// A wall-clock time in a named zone becometh an instant with a fixed offset.
+/// The hour that daylight saving skippeth existeth in no zone; take the next
+/// valid one rather than fail a whole week's timetable for it.
+fn localise(naive: NaiveDateTime, zone: Tz) -> Result<Stamp> {
+    let local = zone
+        .from_local_datetime(&naive)
         .earliest()
-        .ok_or_else(|| anyhow!("{naive} falleth in no valid hour of Europe/Vienna"))
+        .ok_or_else(|| anyhow!("{naive} falleth in no valid hour of {}", zone.name()))?;
+    Ok(local.fixed_offset())
 }
 
-fn parse_stamp(raw: &str) -> Result<DateTime<Tz>> {
+fn parse_stamp(raw: &str, zone: Tz) -> Result<Stamp> {
     let naive = NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S")
         .or_else(|_| NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M"))
         .with_context(|| format!("unreadable timestamp {raw}"))?;
-    localise(naive)
+    localise(naive, zone)
 }
 
 // ---------------------------------------------------------------- the wire --
@@ -521,7 +524,7 @@ impl GridEntry {
             .collect()
     }
 
-    fn into_lesson(self) -> Result<Lesson> {
+    fn into_lesson(self, zone: Tz) -> Result<Lesson> {
         let subject_long = self
             .slots()
             .filter_map(|s| s.current.as_ref())
@@ -530,8 +533,8 @@ impl GridEntry {
             .unwrap_or_default();
 
         Ok(Lesson {
-            start: parse_stamp(&self.duration.start)?,
-            end: parse_stamp(&self.duration.end)?,
+            start: parse_stamp(&self.duration.start, zone)?,
+            end: parse_stamp(&self.duration.end, zone)?,
             status: Status::parse(&self.status),
             is_event: self.kind == "EVENT",
             subjects: self.present("SUBJECT"),
@@ -613,6 +616,7 @@ mod tests {
         let at = |hour: u32| {
             localise(
                 NaiveDate::from_ymd_opt(2026, 9, day).unwrap().and_hms_opt(hour, 0, 0).unwrap(),
+                DEFAULT_TZ,
             )
             .unwrap()
         };
@@ -677,8 +681,8 @@ mod tests {
     #[test]
     fn absences_swallow_the_hours_they_cover() {
         let leave = Absence {
-            start: stamp(20_260_914, 800).unwrap(),
-            end: stamp(20_260_917, 2155).unwrap(),
+            start: stamp(20_260_914, 800, DEFAULT_TZ).unwrap(),
+            end: stamp(20_260_917, 2155, DEFAULT_TZ).unwrap(),
             reason: "Freistellung".to_owned(),
             text: "Exkursion".to_owned(),
         };
@@ -689,8 +693,8 @@ mod tests {
         assert!(!leave.covers(&lesson(vec![1], Status::Regular, 11, 8, 9)));
 
         let half = Absence {
-            start: stamp(20_260_921, 1200).unwrap(),
-            end: stamp(20_260_921, 1800).unwrap(),
+            start: stamp(20_260_921, 1200, DEFAULT_TZ).unwrap(),
+            end: stamp(20_260_921, 1800, DEFAULT_TZ).unwrap(),
             reason: String::new(),
             text: String::new(),
         };
@@ -699,10 +703,29 @@ mod tests {
     }
 
     #[test]
+    fn a_school_elsewhere_keeps_its_own_clock() {
+        use chrono_tz::{America::New_York, Asia::Tokyo};
+        let wall = NaiveDate::from_ymd_opt(2026, 9, 21).unwrap().and_hms_opt(8, 0, 0).unwrap();
+        // the same wall-clock hour is a different instant in every school
+        let vienna = localise(wall, DEFAULT_TZ).unwrap();
+        let tokyo = localise(wall, Tokyo).unwrap();
+        let york = localise(wall, New_York).unwrap();
+        assert_eq!(vienna.format("%:z").to_string(), "+02:00");
+        assert_eq!(tokyo.format("%:z").to_string(), "+09:00");
+        assert_eq!(york.format("%:z").to_string(), "-04:00");
+        assert_ne!(vienna.to_utc(), tokyo.to_utc());
+        assert_ne!(vienna.to_utc(), york.to_utc());
+        // and each still readeth as eight in the morning where the school is
+        for when in [vienna, tokyo, york] {
+            assert_eq!(when.format("%H:%M").to_string(), "08:00");
+        }
+    }
+
+    #[test]
     fn timestamps_land_in_vienna() {
-        let noon = parse_stamp("2026-09-21T08:00").unwrap();
+        let noon = parse_stamp("2026-09-21T08:00", DEFAULT_TZ).unwrap();
         assert_eq!(noon.format("%Y-%m-%d %H:%M %:z").to_string(), "2026-09-21 08:00 +02:00");
-        let winter = parse_stamp("2026-12-01T08:00:00").unwrap();
+        let winter = parse_stamp("2026-12-01T08:00:00", DEFAULT_TZ).unwrap();
         assert_eq!(winter.format("%:z").to_string(), "+01:00");
     }
 

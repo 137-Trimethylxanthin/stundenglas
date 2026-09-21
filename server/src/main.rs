@@ -2,15 +2,18 @@
 //! publisheth a calendar for each.
 
 mod admin;
+mod auth;
 mod config;
 mod crypto;
 mod db;
 mod feed;
+mod schools;
 mod sync;
+mod web;
 
 use anyhow::{Context, Result};
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{get, post};
 use clap::{Parser, Subcommand};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -24,6 +27,8 @@ use config::Config;
 pub struct AppState {
     pub pool: PgPool,
     pub config: Arc<Config>,
+    /// One client, so connections to Supabase are kept and reused.
+    pub http: reqwest::Client,
 }
 
 #[derive(Parser)]
@@ -47,6 +52,9 @@ enum Command {
         school: String,
         #[arg(long)]
         username: String,
+        /// The zone the school keeps its clocks in.
+        #[arg(long, default_value = "Europe/Vienna")]
+        timezone: chrono_tz::Tz,
         /// Read from the UNTIS_PASS environment variable, never the command line.
         #[arg(long, default_value = "UNTIS_PASS")]
         password_env: String,
@@ -79,15 +87,25 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
     let pool = db::connect(&config.database_url).await?;
-    let state = AppState { pool, config: Arc::new(config) };
+    let state = AppState {
+        pool,
+        config: Arc::new(config),
+        http: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .context("building the HTTP client")?,
+    };
 
     match args.command {
         Some(Command::GenerateKey) => unreachable!("handled above"),
-        Some(Command::AddAccount { user, server, school, username, password_env }) => {
+        Some(Command::AddAccount { user, server, school, username, timezone, password_env }) => {
             let password = std::env::var(&password_env)
                 .with_context(|| format!("{password_env} is not set"))?;
-            let url =
-                admin::add_account(&state, user, &server, &school, &username, &password).await?;
+            let url = admin::add_account(
+                &state,
+                &db::NewAccount { user_id: user, server, school, username, password, timezone },
+            )
+            .await?;
             println!("{url}");
         }
         Some(Command::List { user }) => admin::list(&state, user).await?,
@@ -106,6 +124,13 @@ async fn serve(state: AppState) -> Result<()> {
 
     let listen = state.config.listen.clone();
     let app = Router::new()
+        .route("/", get(web::index))
+        .route("/signup", post(web::sign_up))
+        .route("/login", post(web::sign_in))
+        .route("/logout", post(web::sign_out))
+        .route("/links", post(web::add_link))
+        .route("/links/{id}/feeds", post(web::new_feed))
+        .route("/links/{id}/delete", post(web::drop_link))
         .route("/cal/{file}", get(feed::serve))
         .route("/healthz", get(healthz))
         .layer(RequestBodyLimitLayer::new(64 * 1024))

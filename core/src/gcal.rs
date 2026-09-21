@@ -1,7 +1,7 @@
 //! Writeth only unto its own secondary calendar, and only unto its own events.
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, SecondsFormat};
+use chrono::SecondsFormat;
 use chrono_tz::Tz;
 use futures::stream::{self, StreamExt};
 use serde::Deserialize;
@@ -14,7 +14,6 @@ use crate::untis::{Lesson, Status};
 
 const API: &str = "https://www.googleapis.com/calendar/v3";
 pub const CALENDAR_NAME: &str = "Schule (Untis)";
-const TIME_ZONE: &str = "Europe/Vienna";
 const MARKER: &str = "untis";
 const ATTEMPTS: u32 = 4;
 
@@ -27,7 +26,7 @@ const COLOUR_EVENT: &str = "5";
 pub struct Desired {
     pub id: String,
     pub summary: String,
-    pub start: DateTime<Tz>,
+    pub start: crate::untis::Stamp,
     pub body: Value,
 }
 
@@ -71,7 +70,7 @@ impl Calendar {
         Self { http, token }
     }
 
-    pub async fn find_or_create(&self, name: &str) -> Result<String> {
+    pub async fn find_or_create(&self, name: &str, zone: Tz) -> Result<String> {
         let mut page: Option<String> = None;
         loop {
             let mut query: Vec<(&str, String)> = vec![("maxResults", "250".to_owned())];
@@ -90,7 +89,7 @@ impl Calendar {
         }
 
         let made: CalendarRef = self
-            .post(format!("{API}/calendars"), &json!({ "summary": name, "timeZone": TIME_ZONE }))
+            .post(format!("{API}/calendars"), &json!({ "summary": name, "timeZone": zone.name() }))
             .await
             .context("creating the calendar")?;
         Ok(made.id)
@@ -99,8 +98,8 @@ impl Calendar {
     pub async fn existing(
         &self,
         calendar: &str,
-        from: DateTime<Tz>,
-        to: DateTime<Tz>,
+        from: crate::untis::Stamp,
+        to: crate::untis::Stamp,
     ) -> Result<HashMap<String, Existing>> {
         let mut found = HashMap::new();
         let mut page: Option<String> = None;
@@ -300,7 +299,7 @@ enum Conflict {
     Other(anyhow::Error),
 }
 
-pub fn desired_of(lesson: &Lesson) -> Desired {
+pub fn desired_of(lesson: &Lesson, zone: Tz) -> Desired {
     let colour = if lesson.cancelled() {
         Some(COLOUR_CANCELLED)
     } else if lesson.is_event {
@@ -324,8 +323,8 @@ pub fn desired_of(lesson: &Lesson) -> Desired {
         "summary": summary,
         "description": description,
         "location": location,
-        "start": { "dateTime": start, "timeZone": TIME_ZONE },
-        "end": { "dateTime": end, "timeZone": TIME_ZONE },
+        "start": { "dateTime": start, "timeZone": zone.name() },
+        "end": { "dateTime": end, "timeZone": zone.name() },
         "transparency": transparency,
         "reminders": { "useDefault": false, "overrides": [] },
         "extendedProperties": { "private": { "source": MARKER } },
@@ -348,12 +347,12 @@ pub fn desired_of(lesson: &Lesson) -> Desired {
     Desired { id: lesson.event_id(), summary, start: lesson.start, body }
 }
 
-pub fn plan(lessons: &[Lesson], existing: &HashMap<String, Existing>) -> Plan {
+pub fn plan(lessons: &[Lesson], existing: &HashMap<String, Existing>, zone: Tz) -> Plan {
     let mut plan = Plan::default();
     let mut wanted: HashMap<String, ()> = HashMap::with_capacity(lessons.len());
 
     for lesson in lessons {
-        let desired = desired_of(lesson);
+        let desired = desired_of(lesson, zone);
         wanted.insert(desired.id.clone(), ());
         match existing.get(&desired.id) {
             None => plan.inserts.push(desired),

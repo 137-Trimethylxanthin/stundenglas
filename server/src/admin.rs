@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use uuid::Uuid;
 
-use crate::{AppState, db};
+use crate::{AppState, db, db::NewAccount};
 
 /// A token for a feed URL: 32 bytes of randomness, url-safe.
 pub fn mint_token() -> Result<String> {
@@ -18,27 +18,11 @@ pub fn mint_token() -> Result<String> {
 }
 
 /// Attach a WebUntis login to a user and hand back a calendar URL.
-pub async fn add_account(
-    state: &AppState,
-    user_id: Uuid,
-    server: &str,
-    school: &str,
-    username: &str,
-    password: &str,
-) -> Result<String> {
-    if password.is_empty() {
+pub async fn add_account(state: &AppState, new: &NewAccount) -> Result<String> {
+    if new.password.is_empty() {
         bail!("a password is wanted");
     }
-    let account = db::add_account(
-        &state.pool,
-        &state.config.sealer,
-        user_id,
-        server,
-        school,
-        username,
-        password,
-    )
-    .await?;
+    let account = db::add_account(&state.pool, &state.config.sealer, new).await?;
 
     // One feed is made at once, so there is something to subscribe to.
     let existing = db::feeds_of(&state.pool, account.id).await?;
@@ -57,11 +41,12 @@ pub async fn list(state: &AppState, user_id: Uuid) -> Result<()> {
     for account in db::accounts_of(&state.pool, user_id).await? {
         let who = account.display_name.clone().unwrap_or_else(|| "?".into());
         println!(
-            "{}  {}@{}  {}  {}",
+            "{}  {}@{}  {}  {}  {}",
             account.id,
             account.username,
             account.school,
             who,
+            account.timezone.name(),
             if account.enabled { "enabled" } else { "disabled" }
         );
         for feed in db::feeds_of(&state.pool, account.id).await? {

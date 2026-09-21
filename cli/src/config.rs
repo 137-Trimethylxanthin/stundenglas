@@ -8,6 +8,8 @@ pub struct Settings {
     pub school: String,
     pub user: String,
     pub password: String,
+    /// The zone the school keepeth its clocks in.
+    pub timezone: chrono_tz::Tz,
 }
 
 impl std::fmt::Debug for Settings {
@@ -17,6 +19,7 @@ impl std::fmt::Debug for Settings {
             .field("school", &self.school)
             .field("user", &self.user)
             .field("password", &"<redacted>")
+            .field("timezone", &self.timezone.name())
             .finish()
     }
 }
@@ -30,6 +33,7 @@ impl Settings {
         let mut school = String::new();
         let mut user = String::new();
         let mut password = String::new();
+        let mut timezone = String::new();
 
         for line in raw.lines() {
             let line = line.trim();
@@ -45,6 +49,7 @@ impl Settings {
                 "UNTIS_SCHOOL" => school = value,
                 "UNTIS_USER" => user = value,
                 "UNTIS_PASS" => password = value,
+                "UNTIS_TZ" => timezone = value,
                 _ => {}
             }
         }
@@ -59,12 +64,26 @@ impl Settings {
                 bail!("{name} is missing from {}", path.display());
             }
         }
-        Ok(Self { server, school, user, password })
+        let timezone = if timezone.is_empty() {
+            stundenglas_core::DEFAULT_TZ
+        } else {
+            timezone.parse().map_err(|_| {
+                anyhow::anyhow!("UNTIS_TZ is not an IANA zone, e.g. Europe/Vienna: {timezone}")
+            })?
+        };
+
+        Ok(Self { server, school, user, password, timezone })
     }
 }
 
 impl From<Settings> for stundenglas_core::Credentials {
     fn from(s: Settings) -> Self {
-        Self { server: s.server, school: s.school, user: s.user, password: s.password }
+        Self {
+            server: s.server,
+            school: s.school,
+            user: s.user,
+            password: s.password,
+            timezone: s.timezone,
+        }
     }
 }
