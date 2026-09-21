@@ -8,6 +8,8 @@ mod crypto;
 mod db;
 mod feed;
 mod google;
+mod mfa;
+mod people;
 mod schools;
 mod sync;
 mod web;
@@ -151,6 +153,14 @@ async fn serve(state: AppState) -> Result<()> {
         .route("/links/{id}/google", get(google::begin))
         .route("/links/{id}/google/delete", post(google::unlink))
         .route("/google/callback", get(google::callback))
+        .route("/security", get(web::security_page))
+        .route("/security/enrol/start", post(web::enrol_start))
+        .route("/security/enrol/finish", post(web::enrol_finish))
+        .route("/security/{id}/forget", post(web::forget_key))
+        .route("/mfa/challenge", post(web::mfa_challenge))
+        .route("/mfa/verify", post(web::mfa_verify))
+        .route("/admin", get(web::admin_page))
+        .route("/admin/{who}/{what}", post(web::admin_decide))
         .route("/cal/{file}", get(feed::serve))
         .route("/healthz", get(healthz))
         .layer(RequestBodyLimitLayer::new(64 * 1024))

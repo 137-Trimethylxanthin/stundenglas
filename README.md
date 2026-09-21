@@ -67,6 +67,33 @@ Friends sign up, add their school with its timezone, and copy the link. The
 server refreshes every account on a timer and serves each feed from cache, so a
 hundred subscribers polling cost the school nothing.
 
+### Who gets in
+
+Signing up is open; being let in is not. A new account waits until an
+administrator approves it, and until then can do nothing at all — not even add
+a school. Name the administrators by address:
+
+```sh
+export ADMIN_EMAILS=you@example.test,someone@example.test
+```
+
+Those addresses are admitted the moment they sign up, and see a page listing
+everyone waiting.
+
+### Security keys
+
+A key may be registered as a **second factor**: after the password, not instead
+of it. Supabase's account service offers no passwordless sign-in over its API
+yet, so that is as far as it goes for now.
+
+Two things about the relying party, which is derived from `PUBLIC_URL`:
+
+- it must be a hostname, never an IP — WebAuthn refuses `127.0.0.1`, though
+  `localhost` is allowed for development
+- a key is bound to the host it was registered under. Changing `PUBLIC_URL`
+  later invalidates every key already registered, and the same host must appear
+  in `supabase/config.toml` under `[auth.webauthn]`
+
 There are also operator commands — `add-account`, `list`, `sync-now`,
 `link-google` — for doing it without the web pages. See `server/README.md`.
 

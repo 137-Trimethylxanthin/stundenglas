@@ -33,6 +33,8 @@ pub struct Config {
     /// How many accounts are refreshed at once.
     pub sync_lanes: usize,
     pub google: Option<GoogleClient>,
+    /// Addresses admitted at once, and allowed to admit others.
+    pub admin_emails: Vec<String>,
 }
 
 fn need(key: &str) -> Result<String> {
@@ -74,6 +76,11 @@ impl Config {
                 }
                 _ => None,
             },
+            admin_emails: or("ADMIN_EMAILS", "")
+                .split(',')
+                .map(|a| a.trim().to_ascii_lowercase())
+                .filter(|a| !a.is_empty())
+                .collect(),
         })
     }
 
@@ -95,6 +102,7 @@ impl std::fmt::Debug for Config {
             .field("sync_every", &self.sync_every)
             .field("sync_lanes", &self.sync_lanes)
             .field("google", &self.google.as_ref().map(|_| "<configured>"))
+            .field("admin_emails", &self.admin_emails)
             .finish()
     }
 }
@@ -119,6 +127,7 @@ mod tests {
                 id: "client-id-material".to_owned(),
                 secret: "client-secret-material".to_owned(),
             }),
+            admin_emails: vec![],
         };
         let shown = format!("{config:?}");
         for secret in
@@ -141,6 +150,7 @@ mod tests {
             sync_every: Duration::from_secs(1800),
             sync_lanes: 1,
             google: None,
+            admin_emails: vec![],
         };
         assert_eq!(config.feed_url("abc"), "https://example.test/cal/abc.ics");
         config.public_url = "https://example.test".to_owned();

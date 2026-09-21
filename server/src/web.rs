@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::auth::{self, CurrentUser};
 use crate::db::{self, NewAccount};
-use crate::{AppState, schools};
+use crate::{AppState, people, schools};
 
 // A short list of the zones a European school is likely to keep, with the rest
 // reachable by typing. Better than a thousand-line dropdown.
@@ -148,6 +148,11 @@ pub async fn index(State(state): State<AppState>, jar: CookieJar) -> Response {
 // --------------------------------------------------------------- dashboard ---
 
 async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) -> Response {
+    let me = people::profile(&state.pool, user.id).await;
+    let admin = me.as_ref().is_some_and(|p| p.is_admin);
+    if !me.as_ref().is_some_and(|p| p.approved) {
+        return waiting_room(admin);
+    }
     let accounts = db::accounts_of(&state.pool, user.id).await.unwrap_or_default();
 
     let mut cards = Vec::new();
@@ -165,6 +170,10 @@ async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) 
         html! {
             h1 { "Your timetables" }
             p.lede { "One link per school. Each keeps its own clock." }
+            p.meta {
+                a href="/security" { "Security keys" }
+                @if admin { " · " a href="/admin" { "Who may join" } }
+            }
             @if has_google {
                 p.note {
                     "A subscribed link is refreshed on your calendar's own schedule — Google "
@@ -278,8 +287,16 @@ pub async fn sign_up(
     headers: HeaderMap,
     Form(form): Form<Login>,
 ) -> Response {
-    match auth::sign_up(&state, form.email.trim(), &form.password).await {
-        Ok(user) => begin(&state, jar, &headers, user).await,
+    let email = form.email.trim().to_ascii_lowercase();
+    match auth::sign_up(&state, &email, &form.password).await {
+        Ok(who) => {
+            if let Err(err) =
+                people::on_signup(&state.pool, who.user, &email, &state.config.admin_emails).await
+            {
+                tracing::error!("could not record the account: {err:#}");
+            }
+            begin(&state, jar, &headers, who).await
+        }
         Err(err) => refuse(&state, &format!("{err}")).await,
     }
 }
@@ -290,15 +307,42 @@ pub async fn sign_in(
     headers: HeaderMap,
     Form(form): Form<Login>,
 ) -> Response {
-    match auth::sign_in(&state, form.email.trim(), &form.password).await {
-        Ok(user) => begin(&state, jar, &headers, user).await,
+    let email = form.email.trim().to_ascii_lowercase();
+    match auth::sign_in(&state, &email, &form.password).await {
+        Ok(who) => {
+            // An account made before profiles existed still needs a row.
+            let _ =
+                people::on_signup(&state.pool, who.user, &email, &state.config.admin_emails).await;
+            // A security key, if one is enrolled, before any session is opened.
+            if let Some(factor) = crate::mfa::verified_factor(&state, &who.gotrue).await {
+                return match crate::mfa::park(&state, who.user, factor.id, &who.gotrue).await {
+                    Ok(token) => {
+                        let jar = jar.add(auth::pending_cookie(
+                            token,
+                            state.config.public_url.starts_with("https"),
+                        ));
+                        (jar, key_prompt(&factor.friendly_name)).into_response()
+                    }
+                    Err(err) => {
+                        tracing::error!("could not park the sign-in: {err:#}");
+                        refuse(&state, "could not sign you in just now").await
+                    }
+                };
+            }
+            begin(&state, jar, &headers, who).await
+        }
         Err(err) => refuse(&state, &format!("{err}")).await,
     }
 }
 
-async fn begin(state: &AppState, jar: CookieJar, headers: &HeaderMap, user: Uuid) -> Response {
+async fn begin(
+    state: &AppState,
+    jar: CookieJar,
+    headers: &HeaderMap,
+    who: auth::Admitted,
+) -> Response {
     let agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
-    match auth::open_session(&state.pool, user, agent).await {
+    match auth::open_session(state, who.user, &who.gotrue, agent).await {
         Ok(token) => {
             let jar =
                 jar.add(auth::cookie_for(token, state.config.public_url.starts_with("https")));
@@ -353,6 +397,9 @@ pub async fn add_link(
         return Redirect::to("/").into_response();
     };
 
+    if !people::profile(&state.pool, user.id).await.is_some_and(|p| p.approved) {
+        return Redirect::to("/").into_response();
+    }
     let Ok(timezone) = form.timezone.parse::<Tz>() else {
         return dashboard(state, user, Some("that is not a timezone I know".into())).await;
     };
@@ -393,7 +440,9 @@ pub async fn new_feed(
     let Some(user) = current(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
-    if !db::owns(&state.pool, user.id, account).await.unwrap_or(false) {
+    if !people::profile(&state.pool, user.id).await.is_some_and(|p| p.approved)
+        || !db::owns(&state.pool, user.id, account).await.unwrap_or(false)
+    {
         return (StatusCode::NOT_FOUND, "no such school").into_response();
     }
     match crate::admin::mint_token() {
@@ -440,4 +489,356 @@ pub fn say(title: &str, body: &str) -> Response {
 async fn current(state: &AppState, jar: &CookieJar) -> Option<CurrentUser> {
     let cookie = jar.get(auth::COOKIE)?;
     auth::user_of(&state.pool, cookie.value()).await
+}
+
+// ------------------------------------------------------------ the gateway ---
+
+fn waiting_room(admin: bool) -> Response {
+    page(
+        "Waiting to be let in",
+        Some(CurrentUser { id: Uuid::nil() }),
+        html! {
+            h1 { "Your account is waiting" }
+            p.lede {
+                "Anyone may sign up here, but an administrator lets people in one at a time. "
+                "Yours is on the list. Come back once you hear that it has been approved."
+            }
+            @if admin {
+                p { a href="/admin" { "You are an administrator — review the list" } }
+            }
+        },
+    )
+    .into_response()
+}
+
+pub async fn admin_page(State(state): State<AppState>, jar: CookieJar) -> Response {
+    let Some(user) = current(&state, &jar).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !people::profile(&state.pool, user.id).await.is_some_and(|p| p.is_admin) {
+        return (StatusCode::NOT_FOUND, "no such page").into_response();
+    }
+    let folk = people::everyone(&state.pool).await.unwrap_or_default();
+    let waiting = folk.iter().filter(|p| !p.approved).count();
+
+    page(
+        "Who may join",
+        Some(user),
+        html! {
+            h1 { "Who may join" }
+            p.lede {
+                @if waiting == 0 { "Nobody is waiting." }
+                @else if waiting == 1 { "One person is waiting." }
+                @else { (waiting) " people are waiting." }
+            }
+            @for person in &folk {
+                .card {
+                    h3 { (person.email) }
+                    p.meta {
+                        @if person.is_admin { "administrator · " }
+                        @if person.approved { "approved" } @else { "waiting since " }
+                        @if !person.approved { (person.created_at.format("%d %b %H:%M").to_string()) }
+                    }
+                    @if !person.is_admin {
+                        .actions {
+                            @if person.approved {
+                                form method="post" action={ "/admin/" (person.user_id) "/revoke" } {
+                                    button type="submit" { "Revoke" }
+                                }
+                            } @else {
+                                form method="post" action={ "/admin/" (person.user_id) "/approve" } {
+                                    button type="submit" { "Let them in" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            p { a href="/" { "Back to your timetables" } }
+        },
+    )
+    .into_response()
+}
+
+pub async fn admin_decide(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((who, what)): Path<(Uuid, String)>,
+) -> Response {
+    let Some(user) = current(&state, &jar).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !people::profile(&state.pool, user.id).await.is_some_and(|p| p.is_admin) {
+        return (StatusCode::NOT_FOUND, "no such page").into_response();
+    }
+    let _ = people::set_approved(&state.pool, who, user.id, what == "approve").await;
+    Redirect::to("/admin").into_response()
+}
+
+// ------------------------------------------------------- the security key ---
+
+/// WebAuthn lives in the browser; there is no doing the ceremony server-side.
+/// This is the whole of the script: fetch options from us, hand them to the
+/// platform, post the answer back. Nothing is stored in the page.
+const CEREMONY_JS: &str = r#"
+const b64u = {
+  dec: s => Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0)),
+  enc: b => btoa(String.fromCharCode(...new Uint8Array(b)))
+            .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''),
+};
+function reviveCreate(o) {
+  o.challenge = b64u.dec(o.challenge);
+  o.user.id = b64u.dec(o.user.id);
+  (o.excludeCredentials||[]).forEach(c => c.id = b64u.dec(c.id));
+  return o;
+}
+function reviveGet(o) {
+  o.challenge = b64u.dec(o.challenge);
+  (o.allowCredentials||[]).forEach(c => c.id = b64u.dec(c.id));
+  return o;
+}
+function packAttestation(c) {
+  return { id: c.id, rawId: b64u.enc(c.rawId), type: c.type,
+    response: { clientDataJSON: b64u.enc(c.response.clientDataJSON),
+                attestationObject: b64u.enc(c.response.attestationObject) } };
+}
+function packAssertion(c) {
+  return { id: c.id, rawId: b64u.enc(c.rawId), type: c.type,
+    response: { clientDataJSON: b64u.enc(c.response.clientDataJSON),
+                authenticatorData: b64u.enc(c.response.authenticatorData),
+                signature: b64u.enc(c.response.signature),
+                userHandle: c.response.userHandle ? b64u.enc(c.response.userHandle) : null } };
+}
+async function post(url, body) {
+  const r = await fetch(url, { method: 'POST', headers: {'Content-Type':'application/json'},
+                               body: JSON.stringify(body || {}) });
+  const text = await r.text();
+  if (!r.ok) throw new Error(text || r.statusText);
+  return text ? JSON.parse(text) : {};
+}
+function complain(err) {
+  const box = document.getElementById('problem');
+  if (box) { box.textContent = String(err && err.message || err); box.hidden = false; }
+}
+async function enrolKey() {
+  try {
+    const name = (document.getElementById('keyname') || {}).value || 'Security key';
+    const started = await post('/security/enrol/start', { name });
+    const cred = await navigator.credentials.create(
+      { publicKey: reviveCreate(started.options.publicKey || started.options) });
+    await post('/security/enrol/finish',
+      { factor_id: started.factor_id, challenge_id: started.challenge_id,
+        credential: packAttestation(cred) });
+    location.href = '/security';
+  } catch (e) { complain(e); }
+}
+async function useKey() {
+  try {
+    const started = await post('/mfa/challenge', {});
+    const cred = await navigator.credentials.get(
+      { publicKey: reviveGet(started.options.publicKey || started.options) });
+    await post('/mfa/verify',
+      { challenge_id: started.challenge_id, credential: packAssertion(cred) });
+    location.href = '/';
+  } catch (e) { complain(e); }
+}
+"#;
+
+fn key_prompt(name: &str) -> Markup {
+    page(
+        "Your security key",
+        None,
+        html! {
+            h1 { "Present your security key" }
+            p.lede {
+                "Your password was accepted. " (name) " is registered on this account, so it is "
+                "wanted as well."
+            }
+            p.bad #problem hidden {}
+            p { button type="button" onclick="useKey()" { "Use my key" } }
+            p.meta { a href="/" { "Cancel" } }
+            script { (maud::PreEscaped(CEREMONY_JS)) }
+        },
+    )
+}
+
+pub async fn security_page(State(state): State<AppState>, jar: CookieJar) -> Response {
+    let Some(user) = current(&state, &jar).await else {
+        return Redirect::to("/").into_response();
+    };
+    let Some(token) = session_token(&jar) else { return Redirect::to("/").into_response() };
+    let bearer = auth::gotrue_of(&state, &token).await.unwrap_or_default();
+    let keys = crate::mfa::factors(&state, &bearer).await.unwrap_or_default();
+
+    page(
+        "Security keys",
+        Some(user),
+        html! {
+            h1 { "Security keys" }
+            p.lede {
+                "A key is asked for after your password. It is a second factor, not a "
+                "replacement: this account service offers no passwordless sign-in yet."
+            }
+            p.bad #problem hidden {}
+            @for key in &keys {
+                .card {
+                    h3 { (key.friendly_name) }
+                    p.meta { @if key.verified { "registered" } @else { "never finished" } }
+                    .actions {
+                        form method="post" action={ "/security/" (key.id) "/forget" } {
+                            button type="submit" { "Remove" }
+                        }
+                    }
+                }
+            }
+            @if keys.is_empty() { p.note { "No key registered yet." } }
+            h2 { "Register a key" }
+            label for="keyname" { "A name you will recognise" }
+            input #keyname type="text" value="Security key";
+            p {} button type="button" onclick="enrolKey()" { "Register this device or key" }
+            p.meta { a href="/" { "Back to your timetables" } }
+            script { (maud::PreEscaped(CEREMONY_JS)) }
+        },
+    )
+    .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct EnrolStart {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+pub async fn enrol_start(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    axum::Json(body): axum::Json<EnrolStart>,
+) -> Response {
+    let Some(_user) = current(&state, &jar).await else {
+        return (StatusCode::UNAUTHORIZED, "sign in first").into_response();
+    };
+    let Some(token) = session_token(&jar) else {
+        return (StatusCode::UNAUTHORIZED, "sign in first").into_response();
+    };
+    let bearer = auth::gotrue_of(&state, &token).await.unwrap_or_default();
+    let name = body.name.unwrap_or_else(|| "Security key".to_owned());
+
+    match crate::mfa::enrol(&state, &bearer, &name).await {
+        Ok(factor) => match crate::mfa::challenge(&state, &bearer, factor).await {
+            Ok(c) => axum::Json(c).into_response(),
+            Err(err) => (StatusCode::BAD_REQUEST, format!("{err}")).into_response(),
+        },
+        Err(err) => (StatusCode::BAD_REQUEST, format!("{err}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct Finish {
+    factor_id: Uuid,
+    challenge_id: Uuid,
+    credential: serde_json::Value,
+}
+
+pub async fn enrol_finish(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    axum::Json(body): axum::Json<Finish>,
+) -> Response {
+    let Some(token) = session_token(&jar) else {
+        return (StatusCode::UNAUTHORIZED, "sign in first").into_response();
+    };
+    let bearer = auth::gotrue_of(&state, &token).await.unwrap_or_default();
+    match crate::mfa::verify(
+        &state,
+        &bearer,
+        body.factor_id,
+        body.challenge_id,
+        crate::mfa::Ceremonial::Create,
+        body.credential,
+    )
+    .await
+    {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, format!("{err}")).into_response(),
+    }
+}
+
+pub async fn forget_key(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(factor): Path<Uuid>,
+) -> Response {
+    if let Some(token) = session_token(&jar) {
+        let bearer = auth::gotrue_of(&state, &token).await.unwrap_or_default();
+        if let Err(err) = crate::mfa::forget(&state, &bearer, factor).await {
+            tracing::warn!("could not remove the key: {err:#}");
+        }
+    }
+    Redirect::to("/security").into_response()
+}
+
+pub async fn mfa_challenge(State(state): State<AppState>, jar: CookieJar) -> Response {
+    let Some(pending) = jar.get(auth::PENDING).map(|c| c.value().to_owned()) else {
+        return (StatusCode::UNAUTHORIZED, "start again").into_response();
+    };
+    let Some(parked) = crate::mfa::peek(&state, &pending).await else {
+        return (StatusCode::UNAUTHORIZED, "that sign-in has expired").into_response();
+    };
+    match crate::mfa::challenge(&state, &parked.gotrue, parked.factor).await {
+        Ok(c) => axum::Json(c).into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, format!("{err}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct Answer {
+    challenge_id: Uuid,
+    credential: serde_json::Value,
+}
+
+pub async fn mfa_verify(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<Answer>,
+) -> Response {
+    let Some(pending) = jar.get(auth::PENDING).map(|c| c.value().to_owned()) else {
+        return (StatusCode::UNAUTHORIZED, "start again").into_response();
+    };
+    let Some(parked) = crate::mfa::peek(&state, &pending).await else {
+        return (StatusCode::UNAUTHORIZED, "that sign-in has expired").into_response();
+    };
+
+    match crate::mfa::verify(
+        &state,
+        &parked.gotrue,
+        parked.factor,
+        body.challenge_id,
+        crate::mfa::Ceremonial::Request,
+        body.credential,
+    )
+    .await
+    {
+        Ok(raised) => {
+            crate::mfa::unpark(&state, &pending).await;
+            let agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
+            let secure = state.config.public_url.starts_with("https");
+            match auth::open_session(&state, parked.user, &raised, agent).await {
+                Ok(token) => {
+                    let jar =
+                        jar.add(auth::cookie_for(token, secure)).add(auth::pending_gone(secure));
+                    (jar, StatusCode::OK).into_response()
+                }
+                Err(err) => {
+                    tracing::error!("could not open a session: {err:#}");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "try again").into_response()
+                }
+            }
+        }
+        Err(err) => (StatusCode::BAD_REQUEST, format!("{err}")).into_response(),
+    }
+}
+
+fn session_token(jar: &CookieJar) -> Option<String> {
+    jar.get(auth::COOKIE).map(|c| c.value().to_owned())
 }

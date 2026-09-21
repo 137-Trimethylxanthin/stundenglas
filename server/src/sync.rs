@@ -16,6 +16,7 @@ pub async fn run(state: AppState) {
     loop {
         ticker.tick().await;
         crate::auth::sweep(&state.pool).await;
+        crate::mfa::sweep(&state).await;
         if let Err(err) = once(state.clone()).await {
             tracing::error!("sync round failed: {err:#}");
         }

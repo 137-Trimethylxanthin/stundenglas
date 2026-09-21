@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::AppState;
 
 pub const COOKIE: &str = "stundenglas_session";
+pub const PENDING: &str = "stundenglas_pending";
 const SESSION_DAYS: i64 = 30;
 
 #[derive(Debug, Clone, Copy)]
@@ -53,7 +54,13 @@ fn complain(body: &str, fallback: &str) -> String {
 }
 
 /// Hand the credentials to Supabase and, if it is content, open a session.
-pub async fn sign_up(state: &AppState, email: &str, password: &str) -> Result<Uuid> {
+/// A signed-in Supabase session: who, and the token we may act with.
+pub struct Admitted {
+    pub user: Uuid,
+    pub gotrue: String,
+}
+
+pub async fn sign_up(state: &AppState, email: &str, password: &str) -> Result<Admitted> {
     if password.chars().count() < 10 {
         bail!("choose a password of at least ten characters");
     }
@@ -63,21 +70,24 @@ pub async fn sign_up(state: &AppState, email: &str, password: &str) -> Result<Uu
         bail!("{}", complain(&body, "that sign-up was refused"));
     }
     let session: GoTrueSession = serde_json::from_str(&body).context("reading the sign-up")?;
-    match session.user {
+    match (session.user, session.access_token) {
         // No session comes back when the address is already taken, or when
         // confirmation by email is demanded. Say so without revealing which.
-        Some(user) if session.access_token.is_some() => Ok(user.id),
+        (Some(user), Some(token)) => Ok(Admitted { user: user.id, gotrue: token }),
         _ => bail!("that address cannot be used to sign up here"),
     }
 }
 
-pub async fn sign_in(state: &AppState, email: &str, password: &str) -> Result<Uuid> {
+pub async fn sign_in(state: &AppState, email: &str, password: &str) -> Result<Admitted> {
     let (status, body) = post(state, "/auth/v1/token?grant_type=password", email, password).await?;
     if !status.is_success() {
         bail!("{}", complain(&body, "those details were not accepted"));
     }
     let session: GoTrueSession = serde_json::from_str(&body).context("reading the sign-in")?;
-    session.user.map(|u| u.id).context("no account came back")
+    match (session.user, session.access_token) {
+        (Some(user), Some(token)) => Ok(Admitted { user: user.id, gotrue: token }),
+        _ => bail!("no session came back"),
+    }
 }
 
 async fn post(
@@ -104,20 +114,45 @@ fn hash(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
 }
 
-pub async fn open_session(pool: &PgPool, user: Uuid, agent: Option<&str>) -> Result<String> {
+pub async fn open_session(
+    state: &AppState,
+    user: Uuid,
+    gotrue: &str,
+    agent: Option<&str>,
+) -> Result<String> {
     let token = crate::admin::mint_token()?;
+    let sealed = state.config.sealer.seal(gotrue)?;
     sqlx::query(
-        "insert into sessions (token_hash, user_id, expires_at, user_agent)
-         values ($1, $2, $3, $4)",
+        "insert into sessions
+            (token_hash, user_id, expires_at, user_agent, gotrue_secret, gotrue_nonce)
+         values ($1, $2, $3, $4, $5, $6)",
     )
     .bind(hash(&token))
     .bind(user)
     .bind(Utc::now() + Duration::days(SESSION_DAYS))
     .bind(agent.map(|a| a.chars().take(200).collect::<String>()))
-    .execute(pool)
+    .bind(&sealed.ciphertext)
+    .bind(&sealed.nonce)
+    .execute(&state.pool)
     .await
     .context("opening a session")?;
     Ok(token)
+}
+
+/// The Supabase token stored with a session, for acting as that user.
+pub async fn gotrue_of(state: &AppState, token: &str) -> Option<String> {
+    let row = sqlx::query(
+        "select gotrue_secret, gotrue_nonce from sessions
+          where token_hash = $1 and expires_at > now()",
+    )
+    .bind(hash(token))
+    .fetch_optional(&state.pool)
+    .await
+    .ok()??;
+    let secret: Option<Vec<u8>> = row.try_get("gotrue_secret").ok().flatten();
+    let nonce: Option<Vec<u8>> = row.try_get("gotrue_nonce").ok().flatten();
+    let sealed = crate::crypto::Sealed { ciphertext: secret?, nonce: nonce? };
+    state.config.sealer.unseal(&sealed).ok()
 }
 
 pub async fn user_of(pool: &PgPool, token: &str) -> Option<CurrentUser> {
@@ -149,6 +184,28 @@ pub fn cookie_for(token: String, secure: bool) -> Cookie<'static> {
     cookie.set_path("/");
     cookie.set_secure(secure);
     cookie.set_max_age(time::Duration::days(SESSION_DAYS));
+    cookie
+}
+
+/// Carries a sign-in that has passed the password but not yet the key. Short
+/// lived, and replaced by the real session the moment the key answers.
+pub fn pending_cookie(token: String, secure: bool) -> Cookie<'static> {
+    let mut cookie = Cookie::new(PENDING, token);
+    cookie.set_http_only(true);
+    cookie.set_same_site(SameSite::Lax);
+    cookie.set_path("/");
+    cookie.set_secure(secure);
+    cookie.set_max_age(time::Duration::minutes(10));
+    cookie
+}
+
+pub fn pending_gone(secure: bool) -> Cookie<'static> {
+    let mut cookie = Cookie::new(PENDING, "");
+    cookie.set_http_only(true);
+    cookie.set_same_site(SameSite::Lax);
+    cookie.set_path("/");
+    cookie.set_secure(secure);
+    cookie.set_max_age(time::Duration::seconds(0));
     cookie
 }
 
