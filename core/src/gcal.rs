@@ -8,6 +8,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use crate::untis::{Lesson, Status};
@@ -60,17 +62,33 @@ pub struct Tally {
     pub failed: usize,
 }
 
+/// Cheap to clone: an HTTP client and a token. Cloning it per request lets
+/// the concurrent writes below own what they need, rather than borrowing
+/// `self` across a stream -- a borrow that makes the whole future's Send-ness
+/// depend on a higher-ranked lifetime, and so unspawnable.
+#[derive(Clone)]
 pub struct Calendar {
     http: reqwest::Client,
     token: String,
 }
+
+/// The three public calls return boxed futures rather than being plain `async
+/// fn`s. An `async fn` is generic over the lifetimes of its references, and a
+/// caller that spawns the work cannot then be shown Send for *every* lifetime,
+/// only for some -- the compiler's "not general enough". Boxing fixes the
+/// lifetime here, where it is known, and the callers are free.
+type Eventually<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 impl Calendar {
     pub fn new(http: reqwest::Client, token: String) -> Self {
         Self { http, token }
     }
 
-    pub async fn find_or_create(&self, name: &str, zone: Tz) -> Result<String> {
+    pub fn find_or_create<'a>(&'a self, name: &'a str, zone: Tz) -> Eventually<'a, String> {
+        Box::pin(self.find_or_create_inner(name, zone))
+    }
+
+    async fn find_or_create_inner(&self, name: &str, zone: Tz) -> Result<String> {
         let mut page: Option<String> = None;
         loop {
             let mut query: Vec<(&str, String)> = vec![("maxResults", "250".to_owned())];
@@ -95,7 +113,16 @@ impl Calendar {
         Ok(made.id)
     }
 
-    pub async fn existing(
+    pub fn existing<'a>(
+        &'a self,
+        calendar: &'a str,
+        from: crate::untis::Stamp,
+        to: crate::untis::Stamp,
+    ) -> Eventually<'a, HashMap<String, Existing>> {
+        Box::pin(self.existing_inner(calendar, from, to))
+    }
+
+    async fn existing_inner(
         &self,
         calendar: &str,
         from: crate::untis::Stamp,
@@ -139,28 +166,57 @@ impl Calendar {
         }
     }
 
-    pub async fn apply(&self, calendar: &str, plan: &Plan, lanes: usize) -> Result<Tally> {
-        let mut tally = Tally::default();
+    pub fn apply<'a>(
+        &'a self,
+        calendar: &'a str,
+        plan: &'a Plan,
+        lanes: usize,
+    ) -> Eventually<'a, Tally> {
+        Box::pin(self.apply_inner(calendar, plan, lanes))
+    }
 
-        let written = stream::iter(
-            plan.inserts.iter().map(|e| (e, true)).chain(plan.updates.iter().map(|e| (e, false))),
-        )
-        .map(|(event, fresh)| async move {
-            let outcome = if fresh {
-                match self.insert(calendar, event).await {
-                    // Already there, though beyond the window we looked upon.
-                    Err(Conflict::Exists) => self.update(calendar, event).await.map(|()| false),
-                    Err(Conflict::Other(err)) => Err(err),
-                    Ok(()) => Ok(true),
+    async fn apply_inner(&self, calendar: &str, plan: &Plan, lanes: usize) -> Result<Tally> {
+        let mut tally = Tally::default();
+        // Owned once, up here, so the closures below capture no borrow of
+        // `self` at all -- a borrowed capture makes the closure generic over
+        // its lifetime and the whole future unspawnable.
+        let me = self.clone();
+        let cal = calendar.to_owned();
+
+        // Owned items, not borrowed ones: an item of `&Desired` makes the
+        // closure generic over that lifetime, which is the last thing keeping
+        // this future from being spawnable.
+        let work: Vec<(Desired, bool)> = plan
+            .inserts
+            .iter()
+            .cloned()
+            .map(|e| (e, true))
+            .chain(plan.updates.iter().cloned().map(|e| (e, false)))
+            .collect();
+
+        let written = stream::iter(work)
+            .map(move |(event, fresh)| {
+                let me = me.clone();
+                let calendar = cal.clone();
+                async move {
+                    let outcome = if fresh {
+                        match me.insert(&calendar, &event).await {
+                            // Already there, though beyond the window we looked upon.
+                            Err(Conflict::Exists) => {
+                                me.update(&calendar, &event).await.map(|()| false)
+                            }
+                            Err(Conflict::Other(err)) => Err(err),
+                            Ok(()) => Ok(true),
+                        }
+                    } else {
+                        me.update(&calendar, &event).await.map(|()| false)
+                    };
+                    (event.id.clone(), outcome)
                 }
-            } else {
-                self.update(calendar, event).await.map(|()| false)
-            };
-            (event.id.clone(), outcome)
-        })
-        .buffer_unordered(lanes)
-        .collect::<Vec<_>>()
-        .await;
+            })
+            .buffer_unordered(lanes)
+            .collect::<Vec<_>>()
+            .await;
 
         for (id, outcome) in written {
             match outcome {
@@ -173,8 +229,15 @@ impl Calendar {
             }
         }
 
-        let removed = stream::iter(plan.deletes.iter())
-            .map(|event| async move { (event.id.clone(), self.delete(calendar, &event.id).await) })
+        let me = self.clone();
+        let cal = calendar.to_owned();
+        let doomed: Vec<Existing> = plan.deletes.clone();
+        let removed = stream::iter(doomed)
+            .map(move |event| {
+                let me = me.clone();
+                let calendar = cal.clone();
+                async move { (event.id.clone(), me.delete(&calendar, &event.id).await) }
+            })
             .buffer_unordered(lanes)
             .collect::<Vec<_>>()
             .await;

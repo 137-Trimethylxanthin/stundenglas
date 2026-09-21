@@ -6,6 +6,14 @@ use std::time::Duration;
 
 use crate::crypto::Sealer;
 
+/// A Google OAuth *web* client. Absent, and the push option simply is not
+/// offered; the calendar links work without it.
+#[derive(Clone)]
+pub struct GoogleClient {
+    pub id: String,
+    pub secret: String,
+}
+
 #[derive(Clone)]
 pub struct Config {
     /// Where Postgres liveth.
@@ -24,6 +32,7 @@ pub struct Config {
     pub sync_every: Duration,
     /// How many accounts are refreshed at once.
     pub sync_lanes: usize,
+    pub google: Option<GoogleClient>,
 }
 
 fn need(key: &str) -> Result<String> {
@@ -58,6 +67,13 @@ impl Config {
             sealer,
             sync_every: Duration::from_secs(minutes * 60),
             sync_lanes: lanes.clamp(1, 32),
+            google: match (std::env::var("GOOGLE_CLIENT_ID"), std::env::var("GOOGLE_CLIENT_SECRET"))
+            {
+                (Ok(id), Ok(secret)) if !id.is_empty() && !secret.is_empty() => {
+                    Some(GoogleClient { id, secret })
+                }
+                _ => None,
+            },
         })
     }
 
@@ -78,6 +94,7 @@ impl std::fmt::Debug for Config {
             .field("sealer", &self.sealer)
             .field("sync_every", &self.sync_every)
             .field("sync_lanes", &self.sync_lanes)
+            .field("google", &self.google.as_ref().map(|_| "<configured>"))
             .finish()
     }
 }
@@ -98,9 +115,15 @@ mod tests {
             sealer: Sealer::from_bytes(&[7; 32]).unwrap(),
             sync_every: Duration::from_secs(1800),
             sync_lanes: 4,
+            google: Some(GoogleClient {
+                id: "client-id-material".to_owned(),
+                secret: "client-secret-material".to_owned(),
+            }),
         };
         let shown = format!("{config:?}");
-        for secret in ["hunter2", "anon-key-material", "service-key-material"] {
+        for secret in
+            ["hunter2", "anon-key-material", "service-key-material", "client-secret-material"]
+        {
             assert!(!shown.contains(secret), "{secret} leaked into {shown}");
         }
     }
@@ -117,6 +140,7 @@ mod tests {
             sealer: Sealer::from_bytes(&[0; 32]).unwrap(),
             sync_every: Duration::from_secs(1800),
             sync_lanes: 1,
+            google: None,
         };
         assert_eq!(config.feed_url("abc"), "https://example.test/cal/abc.ics");
         config.public_url = "https://example.test".to_owned();

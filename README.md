@@ -35,8 +35,13 @@ Markers: ❌ cancelled · ⚠️ changed · 📌 event.
 
 Google refreshes a subscribed URL on its own schedule — often many hours, and
 not adjustable. iOS lets you pick fifteen minutes. If you want minute-fresh
-updates in Google itself, the CLI writes events through the API instead, and
-the service will grow the same as an option.
+updates in Google itself, connect your account and events are written through
+the API the moment we see a change, into a secondary calendar of its own.
+
+That is optional, and the server offers it only when a Google OAuth **web**
+client is configured (`GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`, with
+`<PUBLIC_URL>/google/callback` as an authorised redirect URI). Without one,
+everything else still works.
 
 ---
 
@@ -53,6 +58,8 @@ Put that key somewhere the database is not, then:
 export STUNDENGLAS_KEY=…           DATABASE_URL=postgresql://…
 export SUPABASE_URL=…              SUPABASE_ANON_KEY=…
 export SUPABASE_SERVICE_KEY=…      PUBLIC_URL=https://your.host
+# optional, for pushing into Google Calendar rather than being polled:
+export GOOGLE_CLIENT_ID=…          GOOGLE_CLIENT_SECRET=…
 cargo run -p stundenglas-server
 ```
 
@@ -60,8 +67,8 @@ Friends sign up, add their school with its timezone, and copy the link. The
 server refreshes every account on a timer and serves each feed from cache, so a
 hundred subscribers polling cost the school nothing.
 
-There are also operator commands — `add-account`, `list`, `sync-now` — for
-doing it without the web pages. See `server/README.md`.
+There are also operator commands — `add-account`, `list`, `sync-now`,
+`link-google` — for doing it without the web pages. See `server/README.md`.
 
 ## Run the command
 

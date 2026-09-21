@@ -154,21 +154,30 @@ async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) 
     for account in &accounts {
         let feeds = db::feeds_of(&state.pool, account.id).await.unwrap_or_default();
         let state_of = db::sync_status(&state.pool, account.id).await.unwrap_or(None);
-        cards.push((account.clone(), feeds, state_of));
+        let google = crate::google::has_link(&state.pool, account.id).await;
+        cards.push((account.clone(), feeds, state_of, google));
     }
 
+    let has_google = state.config.google.is_some();
     page(
         "Your timetables",
         Some(user),
         html! {
             h1 { "Your timetables" }
             p.lede { "One link per school. Each keeps its own clock." }
+            @if has_google {
+                p.note {
+                    "A subscribed link is refreshed on your calendar's own schedule — Google "
+                    "often takes hours. Connect Google to have changes written the moment we "
+                    "see them."
+                }
+            }
 
             @if let Some(why) = &problem {
                 p.bad { (why) }
             }
 
-            @for (account, feeds, status) in &cards {
+            @for (account, feeds, status, google) in &cards {
                 .card {
                     h3 { (account.display_name.clone().unwrap_or_else(|| account.username.clone())) }
                     p.meta {
@@ -192,9 +201,23 @@ async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) 
                     @for feed in feeds {
                         code.feed { (state.config.feed_url(&feed.token)) }
                     }
+                    @if *google {
+                        p.meta { "Pushed into Google Calendar as well as the link above." }
+                    }
                     .actions {
                         form method="post" action={ "/links/" (account.id) "/feeds" } {
                             button type="submit" { "New link" }
+                        }
+                        @if has_google {
+                            @if *google {
+                                form method="post" action={ "/links/" (account.id) "/google/delete" } {
+                                    button type="submit" { "Disconnect Google" }
+                                }
+                            } @else {
+                                a href={ "/links/" (account.id) "/google" } {
+                                    button type="button" { "Push to Google Calendar" }
+                                }
+                            }
                         }
                         form method="post" action={ "/links/" (account.id) "/delete" } {
                             button type="submit" { "Remove school" }
@@ -352,7 +375,7 @@ pub async fn add_link(
             // Fetch at once, so the link is not empty when they click it.
             let state2 = state.clone();
             tokio::spawn(async move {
-                if let Err(err) = crate::sync::once(&state2).await {
+                if let Err(err) = crate::sync::once(state2).await {
                     tracing::warn!("first refresh failed: {err:#}");
                 }
             });
@@ -393,6 +416,25 @@ pub async fn drop_link(
     // Deleting by (id, owner) means another user's id simply matches nothing.
     let _ = db::delete_account(&state.pool, user.id, account).await;
     Redirect::to("/").into_response()
+}
+
+/// Who is asking, if anyone. Shared with the Google routes.
+pub async fn signed_in(state: &AppState, jar: &CookieJar) -> Option<CurrentUser> {
+    current(state, jar).await
+}
+
+/// A plain page for telling the user something went one way or another.
+pub fn say(title: &str, body: &str) -> Response {
+    page(
+        title,
+        None,
+        html! {
+            h1 { (title) }
+            p { (body) }
+            p { a href="/" { "Back to your timetables" } }
+        },
+    )
+    .into_response()
 }
 
 async fn current(state: &AppState, jar: &CookieJar) -> Option<CurrentUser> {

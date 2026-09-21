@@ -140,7 +140,7 @@ pub async fn accounts_to_sync(pool: &PgPool, sealer: &Sealer) -> Result<Vec<Acco
 pub async fn set_identity(
     pool: &PgPool,
     account: Uuid,
-    display_name: &str,
+    display_name: String,
     person_id: i64,
 ) -> Result<()> {
     sqlx::query("update untis_accounts set display_name = $2, person_id = $3 where id = $1")
@@ -259,7 +259,7 @@ pub async fn store_sync(
     pool: &PgPool,
     account: Uuid,
     lessons: &[Lesson],
-    etag: &str,
+    etag: String,
     window: (NaiveDate, NaiveDate),
 ) -> Result<()> {
     let payload = serde_json::to_value(lessons)?;
@@ -291,7 +291,7 @@ pub async fn store_sync(
     Ok(())
 }
 
-pub async fn store_failure(pool: &PgPool, account: Uuid, why: &str) -> Result<()> {
+pub async fn store_failure(pool: &PgPool, account: Uuid, why: String) -> Result<()> {
     sqlx::query(
         "insert into sync_state (untis_account_id, last_error, last_error_at, consecutive_fails)
          values ($1, $2, now(), 1)

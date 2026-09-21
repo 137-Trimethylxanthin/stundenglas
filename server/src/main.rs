@@ -7,6 +7,7 @@ mod config;
 mod crypto;
 mod db;
 mod feed;
+mod google;
 mod schools;
 mod sync;
 mod web;
@@ -64,6 +65,16 @@ enum Command {
         #[arg(long)]
         user: Uuid,
     },
+    /// Attach a Google refresh token obtained elsewhere, and name the calendar.
+    LinkGoogle {
+        #[arg(long)]
+        account: Uuid,
+        #[arg(long, default_value = "Schule (Untis)")]
+        calendar: String,
+        /// Read from this environment variable, never the command line.
+        #[arg(long, default_value = "GOOGLE_REFRESH_TOKEN")]
+        token_env: String,
+    },
     /// Refresh every account once and exit.
     SyncNow,
 }
@@ -109,8 +120,14 @@ async fn main() -> Result<()> {
             println!("{url}");
         }
         Some(Command::List { user }) => admin::list(&state, user).await?,
+        Some(Command::LinkGoogle { account, calendar, token_env }) => {
+            let refresh =
+                std::env::var(&token_env).with_context(|| format!("{token_env} is not set"))?;
+            google::adopt_refresh_token(&state, account, &refresh, &calendar).await?;
+            println!("linked; the next refresh will push");
+        }
         Some(Command::SyncNow) => {
-            let done = sync::once(&state).await?;
+            let done = sync::once(state).await?;
             println!("refreshed {done} account(s)");
         }
         None => serve(state).await?,
@@ -131,6 +148,9 @@ async fn serve(state: AppState) -> Result<()> {
         .route("/links", post(web::add_link))
         .route("/links/{id}/feeds", post(web::new_feed))
         .route("/links/{id}/delete", post(web::drop_link))
+        .route("/links/{id}/google", get(google::begin))
+        .route("/links/{id}/google/delete", post(google::unlink))
+        .route("/google/callback", get(google::callback))
         .route("/cal/{file}", get(feed::serve))
         .route("/healthz", get(healthz))
         .layer(RequestBodyLimitLayer::new(64 * 1024))

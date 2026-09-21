@@ -3,7 +3,6 @@
 
 use anyhow::Result;
 use chrono::{Duration as Days, Local, NaiveDate};
-use futures::stream::{self, StreamExt};
 use sha2::{Digest, Sha256};
 use stundenglas_core::{Lesson, untis};
 
@@ -17,48 +16,67 @@ pub async fn run(state: AppState) {
     loop {
         ticker.tick().await;
         crate::auth::sweep(&state.pool).await;
-        if let Err(err) = once(&state).await {
+        if let Err(err) = once(state.clone()).await {
             tracing::error!("sync round failed: {err:#}");
         }
     }
 }
 
-pub async fn once(state: &AppState) -> Result<usize> {
+pub async fn once(state: AppState) -> Result<usize> {
     let accounts = crate::db::accounts_to_sync(&state.pool, &state.config.sealer).await?;
     if accounts.is_empty() {
         return Ok(0);
     }
     tracing::info!(count = accounts.len(), "refreshing");
 
-    let done = stream::iter(accounts)
-        .map(|entry| async move {
+    // One task per account, each holding only what it owns, with a permit to
+    // keep the school's server from being hit by everyone at once. Each task
+    // also fails on its own: one school being unreachable must not rob the
+    // rest of their refresh.
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(state.config.sync_lanes));
+    let mut tasks = tokio::task::JoinSet::new();
+    for entry in accounts {
+        let state = state.clone();
+        let permits = permits.clone();
+        tasks.spawn(async move {
+            let _permit = permits.acquire_owned().await;
             let id = entry.account.id;
-            match fetch_one(state, &entry).await {
+            match fetch_one(state.clone(), entry).await {
                 Ok(count) => {
                     tracing::info!(account = %id, lessons = count, "refreshed");
                     true
                 }
                 Err(err) => {
                     tracing::warn!(account = %id, "refresh failed: {err:#}");
-                    let _ = crate::db::store_failure(&state.pool, id, &format!("{err:#}")).await;
+                    let _ = crate::db::store_failure(&state.pool, id, format!("{err:#}")).await;
                     false
                 }
             }
-        })
-        .buffer_unordered(state.config.sync_lanes)
-        .filter(|ok| futures::future::ready(*ok))
-        .count()
-        .await;
+        });
+    }
 
+    let mut done = 0;
+    while let Some(outcome) = tasks.join_next().await {
+        if matches!(outcome, Ok(true)) {
+            done += 1;
+        }
+    }
     Ok(done)
 }
 
-async fn fetch_one(state: &AppState, entry: &crate::db::AccountWithSecret) -> Result<usize> {
+async fn fetch_one(state: AppState, entry: crate::db::AccountWithSecret) -> Result<usize> {
+    let state = &state;
+    let entry = &entry;
     let mut client = untis::Client::new(entry.credentials.clone())?;
     client.login().await?;
 
-    crate::db::set_identity(&state.pool, entry.account.id, &client.person_name, client.person_id)
-        .await?;
+    crate::db::set_identity(
+        &state.pool,
+        entry.account.id,
+        client.person_name.clone(),
+        client.person_id,
+    )
+    .await?;
 
     let (from, to) = window(client.year);
     let mut lessons = client.fetch(from, to).await?;
@@ -69,7 +87,21 @@ async fn fetch_one(state: &AppState, entry: &crate::db::AccountWithSecret) -> Re
     }
 
     let etag = fingerprint(&lessons);
-    crate::db::store_sync(&state.pool, entry.account.id, &lessons, &etag, (from, to)).await?;
+    crate::db::store_sync(&state.pool, entry.account.id, &lessons, etag, (from, to)).await?;
+
+    // Those who asked for it get the same timetable written into Google, so
+    // they need not wait for Google to look at the subscribed link.
+    match crate::google::push(state.clone(), entry.account.clone(), lessons.clone()).await {
+        Ok(Some(tally)) => tracing::info!(
+            account = %entry.account.id,
+            inserted = tally.inserted, updated = tally.updated,
+            deleted = tally.deleted, failed = tally.failed,
+            "pushed to Google"
+        ),
+        Ok(None) => {}
+        // A Google mishap must not lose the timetable we just stored.
+        Err(err) => tracing::warn!(account = %entry.account.id, "Google push failed: {err:#}"),
+    }
     Ok(lessons.len())
 }
 
