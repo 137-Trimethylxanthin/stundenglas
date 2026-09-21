@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone};
 use chrono_tz::{Europe::Vienna, Tz};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:155.0) Gecko/20100101 Firefox/155.0";
 
@@ -11,7 +11,7 @@ const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:155.0) Gecko/201001
 /// stampeth every hour TZID=Europe/Vienna, so herein lieth the zone.
 pub const TZ: Tz = Vienna;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
     Regular,
     Changed,
@@ -28,10 +28,12 @@ impl Status {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lesson {
     pub ids: Vec<i64>,
+    #[serde(with = "stamp_rfc3339")]
     pub start: DateTime<Tz>,
+    #[serde(with = "stamp_rfc3339")]
     pub end: DateTime<Tz>,
     pub status: Status,
     pub is_event: bool,
@@ -131,6 +133,24 @@ impl Lesson {
             self.ids.iter().map(|i| itoa(*i)).collect::<Vec<_>>().join(",")
         ));
         lines.join("\n")
+    }
+}
+
+/// chrono can write a `DateTime<Tz>` but will not read one back, so the wire
+/// form is RFC 3339 and the zone is restored on the way in. The instant
+/// surviveth exactly; only the zone's name is re-attached.
+mod stamp_rfc3339 {
+    use super::{TZ, Tz};
+    use chrono::{DateTime, SecondsFormat};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    pub fn serialize<S: Serializer>(when: &DateTime<Tz>, out: S) -> Result<S::Ok, S::Error> {
+        out.serialize_str(&when.to_rfc3339_opts(SecondsFormat::Secs, false))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(input: D) -> Result<DateTime<Tz>, D::Error> {
+        let raw = String::deserialize(input)?;
+        DateTime::parse_from_rfc3339(&raw).map(|t| t.with_timezone(&TZ)).map_err(D::Error::custom)
     }
 }
 

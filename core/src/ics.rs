@@ -139,6 +139,14 @@ mod tests {
     use crate::untis::{Lesson, Status, TZ};
     use chrono::{NaiveDate, TimeZone};
 
+    pub(super) fn sample_lesson() -> Lesson {
+        let mut l = lesson(Status::Changed, "MAT");
+        l.teachers_removed = vec!["ABC".to_owned()];
+        l.lesson_info = "Gruppe 1".to_owned();
+        l.notes = "Ümläüte, Kommas; und \\ Schrägstriche".to_owned();
+        l
+    }
+
     fn lesson(status: Status, subject: &str) -> Lesson {
         let at = |h: u32| {
             TZ.from_local_datetime(
@@ -246,5 +254,29 @@ mod tests {
         let out = feed.render(&[], Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap());
         assert!(out.contains("REFRESH-INTERVAL;VALUE=DURATION:PT15M"));
         assert!(out.contains("X-PUBLISHED-TTL:PT15M"));
+    }
+}
+
+#[cfg(test)]
+mod round_trip {
+    use crate::untis::Lesson;
+
+    /// The cache in Postgres holdeth lessons as JSON; what goeth in must come
+    /// out the same, or a feed would drift from what was fetched.
+    #[test]
+    fn lessons_survive_a_turn_through_json() {
+        let before = super::tests::sample_lesson();
+        let text = serde_json::to_string(&before).unwrap();
+        let after: Lesson = serde_json::from_str(&text).unwrap();
+        assert_eq!(before.ids, after.ids);
+        assert_eq!(before.start, after.start, "the instant must not shift");
+        assert_eq!(before.end, after.end);
+        assert_eq!(before.title(), after.title());
+        assert_eq!(before.description(), after.description());
+        assert_eq!(before.event_id(), after.event_id());
+        // and the rendering is byte-identical
+        let stamp = chrono::Utc::now();
+        let feed = super::Feed::default();
+        assert_eq!(feed.render(&[before], stamp), feed.render(&[after], stamp));
     }
 }
