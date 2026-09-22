@@ -949,6 +949,99 @@ fn waiting_room(admin: bool) -> Response {
     .into_response()
 }
 
+/// `GET /admin/health`
+///
+/// What an administrator would otherwise go to the database for: who is
+/// failing, who has never been subscribed to, and who is merely waiting out a
+/// backoff.
+pub async fn health_page(State(state): State<AppState>, jar: CookieJar) -> Response {
+    let Some(user) = current(&state, &jar).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !people::profile(&state.pool, user.id).await.is_some_and(|p| p.is_admin) {
+        return (StatusCode::NOT_FOUND, "no such page").into_response();
+    }
+    let rows = db::health(&state.pool).await.unwrap_or_default();
+    let stuck = rows.iter().filter(|r| r.credentials_rejected).count();
+    let failing = rows.iter().filter(|r| r.consecutive_fails > 0).count();
+    let idle = rows.iter().filter(|r| r.last_served_at.is_none()).count();
+    let now = chrono::Utc::now();
+
+    page(
+        "How it fares",
+        Some(user),
+        html! {
+            h1 { "How it fares" }
+            p.lede {
+                (rows.len()) " school link" (plural(rows.len())) " · "
+                (stuck) " waiting on a password · "
+                (failing) " failing · "
+                (idle) " never subscribed to"
+            }
+            p.meta { a href="/admin" { "Who may join" } }
+
+            @for row in &rows {
+                .card {
+                    h3 { (row.school) " · " (row.username) }
+                    p.meta {
+                        (row.email) " · "
+                        // The id the operator commands take, so an
+                        // administrator need not go to the database for it.
+                        code { (row.account) }
+                    }
+                    @if row.credentials_rejected {
+                        p.bad {
+                            "The school refused this login. Nothing is tried until its owner "
+                            "enters the password again."
+                        }
+                    } @else if let Some(why) = &row.last_error {
+                        p.bad {
+                            (row.consecutive_fails) " failure" (plural(row.consecutive_fails as usize))
+                            " in a row: " (why.chars().take(160).collect::<String>())
+                        }
+                        @if let Some(when) = row.next_attempt_at {
+                            @if when > now {
+                                p.meta {
+                                    "Waiting until " (when.format("%d %b %H:%M UTC").to_string())
+                                }
+                            }
+                        }
+                    }
+                    p.meta {
+                        (row.lesson_count) " lessons"
+                        @if row.exam_count > 0 { ", " (row.exam_count) " exams" }
+                        " · " (row.feeds) " link" (plural(row.feeds as usize))
+                        @if !row.enabled { " · disabled" }
+                    }
+                    p.meta {
+                        @match row.last_ok_at {
+                            Some(when) => {
+                                "Last refreshed " (when.format("%d %b %H:%M UTC").to_string())
+                            }
+                            None => { "Never refreshed" }
+                        }
+                        " · "
+                        @match row.last_served_at {
+                            Some(when) => {
+                                "last fetched " (when.format("%d %b %H:%M UTC").to_string())
+                            }
+                            None => { "never fetched by any calendar" }
+                        }
+                    }
+                }
+            }
+            @if rows.is_empty() {
+                p.note { "No school is linked yet." }
+            }
+        },
+    )
+    .into_response()
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
 pub async fn admin_page(State(state): State<AppState>, jar: CookieJar) -> Response {
     let Some(user) = current(&state, &jar).await else {
         return Redirect::to("/").into_response();
@@ -964,6 +1057,7 @@ pub async fn admin_page(State(state): State<AppState>, jar: CookieJar) -> Respon
         Some(user),
         html! {
             h1 { "Who may join" }
+            p.meta { a href="/admin/health" { "How it fares" } }
             p.lede {
                 @if waiting == 0 { "Nobody is waiting." }
                 @else if waiting == 1 { "One person is waiting." }

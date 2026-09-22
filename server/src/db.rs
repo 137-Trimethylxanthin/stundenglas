@@ -698,3 +698,69 @@ pub async fn rotate_token(pool: &PgPool, user_id: Uuid, feed: Uuid, token: &str)
     .context("rotating the address")?;
     Ok(done.rows_affected() > 0)
 }
+
+// ------------------------------------------------------------ the whole ---
+
+/// One line of the administrator's view: an account, whose it is, and how its
+/// refreshing is faring.
+pub struct Health {
+    pub account: Uuid,
+    pub email: String,
+    pub school: String,
+    pub username: String,
+    pub enabled: bool,
+    pub credentials_rejected: bool,
+    pub lesson_count: i32,
+    pub exam_count: i32,
+    pub last_ok_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub consecutive_fails: i32,
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub feeds: i64,
+    pub last_served_at: Option<DateTime<Utc>>,
+}
+
+/// The troubled first, then those nobody has ever subscribed to, then the
+/// rest: the order an administrator would put them in themselves.
+pub async fn health(pool: &PgPool) -> Result<Vec<Health>> {
+    let rows = sqlx::query(
+        "select a.id, a.school, a.username, a.enabled, a.credentials_rejected,
+                p.email,
+                coalesce(s.lesson_count, 0) as lesson_count,
+                coalesce(s.exam_count, 0)   as exam_count,
+                s.last_ok_at, s.last_error, coalesce(s.consecutive_fails, 0) as consecutive_fails,
+                s.next_attempt_at,
+                (select count(*) from feeds f where f.untis_account_id = a.id) as feeds,
+                (select max(f.last_served_at) from feeds f where f.untis_account_id = a.id)
+                    as last_served_at
+           from untis_accounts a
+           left join profiles p on p.user_id = a.user_id
+           left join sync_state s on s.untis_account_id = a.id
+          order by a.credentials_rejected desc,
+                   coalesce(s.consecutive_fails, 0) desc,
+                   s.last_ok_at asc nulls first",
+    )
+    .fetch_all(pool)
+    .await
+    .context("gathering the state of things")?;
+
+    Ok(rows
+        .iter()
+        .map(|r| Health {
+            account: r.get("id"),
+            email: r.try_get::<Option<String>, _>("email").ok().flatten().unwrap_or_default(),
+            school: r.get("school"),
+            username: r.get("username"),
+            enabled: r.get("enabled"),
+            credentials_rejected: r.try_get("credentials_rejected").unwrap_or(false),
+            lesson_count: r.get("lesson_count"),
+            exam_count: r.get("exam_count"),
+            last_ok_at: r.try_get("last_ok_at").ok().flatten(),
+            last_error: r.try_get("last_error").ok().flatten(),
+            consecutive_fails: r.get("consecutive_fails"),
+            next_attempt_at: r.try_get("next_attempt_at").ok().flatten(),
+            feeds: r.try_get("feeds").unwrap_or(0),
+            last_served_at: r.try_get("last_served_at").ok().flatten(),
+        })
+        .collect())
+}

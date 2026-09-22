@@ -1,6 +1,6 @@
 //! The public face of the service: a secret URL any calendar may subscribe to.
 
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use stundenglas_core::ics;
@@ -14,18 +14,28 @@ use crate::AppState;
 pub async fn serve(
     State(state): State<AppState>,
     Path(file): Path<String>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
+    let who = caller(&headers, peer);
+    if state.guard.is_barred(who) {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many misses; wait a while").into_response();
+    }
     let Some(token) = file.strip_suffix(".ics") else {
+        state.guard.note_miss(who);
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
     if !token_is_plausible(token) {
+        state.guard.note_miss(who);
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
 
     let payload = match crate::db::feed_by_token(&state.pool, token).await {
         Ok(Some(found)) => found,
-        Ok(None) => return (StatusCode::NOT_FOUND, "no such calendar").into_response(),
+        Ok(None) => {
+            state.guard.note_miss(who);
+            return (StatusCode::NOT_FOUND, "no such calendar").into_response();
+        }
         Err(err) => {
             tracing::error!("feed lookup failed: {err:#}");
             return (StatusCode::INTERNAL_SERVER_ERROR, "try again shortly").into_response();
@@ -81,6 +91,29 @@ pub async fn serve(
         body,
     )
         .into_response()
+}
+
+/// Who is asking. Behind a proxy the peer is the proxy itself, so its own
+/// header is preferred where there is one — without this, one busy edge node
+/// would be barred on everybody's behalf.
+///
+/// The headers are only as honest as whoever set them; they are trusted here
+/// because the alternative, in front of Cloudflare, is to count the whole
+/// world as one caller.
+fn caller(headers: &HeaderMap, peer: std::net::SocketAddr) -> std::net::IpAddr {
+    for name in ["cf-connecting-ip", "x-real-ip"] {
+        if let Some(found) = headers.get(name).and_then(|v| v.to_str().ok())
+            && let Ok(address) = found.trim().parse()
+        {
+            return address;
+        }
+    }
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|chain| chain.split(',').next())
+        .and_then(|first| first.trim().parse().ok())
+        .unwrap_or_else(|| peer.ip())
 }
 
 /// The timetable's fingerprint and the link's settings together. Either one
@@ -173,5 +206,44 @@ mod etag_tests {
             super::etag_for(&payload(true, Some(60)), "Stundenplan"),
             "an unchanged feed must still cost a subscriber nothing"
         );
+    }
+}
+
+#[cfg(test)]
+mod caller_tests {
+    use axum::http::HeaderMap;
+
+    fn peer() -> std::net::SocketAddr {
+        "10.0.0.5:9000".parse().unwrap()
+    }
+
+    #[test]
+    fn without_a_proxy_the_peer_is_the_caller() {
+        assert_eq!(super::caller(&HeaderMap::new(), peer()).to_string(), "10.0.0.5");
+    }
+
+    #[test]
+    fn behind_cloudflare_the_header_wins() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-connecting-ip", "203.0.113.9".parse().unwrap());
+        assert_eq!(
+            super::caller(&headers, peer()).to_string(),
+            "203.0.113.9",
+            "else one edge node would be barred on everybody's behalf"
+        );
+    }
+
+    #[test]
+    fn a_forwarded_chain_yields_its_first_hop() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.9, 70.41.3.18".parse().unwrap());
+        assert_eq!(super::caller(&headers, peer()).to_string(), "203.0.113.9");
+    }
+
+    #[test]
+    fn nonsense_in_a_header_falls_back_to_the_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-connecting-ip", "not-an-address".parse().unwrap());
+        assert_eq!(super::caller(&headers, peer()).to_string(), "10.0.0.5");
     }
 }

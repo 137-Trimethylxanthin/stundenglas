@@ -8,6 +8,7 @@ mod crypto;
 mod db;
 mod feed;
 mod google;
+mod guard;
 mod mfa;
 mod people;
 mod schools;
@@ -29,6 +30,8 @@ use config::Config;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
+    /// Counts misses at the feed route, and turns away whoever is guessing.
+    pub guard: Arc<guard::Guard>,
     pub config: Arc<Config>,
     /// One client, so connections to Supabase are kept and reused.
     pub http: reqwest::Client,
@@ -108,6 +111,7 @@ async fn main() -> Result<()> {
     let pool = db::connect(&config.database_url).await?;
     let state = AppState {
         pool,
+        guard: Arc::new(guard::Guard::default()),
         config: Arc::new(config),
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
@@ -200,6 +204,7 @@ async fn serve(state: AppState) -> Result<()> {
         .route("/mfa/challenge", post(web::mfa_challenge))
         .route("/mfa/verify", post(web::mfa_verify))
         .route("/admin", get(web::admin_page))
+        .route("/admin/health", get(web::health_page))
         .route("/admin/{who}/{what}", post(web::admin_decide))
         .route("/cal/{file}", get(feed::serve))
         .route("/healthz", get(healthz))
@@ -212,7 +217,9 @@ async fn serve(state: AppState) -> Result<()> {
         .with_context(|| format!("binding {listen}"))?;
     tracing::info!("listening on {listen}");
 
-    axum::serve(listener, app).with_graceful_shutdown(quit()).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .with_graceful_shutdown(quit())
+        .await?;
     scheduler.abort();
     Ok(())
 }
