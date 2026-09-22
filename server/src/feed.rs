@@ -40,7 +40,10 @@ pub async fn serve(
         .clone()
         .map_or_else(|| "Stundenplan".to_owned(), |who| format!("Stundenplan {who}"));
 
-    let etag = payload.etag.clone().unwrap_or_else(|| "empty".to_owned());
+    // The stored etag follows the school's timetable alone, but what we render
+    // follows this link's own settings too. Fold them in, or a reminder just
+    // switched on answers 304 for ever and is never seen.
+    let etag = etag_for(&payload, &name);
     let quoted = format!("\"{etag}\"");
     if headers
         .get(header::IF_NONE_MATCH)
@@ -78,6 +81,22 @@ pub async fn serve(
         .into_response()
 }
 
+/// The timetable's fingerprint and the link's settings together. Either one
+/// changing must change the answer.
+fn etag_for(payload: &crate::db::FeedPayload, name: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(payload.etag.as_deref().unwrap_or("empty").as_bytes());
+    hasher.update([0]);
+    hasher.update(name.as_bytes());
+    hasher.update([0]);
+    hasher.update([u8::from(payload.feed.keep_cancelled)]);
+    hasher.update(payload.feed.refresh_minutes.to_le_bytes());
+    hasher.update(payload.feed.remind_before_minutes.unwrap_or(-1).to_le_bytes());
+    hasher.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
 /// Cheap gate before touching the database, so a flood of nonsense URLs
 /// costeth us no queries.
 pub(crate) fn token_is_plausible(token: &str) -> bool {
@@ -103,5 +122,51 @@ mod tests {
         assert!(!token_is_plausible("has spaces here!"), "spaces");
         assert!(!token_is_plausible("../../etc/passwd"), "traversal");
         assert!(!token_is_plausible("abcdefghijklmnop';--"), "sql-ish");
+    }
+}
+
+#[cfg(test)]
+mod etag_tests {
+    use crate::db::{Feed, FeedPayload};
+    use uuid::Uuid;
+
+    fn payload(keep_cancelled: bool, remind: Option<i32>) -> FeedPayload {
+        FeedPayload {
+            feed: Feed {
+                id: Uuid::nil(),
+                token: "tok".into(),
+                keep_cancelled,
+                refresh_minutes: 60,
+                remind_before_minutes: remind,
+                label: None,
+                display_name: None,
+            },
+            lessons: vec![],
+            exams: vec![],
+            etag: Some("abcd1234".into()),
+            fetched_at: None,
+        }
+    }
+
+    #[test]
+    fn a_changed_setting_changes_the_answer() {
+        let quiet = super::etag_for(&payload(true, None), "Stundenplan");
+        let ringing = super::etag_for(&payload(true, Some(1440)), "Stundenplan");
+        assert_ne!(quiet, ringing, "switching a reminder on must not answer 304 for ever");
+
+        let without = super::etag_for(&payload(false, None), "Stundenplan");
+        assert_ne!(quiet, without, "dropping cancelled hours changes what is rendered");
+
+        let renamed = super::etag_for(&payload(true, None), "Stundenplan Anna");
+        assert_ne!(quiet, renamed, "the calendar's name is in the body too");
+    }
+
+    #[test]
+    fn an_unchanged_feed_keeps_its_fingerprint() {
+        assert_eq!(
+            super::etag_for(&payload(true, Some(60)), "Stundenplan"),
+            super::etag_for(&payload(true, Some(60)), "Stundenplan"),
+            "an unchanged feed must still cost a subscriber nothing"
+        );
     }
 }

@@ -107,8 +107,10 @@ async fn fetch_one(state: AppState, entry: crate::db::AccountWithSecret) -> Resu
 
     // Exams are a separate endpoint, and a school that keepeth none, or that
     // withholdeth them, must not cost the timetable its refresh.
+    // Once per account per round, which is not noisy, and a tenant that
+    // withholdeth exams for ever should not do so silently.
     let exams = client.fetch_exams(from, to).await.unwrap_or_else(|err| {
-        tracing::debug!(account = %entry.account.id, "no exams read: {err:#}");
+        tracing::warn!(account = %entry.account.id, "no exams read: {err:#}");
         Vec::new()
     });
 
