@@ -18,6 +18,8 @@ pub struct Feed<'a> {
     pub refresh_minutes: u32,
     /// Cancelled lessons kept as transparent entries, or left out entirely.
     pub keep_cancelled: bool,
+    /// Subject short names to leave out entirely. Empty leaveth all in.
+    pub hide_subjects: &'a [String],
     /// Whether homework is carried at all. Whole-day entries add up, and not
     /// everyone wanteth them in the same calendar as their hours.
     pub with_homework: bool,
@@ -32,6 +34,7 @@ impl Default for Feed<'_> {
             name: "Stundenplan",
             refresh_minutes: 60,
             keep_cancelled: true,
+            hide_subjects: &[],
             with_homework: true,
             remind_before: None,
         }
@@ -63,19 +66,37 @@ impl Feed<'_> {
             if lesson.cancelled() && !self.keep_cancelled {
                 continue;
             }
+            if self.hidden(&lesson.subjects) {
+                continue;
+            }
             self.event(&mut out, lesson, stamp);
         }
         for exam in exams {
+            if self.hidden(std::slice::from_ref(&exam.subject)) {
+                continue;
+            }
             self.exam(&mut out, exam, stamp);
         }
         if self.with_homework {
             for piece in homework {
+                if self.hidden(std::slice::from_ref(&piece.subject)) {
+                    continue;
+                }
                 Self::homework(&mut out, piece, stamp);
             }
         }
 
         line(&mut out, "END:VCALENDAR");
         out
+    }
+
+    /// Whether any of these subjects is one this feed leaveth out. Compared
+    /// without regard to case, since a student typeth "rk" for "RK".
+    fn hidden(&self, subjects: &[String]) -> bool {
+        !self.hide_subjects.is_empty()
+            && subjects.iter().any(|subject| {
+                self.hide_subjects.iter().any(|hidden| hidden.eq_ignore_ascii_case(subject))
+            })
     }
 
     fn event(&self, out: &mut String, lesson: &Lesson, stamp: DateTime<Utc>) {
@@ -452,6 +473,48 @@ mod tests {
         assert!(out.contains("SUMMARY:📚 D — Kapitel 4 lesen"));
         assert!(out.contains("TRANSP:TRANSPARENT"), "homework blocks no time");
         assert!(!out.contains("BEGIN:VALARM"), "only exams ring");
+    }
+
+    #[test]
+    fn a_subject_left_out_takes_its_exams_and_homework_with_it() {
+        // The fixtures: lessons in D and M, an exam in M, homework in D.
+        let hide_d = vec!["d".to_owned()];
+        let feed = Feed { hide_subjects: &hide_d, ..Feed::default() };
+        let out = feed.render(
+            &[lesson(Status::Regular, "D"), lesson(Status::Regular, "M")],
+            &[exam()],
+            &[homework()],
+            Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
+        );
+        assert!(!out.contains("SUMMARY:📚"), "the homework in D goes with its subject");
+        assert!(out.contains("SUMMARY:📝"), "the exam in M stays");
+        assert_eq!(out.matches("BEGIN:VEVENT").count(), 2, "one lesson, one exam");
+
+        // And the other way about, which catches a filter applied to only one
+        // of the three kinds.
+        let hide_m = vec!["M".to_owned()];
+        let feed = Feed { hide_subjects: &hide_m, ..Feed::default() };
+        let out = feed.render(
+            &[lesson(Status::Regular, "D"), lesson(Status::Regular, "M")],
+            &[exam()],
+            &[homework()],
+            Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
+        );
+        assert!(!out.contains("SUMMARY:📝"), "the exam in M goes with its subject");
+        assert!(out.contains("SUMMARY:📚"), "the homework in D stays");
+        assert_eq!(out.matches("BEGIN:VEVENT").count(), 2, "one lesson, one homework");
+    }
+
+    #[test]
+    fn leaving_nothing_out_leaves_everything_in() {
+        let feed = Feed::default();
+        let out = feed.render(
+            &[lesson(Status::Regular, "D")],
+            &[exam()],
+            &[homework()],
+            Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
+        );
+        assert_eq!(out.matches("BEGIN:VEVENT").count(), 3);
     }
 
     #[test]

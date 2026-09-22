@@ -175,6 +175,7 @@ pub struct Feed {
     /// Minutes before an exam to ring. None, and nothing rings.
     pub remind_before_minutes: Option<i32>,
     pub with_homework: bool,
+    pub hide_subjects: Vec<String>,
     pub label: Option<String>,
     pub display_name: Option<String>,
 }
@@ -197,6 +198,7 @@ fn feed_from(row: &PgRow, display_name: Option<String>) -> Feed {
         refresh_minutes: row.get("refresh_minutes"),
         remind_before_minutes: row.try_get("remind_before_minutes").ok().flatten(),
         with_homework: row.try_get("with_homework").unwrap_or(true),
+        hide_subjects: row.try_get("hide_subjects").unwrap_or_default(),
         label: row.try_get("label").ok().flatten(),
         display_name,
     }
@@ -206,7 +208,7 @@ pub async fn create_feed(pool: &PgPool, account: Uuid, token: &str) -> Result<Fe
     let row = sqlx::query(
         "insert into feeds (untis_account_id, token) values ($1, $2)
          returning id, token, untis_account_id, keep_cancelled, refresh_minutes,
-                   remind_before_minutes, with_homework, label",
+                   remind_before_minutes, with_homework, hide_subjects, label",
     )
     .bind(account)
     .bind(token)
@@ -223,6 +225,7 @@ pub struct FeedSettings {
     pub refresh_minutes: i32,
     pub remind_before_minutes: Option<i32>,
     pub with_homework: bool,
+    pub hide_subjects: Vec<String>,
     pub label: Option<String>,
 }
 
@@ -240,7 +243,8 @@ pub async fn update_feed(
                 refresh_minutes = $4,
                 remind_before_minutes = $5,
                 with_homework = $6,
-                label = $7
+                hide_subjects = $7,
+                label = $8
            from untis_accounts a
           where f.id = $1 and f.untis_account_id = a.id and a.user_id = $2",
     )
@@ -250,6 +254,7 @@ pub async fn update_feed(
     .bind(want.refresh_minutes.clamp(5, 1440))
     .bind(want.remind_before_minutes.map(|m| m.clamp(5, 10_080)))
     .bind(want.with_homework)
+    .bind(&want.hide_subjects)
     .bind(want.label.as_deref().filter(|l| !l.is_empty()))
     .execute(pool)
     .await
@@ -260,7 +265,7 @@ pub async fn update_feed(
 pub async fn feeds_of(pool: &PgPool, account: Uuid) -> Result<Vec<Feed>> {
     let rows = sqlx::query(
         "select id, token, untis_account_id, keep_cancelled, refresh_minutes,
-                remind_before_minutes, with_homework, label
+                remind_before_minutes, with_homework, hide_subjects, label
            from feeds where untis_account_id = $1 order by created_at",
     )
     .bind(account)
@@ -272,7 +277,7 @@ pub async fn feeds_of(pool: &PgPool, account: Uuid) -> Result<Vec<Feed>> {
 pub async fn feed_by_token(pool: &PgPool, token: &str) -> Result<Option<FeedPayload>> {
     let Some(row) = sqlx::query(
         "select f.id, f.token, f.untis_account_id, f.keep_cancelled, f.refresh_minutes,
-                f.remind_before_minutes, f.with_homework, f.label,
+                f.remind_before_minutes, f.with_homework, f.hide_subjects, f.label,
                 a.display_name, s.lessons, s.exams, s.homework, s.etag, s.last_ok_at
            from feeds f
            join untis_accounts a on a.id = f.untis_account_id
@@ -573,6 +578,24 @@ pub async fn export_for(pool: &PgPool, user_id: Uuid) -> Result<serde_json::Valu
                  Nor is any Google token, which Google alone can reissue.",
         "schools": schools,
     }))
+}
+
+/// Every subject this account's cached timetable mentioneth, so a feed may be
+/// told what to leave out without anyone typing a short name from memory.
+pub async fn subjects_of(pool: &PgPool, account: Uuid) -> Result<Vec<String>> {
+    let rows = sqlx::query(
+        "select subject from sync_state s,
+                lateral jsonb_array_elements(s.lessons) as lesson,
+                lateral jsonb_array_elements_text(lesson->'subjects') as t(subject)
+          where s.untis_account_id = $1
+          group by subject
+          order by subject",
+    )
+    .bind(account)
+    .fetch_all(pool)
+    .await
+    .context("listing the subjects")?;
+    Ok(rows.iter().map(|r| r.get("subject")).collect())
 }
 
 // ------------------------------------------------------------- rotation ---

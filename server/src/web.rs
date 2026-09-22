@@ -102,6 +102,10 @@ code.feed { display: block; word-break: break-all; font-size: .8rem; padding: .5
 .notice p { opacity: 1; }
 button.danger { border-color: #b3261e; color: #b3261e; }
 .actions { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .5rem; }
+.subjects { display: flex; gap: .4rem; flex-wrap: wrap; margin: .3rem 0 .2rem; }
+.pill { display: inline-flex; align-items: center; gap: .15rem; margin: 0;
+        border: 1px solid var(--edge); border-radius: 1rem; padding: .1rem .6rem .1rem .4rem;
+        font-size: .85rem; opacity: 1; }
 details.qr { margin: .5rem 0; font-size: .9rem; }
 details.qr summary { cursor: pointer; opacity: .8; }
 .qrbox { background: #fff; padding: .6rem; border-radius: .5rem; width: max-content;
@@ -197,7 +201,8 @@ async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) 
         let feeds = db::feeds_of(&state.pool, account.id).await.unwrap_or_default();
         let state_of = db::sync_status(&state.pool, account.id).await.unwrap_or(None);
         let google = crate::google::has_link(&state.pool, account.id).await;
-        cards.push((account.clone(), feeds, state_of, google));
+        let subjects = db::subjects_of(&state.pool, account.id).await.unwrap_or_default();
+        cards.push((account.clone(), feeds, state_of, google, subjects));
     }
 
     let has_google = state.config.google.is_some();
@@ -223,7 +228,7 @@ async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) 
                 p.bad { (why) }
             }
 
-            @for (account, feeds, status, google) in &cards {
+            @for (account, feeds, status, google, subjects) in &cards {
                 .card {
                     h3 { (account.display_name.clone().unwrap_or_else(|| account.username.clone())) }
                     p.meta {
@@ -327,6 +332,23 @@ async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) 
                                     input type="checkbox" name="with_homework" value="1"
                                           checked[feed.with_homework];
                                     " Carry homework, on the day it is due"
+                                }
+                                @if !subjects.is_empty() {
+                                    label { "Leave out" }
+                                    p.meta {
+                                        "Subjects ticked here are kept out of this link "
+                                        "entirely — the lessons, their exams and their homework."
+                                    }
+                                    .subjects {
+                                        @for subject in subjects {
+                                            label.pill {
+                                                input type="checkbox" name="hide" value=(subject)
+                                                      checked[feed.hide_subjects.iter()
+                                                          .any(|h| h.eq_ignore_ascii_case(subject))];
+                                                " " (subject)
+                                            }
+                                        }
+                                    }
                                 }
                                 p {} button type="submit" { "Save" }
                             }
@@ -455,6 +477,9 @@ pub async fn feed_settings(
         refresh_minutes: form.refresh_minutes.unwrap_or(60),
         remind_before_minutes: form.remind_before_minutes.filter(|m| *m > 0),
         with_homework: form.with_homework.is_some(),
+        // Each unticked box sends nothing, so what arrives is exactly the set
+        // to leave out.
+        hide_subjects: form.hide.unwrap_or_default(),
         label: form.label.map(|l| l.trim().chars().take(60).collect()),
     };
 
@@ -658,6 +683,9 @@ pub struct FeedForm {
     remind_before_minutes: Option<i32>,
     keep_cancelled: Option<String>,
     with_homework: Option<String>,
+    /// One entry per ticked subject; axum gathers repeated fields into a Vec.
+    #[serde(default)]
+    hide: Option<Vec<String>>,
 }
 
 /// A select whose "never" option hath an empty value sendeth `""`, which is

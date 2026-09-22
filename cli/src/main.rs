@@ -121,6 +121,7 @@ async fn run() -> Result<usize> {
             refresh_minutes: 60,
             keep_cancelled: true,
             with_homework: true,
+            hide_subjects: &[],
             // A file written once cannot be re-read; whoever wants an alarm
             // can set one where the file lands.
             remind_before: None,

@@ -69,6 +69,7 @@ pub async fn serve(
         refresh_minutes: payload.feed.refresh_minutes.max(5) as u32,
         keep_cancelled: payload.feed.keep_cancelled,
         with_homework: payload.feed.with_homework,
+        hide_subjects: &payload.feed.hide_subjects,
         remind_before: payload.feed.remind_before_minutes.and_then(|m| u32::try_from(m).ok()),
     };
     let body = feed.render(
@@ -128,6 +129,10 @@ fn etag_for(payload: &crate::db::FeedPayload, name: &str) -> String {
     hasher.update([0]);
     hasher.update([u8::from(payload.feed.keep_cancelled)]);
     hasher.update([u8::from(payload.feed.with_homework)]);
+    for subject in &payload.feed.hide_subjects {
+        hasher.update(subject.as_bytes());
+        hasher.update([0]);
+    }
     hasher.update(payload.feed.refresh_minutes.to_le_bytes());
     hasher.update(payload.feed.remind_before_minutes.unwrap_or(-1).to_le_bytes());
     hasher.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
@@ -175,6 +180,7 @@ mod etag_tests {
                 refresh_minutes: 60,
                 remind_before_minutes: remind,
                 with_homework: true,
+                hide_subjects: vec![],
                 label: None,
                 display_name: None,
             },
