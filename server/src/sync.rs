@@ -4,7 +4,7 @@
 use anyhow::Result;
 use chrono::{Duration as Days, Local, NaiveDate};
 use sha2::{Digest, Sha256};
-use stundenglas_core::{Lesson, untis};
+use stundenglas_core::{Exam, Lesson, untis};
 
 use crate::AppState;
 use crate::db::Failure;
@@ -105,8 +105,16 @@ async fn fetch_one(state: AppState, entry: crate::db::AccountWithSecret) -> Resu
         lessons.retain(|lesson| !leave.covers(lesson));
     }
 
-    let etag = fingerprint(&lessons);
-    crate::db::store_sync(&state.pool, entry.account.id, &lessons, etag, (from, to)).await?;
+    // Exams are a separate endpoint, and a school that keepeth none, or that
+    // withholdeth them, must not cost the timetable its refresh.
+    let exams = client.fetch_exams(from, to).await.unwrap_or_else(|err| {
+        tracing::debug!(account = %entry.account.id, "no exams read: {err:#}");
+        Vec::new()
+    });
+
+    let etag = fingerprint(&lessons, &exams);
+    crate::db::store_sync(&state.pool, entry.account.id, &lessons, &exams, etag, (from, to))
+        .await?;
 
     // Those who asked for it get the same timetable written into Google, so
     // they need not wait for Google to look at the subscribed link.
@@ -134,7 +142,7 @@ fn window(year: (NaiveDate, NaiveDate)) -> (NaiveDate, NaiveDate) {
 
 /// Changeth only when something a subscriber would notice changeth, so an
 /// unchanged timetable answereth 304 and costeth nothing.
-fn fingerprint(lessons: &[Lesson]) -> String {
+fn fingerprint(lessons: &[Lesson], exams: &[Exam]) -> String {
     let mut hasher = Sha256::new();
     for lesson in lessons {
         hasher.update(lesson.event_id().as_bytes());
@@ -146,6 +154,15 @@ fn fingerprint(lessons: &[Lesson]) -> String {
         hasher.update(lesson.start.to_rfc3339().as_bytes());
         hasher.update(lesson.end.to_rfc3339().as_bytes());
         hasher.update(lesson.rooms.join(",").as_bytes());
+        hasher.update(*b"\n");
+    }
+    for exam in exams {
+        hasher.update(exam.event_id().as_bytes());
+        hasher.update([0]);
+        hasher.update(exam.title().as_bytes());
+        hasher.update([0]);
+        hasher.update(exam.start.to_rfc3339().as_bytes());
+        hasher.update(exam.end.to_rfc3339().as_bytes());
         hasher.update(*b"\n");
     }
     hasher.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()

@@ -102,6 +102,11 @@ code.feed { display: block; word-break: break-all; font-size: .8rem; padding: .5
 .notice p { opacity: 1; }
 button.danger { border-color: #b3261e; color: #b3261e; }
 .actions { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .5rem; }
+details.qr { margin: .5rem 0; font-size: .9rem; }
+details.qr summary { cursor: pointer; opacity: .8; }
+.qrbox { background: #fff; padding: .6rem; border-radius: .5rem; width: max-content;
+         margin-top: .5rem; }
+.qrbox svg { display: block; width: 190px; height: 190px; }
 .actions form { margin: 0; }
 "#;
 
@@ -154,6 +159,30 @@ pub async fn index(State(state): State<AppState>, jar: CookieJar) -> Response {
 }
 
 // --------------------------------------------------------------- dashboard ---
+
+/// The feed address as a QR, drawn inline. Nothing is fetched and nothing
+/// leaves the page — a secret URL has no business being sent to an image
+/// service to be made scannable.
+fn qr_svg(url: &str) -> Option<maud::PreEscaped<String>> {
+    use qrcode::render::svg;
+    use qrcode::{EcLevel, QrCode};
+
+    let code = QrCode::with_error_correction_level(url, EcLevel::M).ok()?;
+    let drawn = code
+        .render()
+        .min_dimensions(190, 190)
+        // Fixed colours: a QR wants light behind dark whatever the page
+        // around it is doing.
+        .dark_color(svg::Color("#111111"))
+        .light_color(svg::Color("#ffffff"))
+        .quiet_zone(true)
+        .build();
+
+    // The renderer writes a standalone document, prolog and all. Inside a page
+    // that prolog is not markup but litter, so it is cut away.
+    let from = drawn.find("<svg")?;
+    Some(maud::PreEscaped(drawn[from..].to_owned()))
+}
 
 async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) -> Response {
     let me = people::profile(&state.pool, user.id).await;
@@ -224,6 +253,7 @@ async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) 
                             }
                             Some(s) => {
                                 (s.lesson_count) " lessons"
+                                @if s.exam_count > 0 { ", " (s.exam_count) " exams" }
                                 @if let Some(when) = s.last_ok_at {
                                     ", refreshed " (when.format("%d %b %H:%M UTC").to_string())
                                 }
@@ -233,6 +263,66 @@ async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) 
                     }
                     @for feed in feeds {
                         code.feed { (state.config.feed_url(&feed.token)) }
+                        .actions {
+                            a href=(state.config.webcal_url(&feed.token)) {
+                                button type="button" { "Subscribe on this device" }
+                            }
+                        }
+                        @if let Some(qr) = qr_svg(&state.config.feed_url(&feed.token)) {
+                            details.qr {
+                                summary { "Show a QR code for a phone" }
+                                p.meta {
+                                    "Point a camera at it. Treat it as you would the address "
+                                    "itself: whoever scans it can read this timetable."
+                                }
+                                .qrbox { (qr) }
+                            }
+                        }
+                        details.qr {
+                            summary { "Settings for this link" }
+                            form.stack method="post"
+                                 action={ "/feeds/" (feed.id) "/settings" } {
+                                label { "What to call it" }
+                                input type="text" name="label" maxlength="60"
+                                      placeholder="Phone, laptop, …"
+                                      value=(feed.label.clone().unwrap_or_default());
+
+                                label { "Ask calendars to look again every" }
+                                select name="refresh_minutes" {
+                                    @for choice in [15_i32, 30, 60, 180, 360, 720, 1440] {
+                                        option value=(choice)
+                                               selected[choice == feed.refresh_minutes] {
+                                            (refresh_label(choice))
+                                        }
+                                    }
+                                }
+                                p.meta {
+                                    "A wish, not a rule. iOS honours it; Google refreshes on "
+                                    "its own schedule whatever is asked."
+                                }
+
+                                label { "Remind me before an exam" }
+                                select name="remind_before_minutes" {
+                                    option value="" selected[feed.remind_before_minutes.is_none()] {
+                                        "Never"
+                                    }
+                                    @for choice in [30_i32, 60, 180, 720, 1440, 2880] {
+                                        option value=(choice)
+                                               selected[Some(choice) == feed.remind_before_minutes] {
+                                            (remind_label(choice))
+                                        }
+                                    }
+                                }
+                                p.meta { "Only exams ring. Ordinary lessons never do." }
+
+                                label {
+                                    input type="checkbox" name="keep_cancelled" value="1"
+                                          checked[feed.keep_cancelled];
+                                    " Keep cancelled lessons, shown as free time"
+                                }
+                                p {} button type="submit" { "Save" }
+                            }
+                        }
                     }
                     @if *google {
                         p.meta { "Pushed into Google Calendar as well as the link above." }
@@ -309,6 +399,51 @@ async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) 
         },
     )
     .into_response()
+}
+
+fn refresh_label(minutes: i32) -> String {
+    match minutes {
+        m if m < 60 => format!("{m} minutes"),
+        60 => "hour".to_owned(),
+        m if m < 1440 => format!("{} hours", m / 60),
+        _ => "day".to_owned(),
+    }
+}
+
+fn remind_label(minutes: i32) -> String {
+    match minutes {
+        m if m < 60 => format!("{m} minutes before"),
+        60 => "an hour before".to_owned(),
+        m if m < 1440 => format!("{} hours before", m / 60),
+        1440 => "the day before".to_owned(),
+        m => format!("{} days before", m / 1440),
+    }
+}
+
+/// `POST /feeds/{id}/settings`
+pub async fn feed_settings(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(feed): Path<Uuid>,
+    Form(form): Form<FeedForm>,
+) -> Response {
+    let Some(user) = current(&state, &jar).await else {
+        return Redirect::to("/").into_response();
+    };
+
+    let want = db::FeedSettings {
+        // An unchecked box sendeth nothing at all, which is how HTML saith no.
+        keep_cancelled: form.keep_cancelled.is_some(),
+        refresh_minutes: form.refresh_minutes.unwrap_or(60),
+        remind_before_minutes: form.remind_before_minutes.filter(|m| *m > 0),
+        label: form.label.map(|l| l.trim().chars().take(60).collect()),
+    };
+
+    match db::update_feed(&state.pool, user.id, feed, &want).await {
+        Ok(true) => Redirect::to("/").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such link").into_response(),
+        Err(err) => dashboard(state, user, Some(format!("{err}"))).await,
+    }
 }
 
 /// `GET /privacy`
@@ -457,6 +592,26 @@ pub async fn delete_account(
     // The session row went with the user; the cookie must go too.
     let secure = state.config.public_url.starts_with("https");
     (jar.add(auth::cookie_gone(secure)), Redirect::to("/"))
+}
+
+#[derive(Deserialize)]
+pub struct FeedForm {
+    label: Option<String>,
+    refresh_minutes: Option<i32>,
+    /// Empty when "never" is chosen, which serde readeth as None.
+    #[serde(default, deserialize_with = "empty_as_none")]
+    remind_before_minutes: Option<i32>,
+    keep_cancelled: Option<String>,
+}
+
+/// A select whose "never" option hath an empty value sendeth `""`, which is
+/// neither a number nor absent. Read it as absent.
+fn empty_as_none<'de, D>(given: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(given)?;
+    Ok(raw.filter(|text| !text.trim().is_empty()).and_then(|text| text.trim().parse().ok()))
 }
 
 #[derive(Deserialize)]
@@ -1068,4 +1223,16 @@ pub async fn mfa_verify(
 
 fn session_token(jar: &CookieJar) -> Option<String> {
     jar.get(auth::COOKIE).map(|c| c.value().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_feed_address_becomes_a_scannable_square() {
+        let drawn = super::qr_svg("https://example.test/cal/abcdefghijklmnop.ics")
+            .expect("a URL of ordinary length must fit in a QR");
+        assert!(drawn.0.starts_with("<svg"), "an XML prolog is litter inside a page");
+        assert!(!drawn.0.contains("<?xml"), "the prolog must be cut away, not merely skipped");
+        assert!(drawn.0.len() > 500, "suspiciously small for a QR of that address");
+    }
 }

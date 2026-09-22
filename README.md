@@ -27,9 +27,15 @@ It is deliberately more careful than the export WebUntis itself would give you:
 | **Substitutions** | tells *"X is covering for Y"* apart from *"Y is away and nobody is covering"* |
 | **Leave of absence** | lessons inside an approved absence are dropped, so an excused day shows empty. Overlap-based, so a half-day leave clears only its own hours |
 | **Shared lessons** | a lesson shared between classes is marked changed whenever any class joins or leaves — only a change of teacher or room is flagged |
+| **Exams** | fetched from the endpoint the timetable does not carry, marked 📝, and the only thing here that may ring: set a reminder per link, a day before or an hour |
 | **Several schools** | one account may link many, each with its own timezone |
 
-Markers: ❌ cancelled · ⚠️ changed · 📌 event.
+Markers: ❌ cancelled · ⚠️ changed · 📌 event · 📝 exam.
+
+Each link carries its own settings — what to call it, how often calendars are
+asked to look again, whether cancelled hours are kept, and whether exams ring.
+Alongside the address there is a `webcal://` link, which subscribes in one tap
+on iOS and macOS, and a QR code for pointing a phone at.
 
 ### On Google, specifically
 
@@ -60,6 +66,8 @@ export SUPABASE_URL=…              SUPABASE_ANON_KEY=…
 export SUPABASE_SERVICE_KEY=…      PUBLIC_URL=https://your.host
 # optional, for pushing into Google Calendar rather than being polled:
 export GOOGLE_CLIENT_ID=…          GOOGLE_CLIENT_SECRET=…
+# optional: how long a timetable nobody refreshes is kept (default 180 days)
+export KEEP_DAYS=180
 cargo run -p stundenglas-server
 ```
 
@@ -141,7 +149,15 @@ service, and it is answered as follows:
 
 None of which changes the underlying fact. If you run this for friends, tell
 them plainly what they are handing over, and check what your school's rules
-say about it.
+say about it. The service says it too, at `/privacy`, alongside a button to
+download everything held about an account and one to delete it outright —
+deletion cascades from `auth.users`, so the sealed passwords go with it.
+
+A password the school **refuses** is not offered again. WebUntis locks an
+account that is tried too often, and a locked school account is not something
+this can give back, so a rejected login disables that link until its owner
+enters a new password. A school that is merely unreachable is retried after
+five minutes, then ten, then twenty, to a ceiling of six hours.
 
 ---
 
@@ -158,6 +174,9 @@ say about it.
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+A timetable nobody has refreshed in `KEEP_DAYS` is forgotten, being stale and
+still somebody's whereabouts.
 
 `SCOUT.md` documents the WebUntis API as observed, including the traps: a
 missing bearer token that answers `404` rather than `401`, the filter default

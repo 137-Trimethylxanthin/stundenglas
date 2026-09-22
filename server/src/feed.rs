@@ -55,8 +55,13 @@ pub async fn serve(
         name: &name,
         refresh_minutes: payload.feed.refresh_minutes.max(5) as u32,
         keep_cancelled: payload.feed.keep_cancelled,
+        remind_before: payload.feed.remind_before_minutes.and_then(|m| u32::try_from(m).ok()),
     };
-    let body = feed.render(&payload.lessons, payload.fetched_at.unwrap_or_else(chrono::Utc::now));
+    let body = feed.render(
+        &payload.lessons,
+        &payload.exams,
+        payload.fetched_at.unwrap_or_else(chrono::Utc::now),
+    );
 
     crate::db::note_served(&state.pool, token).await;
 

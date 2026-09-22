@@ -151,6 +151,7 @@ async fn serve(state: AppState) -> Result<()> {
         .route("/links/{id}/feeds", post(web::new_feed))
         .route("/links/{id}/delete", post(web::drop_link))
         .route("/links/{id}/password", post(web::new_password))
+        .route("/feeds/{id}/settings", post(web::feed_settings))
         .route("/links/{id}/google", get(google::begin))
         .route("/links/{id}/google/delete", post(google::unlink))
         .route("/google/callback", get(google::callback))

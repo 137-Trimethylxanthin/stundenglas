@@ -5,7 +5,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::untis::{Lesson, Status};
+use crate::untis::{Exam, Lesson, Status};
 
 const PRODID: &str = "-//stundenglas//WebUntis timetable//EN";
 
@@ -18,16 +18,19 @@ pub struct Feed<'a> {
     pub refresh_minutes: u32,
     /// Cancelled lessons kept as transparent entries, or left out entirely.
     pub keep_cancelled: bool,
+    /// How long before an exam to ring, if at all. Ordinary lessons never
+    /// ring: a calendar that alarms forty times a week is one nobody keeps.
+    pub remind_before: Option<u32>,
 }
 
 impl Default for Feed<'_> {
     fn default() -> Self {
-        Self { name: "Stundenplan", refresh_minutes: 60, keep_cancelled: true }
+        Self { name: "Stundenplan", refresh_minutes: 60, keep_cancelled: true, remind_before: None }
     }
 }
 
 impl Feed<'_> {
-    pub fn render(&self, lessons: &[Lesson], stamp: DateTime<Utc>) -> String {
+    pub fn render(&self, lessons: &[Lesson], exams: &[Exam], stamp: DateTime<Utc>) -> String {
         let mut out = String::with_capacity(256 + lessons.len() * 320);
 
         line(&mut out, "BEGIN:VCALENDAR");
@@ -46,6 +49,9 @@ impl Feed<'_> {
                 continue;
             }
             self.event(&mut out, lesson, stamp);
+        }
+        for exam in exams {
+            self.exam(&mut out, exam, stamp);
         }
 
         line(&mut out, "END:VCALENDAR");
@@ -90,6 +96,44 @@ impl Feed<'_> {
             "REGULAR"
         };
         line(out, &format!("CATEGORIES:{kind}"));
+        line(out, "END:VEVENT");
+    }
+
+    /// An exam standeth apart from the lesson it displaceth: it is the thing
+    /// a student would set an alarm for, and the only thing here that ringeth.
+    fn exam(&self, out: &mut String, exam: &Exam, stamp: DateTime<Utc>) {
+        line(out, "BEGIN:VEVENT");
+        line(out, &format!("UID:{}@stundenglas", exam.event_id()));
+        line(out, &format!("DTSTAMP:{}", utc(stamp)));
+        line(out, &format!("DTSTART:{}", utc(exam.start.with_timezone(&Utc))));
+        line(out, &format!("DTEND:{}", utc(exam.end.with_timezone(&Utc))));
+        line(out, &format!("SUMMARY:{}", escape(&exam.title())));
+
+        let where_at = exam.rooms.join(", ");
+        if !where_at.is_empty() {
+            line(out, &format!("LOCATION:{}", escape(&where_at)));
+        }
+        let what = exam.description();
+        if !what.is_empty() {
+            line(out, &format!("DESCRIPTION:{}", escape(&what)));
+        }
+        line(out, "TRANSP:OPAQUE");
+        line(out, "STATUS:CONFIRMED");
+        line(out, "CATEGORIES:EXAM");
+
+        if let Some(minutes) = self.remind_before {
+            line(out, "BEGIN:VALARM");
+            line(out, "ACTION:DISPLAY");
+            line(out, &format!("DESCRIPTION:{}", escape(&exam.title())));
+            // Whole days where they divide evenly: a client showing "1 day
+            // before" readeth better than one showing "1440 minutes before".
+            if minutes % 1440 == 0 && minutes > 0 {
+                line(out, &format!("TRIGGER:-P{}D", minutes / 1440));
+            } else {
+                line(out, &format!("TRIGGER:-PT{minutes}M"));
+            }
+            line(out, "END:VALARM");
+        }
         line(out, "END:VEVENT");
     }
 }
@@ -147,6 +191,29 @@ mod tests {
         l
     }
 
+    fn exam() -> crate::Exam {
+        let at = |h: u32| {
+            DEFAULT_TZ
+                .from_local_datetime(
+                    &NaiveDate::from_ymd_opt(2026, 9, 21).unwrap().and_hms_opt(h, 0, 0).unwrap(),
+                )
+                .earliest()
+                .unwrap()
+                .fixed_offset()
+        };
+        crate::Exam {
+            id: 42,
+            start: at(8),
+            end: at(10),
+            subject: "M".to_owned(),
+            kind: "Schularbeit".to_owned(),
+            name: String::new(),
+            text: "Kapitel 1-4".to_owned(),
+            teachers: vec!["ABC".to_owned()],
+            rooms: vec!["A1".to_owned()],
+        }
+    }
+
     fn lesson(status: Status, subject: &str) -> Lesson {
         let at = |h: u32| {
             DEFAULT_TZ
@@ -179,7 +246,7 @@ mod tests {
     }
 
     fn render(lessons: &[Lesson]) -> String {
-        Feed::default().render(lessons, Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap())
+        Feed::default().render(lessons, &[], Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap())
     }
 
     #[test]
@@ -236,6 +303,7 @@ mod tests {
         let feed = Feed { keep_cancelled: false, ..Feed::default() };
         let out = feed.render(
             &[lesson(Status::Cancelled, "MAT")],
+            &[],
             Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
         );
         assert_eq!(out.matches("BEGIN:VEVENT").count(), 0);
@@ -253,9 +321,51 @@ mod tests {
     #[test]
     fn a_refresh_hint_is_offered() {
         let feed = Feed { refresh_minutes: 15, ..Feed::default() };
-        let out = feed.render(&[], Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap());
+        let out = feed.render(&[], &[], Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap());
         assert!(out.contains("REFRESH-INTERVAL;VALUE=DURATION:PT15M"));
         assert!(out.contains("X-PUBLISHED-TTL:PT15M"));
+    }
+
+    #[test]
+    fn an_exam_is_its_own_entry_and_saith_so() {
+        let out = Feed::default().render(
+            &[],
+            &[exam()],
+            Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
+        );
+        assert!(out.contains("CATEGORIES:EXAM"), "a calendar should be able to colour them");
+        assert!(out.contains("SUMMARY:📝 M Schularbeit"));
+        assert!(out.contains("UID:exam42@stundenglas"), "stable across refreshes");
+        assert!(out.contains("LOCATION:A1"));
+    }
+
+    #[test]
+    fn nothing_ringeth_unless_asked() {
+        let out = Feed::default().render(
+            &[lesson(Status::Regular, "MAT")],
+            &[exam()],
+            Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
+        );
+        assert!(!out.contains("BEGIN:VALARM"), "an unasked-for alarm is an unkept calendar");
+    }
+
+    #[test]
+    fn an_alarm_rings_for_the_exam_and_not_the_lesson() {
+        let feed = Feed { remind_before: Some(30), ..Feed::default() };
+        let out = feed.render(
+            &[lesson(Status::Regular, "MAT")],
+            &[exam()],
+            Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
+        );
+        assert_eq!(out.matches("BEGIN:VALARM").count(), 1, "only the exam rings");
+        assert!(out.contains("TRIGGER:-PT30M"));
+    }
+
+    #[test]
+    fn a_whole_day_is_said_as_a_day() {
+        let feed = Feed { remind_before: Some(1440), ..Feed::default() };
+        let out = feed.render(&[], &[exam()], Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap());
+        assert!(out.contains("TRIGGER:-P1D"), "clients read this better than -PT1440M");
     }
 }
 
@@ -279,6 +389,6 @@ mod round_trip {
         // and the rendering is byte-identical
         let stamp = chrono::Utc::now();
         let feed = super::Feed::default();
-        assert_eq!(feed.render(&[before], stamp), feed.render(&[after], stamp));
+        assert_eq!(feed.render(&[before], &[], stamp), feed.render(&[after], &[], stamp));
     }
 }

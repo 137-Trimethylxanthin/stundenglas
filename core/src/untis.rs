@@ -202,6 +202,62 @@ pub struct Client {
     pub year: (NaiveDate, NaiveDate),
 }
 
+/// A written exam, which a timetable doth not carry and a student careth
+/// about more than any ordinary hour.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Exam {
+    pub id: i64,
+    pub start: Stamp,
+    pub end: Stamp,
+    /// The subject's short name, as the timetable spelleth it.
+    pub subject: String,
+    /// What the school called this one: "Schularbeit", "Test", and such.
+    pub kind: String,
+    /// A name the school gave this particular exam, if any.
+    pub name: String,
+    pub text: String,
+    pub teachers: Vec<String>,
+    pub rooms: Vec<String>,
+}
+
+impl Exam {
+    /// `📝 M Schularbeit` — the marker first, so it is plain in a crowded day.
+    pub fn title(&self) -> String {
+        let mut out = String::from("📝 ");
+        if !self.subject.is_empty() {
+            out.push_str(&self.subject);
+        }
+        for extra in [&self.kind, &self.name] {
+            if !extra.is_empty() && !out.contains(extra.as_str()) {
+                if !out.ends_with(' ') {
+                    out.push(' ');
+                }
+                out.push_str(extra);
+            }
+        }
+        out.trim().to_owned()
+    }
+
+    pub fn description(&self) -> String {
+        let mut lines = Vec::new();
+        if !self.text.is_empty() {
+            lines.push(self.text.clone());
+        }
+        if !self.teachers.is_empty() {
+            lines.push(format!("Mit {}", self.teachers.join(", ")));
+        }
+        if !self.rooms.is_empty() {
+            lines.push(format!("Raum {}", self.rooms.join(", ")));
+        }
+        lines.join("\n")
+    }
+
+    /// Stable across refreshes, and acceptable to Google as an event id.
+    pub fn event_id(&self) -> String {
+        format!("exam{}", self.id)
+    }
+}
+
 /// The school said no: a wrong password, or a login that wanteth a code we
 /// cannot give it. Worth a type of its own because the answer to it is the
 /// opposite of the answer to an outage — stop, rather than try again.
@@ -375,6 +431,45 @@ impl Client {
 
     /// `excuseStatusId=-1` meaneth *all*; the web page defaulteth to `-3`,
     /// which showeth only the unexcused and so hideth an approved leave.
+    /// Exams, from the classic endpoint: cookie-authenticated, compact dates,
+    /// and `klasseId=-1` without which it answereth nothing. Both are traps
+    /// SCOUT.md recordeth.
+    ///
+    /// Two shapes have been seen in the wild — a compact `examDate` with
+    /// `startTime`, and ISO `startDateTime` — so both are read, and an exam
+    /// that maketh sense in neither is passed over rather than failing the
+    /// refresh for the rest.
+    pub async fn fetch_exams(&self, from: NaiveDate, to: NaiveDate) -> Result<Vec<Exam>> {
+        let reply = self
+            .http
+            .get(format!("{}/WebUntis/api/exams", self.base))
+            .query(&[
+                ("studentId", self.person_id.to_string()),
+                // Not optional: without it the endpoint returns nothing at all.
+                ("klasseId", "-1".to_owned()),
+                ("startDate", from.format("%Y%m%d").to_string()),
+                ("endDate", to.format("%Y%m%d").to_string()),
+            ])
+            .send()
+            .await
+            .context("fetching exams")?;
+
+        let status = reply.status();
+        let body = reply.text().await?;
+        if !status.is_success() {
+            bail!("{status} fetching exams: {}", body.chars().take(200).collect::<String>());
+        }
+
+        let envelope: ExamEnvelope = serde_json::from_str(&body).context("decoding exams")?;
+        let zone = self.settings.timezone;
+        Ok(envelope
+            .exams()
+            .into_iter()
+            .filter_map(|raw| raw.into_exam(zone))
+            .filter(|exam| exam.end > exam.start)
+            .collect())
+    }
+
     pub async fn fetch_absences(&self, from: NaiveDate, to: NaiveDate) -> Result<Vec<Absence>> {
         let reply = self
             .http
@@ -422,6 +517,82 @@ fn itoa(value: i64) -> String {
 }
 
 /// Untis keepeth dates as 20260914 and hours as 800 or 2155.
+/// `{"data": {"exams": []}}` is what one tenant answered; a bare `{"exams": []}`
+/// is what another did. Neither is worth a failed refresh, so both are read.
+#[derive(Deserialize)]
+struct ExamEnvelope {
+    #[serde(default)]
+    data: Option<ExamData>,
+    #[serde(default)]
+    exams: Option<Vec<ExamRaw>>,
+}
+
+#[derive(Deserialize)]
+struct ExamData {
+    #[serde(default)]
+    exams: Option<Vec<ExamRaw>>,
+}
+
+impl ExamEnvelope {
+    fn exams(self) -> Vec<ExamRaw> {
+        self.data.and_then(|data| data.exams).or(self.exams).unwrap_or_default()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExamRaw {
+    #[serde(default)]
+    id: i64,
+    // The compact shape.
+    #[serde(default)]
+    exam_date: Option<i64>,
+    #[serde(default)]
+    start_time: Option<i64>,
+    #[serde(default)]
+    end_time: Option<i64>,
+    // The ISO shape.
+    #[serde(default)]
+    start_date_time: Option<String>,
+    #[serde(default)]
+    end_date_time: Option<String>,
+    #[serde(default)]
+    subject: String,
+    #[serde(default)]
+    exam_type: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    teachers: Vec<String>,
+    #[serde(default)]
+    rooms: Vec<String>,
+}
+
+impl ExamRaw {
+    fn into_exam(self, zone: Tz) -> Option<Exam> {
+        let (start, end) = match (&self.start_date_time, &self.end_date_time) {
+            (Some(from), Some(to)) => (parse_stamp(from, zone).ok()?, parse_stamp(to, zone).ok()?),
+            _ => {
+                let date = self.exam_date?;
+                (stamp(date, self.start_time?, zone).ok()?, stamp(date, self.end_time?, zone).ok()?)
+            }
+        };
+        Some(Exam {
+            id: self.id,
+            start,
+            end,
+            subject: self.subject,
+            kind: self.exam_type,
+            name: self.name,
+            text: self.text,
+            teachers: self.teachers,
+            rooms: self.rooms,
+        })
+    }
+}
+
 fn stamp(date: i64, time: i64, zone: Tz) -> Result<Stamp> {
     let date = NaiveDate::from_ymd_opt(
         (date / 10_000) as i32,
@@ -633,6 +804,52 @@ struct AbsenceRaw {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exams_are_read_in_the_compact_shape() {
+        let body = r#"{"data":{"exams":[{"id":42,"examDate":20260921,"startTime":800,
+            "endTime":940,"subject":"M","examType":"Schularbeit","name":"2. SA",
+            "text":"Kapitel 1-4","teachers":["MUS"],"rooms":["A1"]}]}}"#;
+        let envelope: super::ExamEnvelope = serde_json::from_str(body).unwrap();
+        let exams: Vec<_> = envelope
+            .exams()
+            .into_iter()
+            .filter_map(|raw| raw.into_exam(super::DEFAULT_TZ))
+            .collect();
+        assert_eq!(exams.len(), 1);
+        assert_eq!(exams[0].start.format("%H:%M").to_string(), "08:00");
+        assert_eq!(exams[0].end.format("%H:%M").to_string(), "09:40");
+        assert_eq!(exams[0].title(), "📝 M Schularbeit 2. SA");
+        assert!(exams[0].description().contains("Kapitel 1-4"));
+    }
+
+    #[test]
+    fn exams_are_read_in_the_iso_shape_too() {
+        let body = r#"{"exams":[{"id":7,"startDateTime":"2026-09-21T08:00",
+            "endDateTime":"2026-09-21T09:40","subject":"E","examType":"Test"}]}"#;
+        let envelope: super::ExamEnvelope = serde_json::from_str(body).unwrap();
+        let exams: Vec<_> = envelope
+            .exams()
+            .into_iter()
+            .filter_map(|raw| raw.into_exam(super::DEFAULT_TZ))
+            .collect();
+        assert_eq!(exams.len(), 1, "a tenant answering without the data wrapper is still read");
+        assert_eq!(exams[0].title(), "📝 E Test");
+    }
+
+    #[test]
+    fn an_exam_without_a_usable_time_is_passed_over_not_fatal() {
+        let body = r#"{"data":{"exams":[{"id":1,"subject":"M"},
+            {"id":2,"examDate":20260921,"startTime":800,"endTime":940,"subject":"D"}]}}"#;
+        let envelope: super::ExamEnvelope = serde_json::from_str(body).unwrap();
+        let exams: Vec<_> = envelope
+            .exams()
+            .into_iter()
+            .filter_map(|raw| raw.into_exam(super::DEFAULT_TZ))
+            .collect();
+        assert_eq!(exams.len(), 1, "one unreadable exam must not cost the others");
+        assert_eq!(exams[0].id, 2);
+    }
+
     use super::{Rejected, was_rejected};
 
     #[test]

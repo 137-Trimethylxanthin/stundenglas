@@ -90,6 +90,19 @@ impl Config {
     pub fn feed_url(&self, token: &str) -> String {
         format!("{}/cal/{token}.ics", self.public_url)
     }
+
+    /// The same address under the scheme calendars answer to. Tapping it on a
+    /// phone opens the subscribe dialogue instead of downloading a file once,
+    /// which is the difference between a calendar that follows the timetable
+    /// and a snapshot of the day it was fetched.
+    pub fn webcal_url(&self, token: &str) -> String {
+        let bare = self
+            .public_url
+            .strip_prefix("https://")
+            .or_else(|| self.public_url.strip_prefix("http://"))
+            .unwrap_or(&self.public_url);
+        format!("webcal://{bare}/cal/{token}.ics")
+    }
 }
 
 impl std::fmt::Debug for Config {
@@ -159,6 +172,7 @@ mod tests {
             keep_days: 180,
         };
         assert_eq!(config.feed_url("abc"), "https://example.test/cal/abc.ics");
+        assert_eq!(config.webcal_url("abc"), "webcal://example.test/cal/abc.ics");
         config.public_url = "https://example.test".to_owned();
         assert!(!config.feed_url("abc").contains("//cal"));
     }

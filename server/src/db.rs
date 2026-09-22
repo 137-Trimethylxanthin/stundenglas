@@ -6,7 +6,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
-use stundenglas_core::{Credentials, DEFAULT_TZ, Lesson};
+use stundenglas_core::{Credentials, DEFAULT_TZ, Exam, Lesson};
 use uuid::Uuid;
 
 use crate::crypto::{KEY_VERSION, Sealed, Sealer};
@@ -168,9 +168,13 @@ pub async fn set_identity(
 
 #[derive(Debug, Clone)]
 pub struct Feed {
+    pub id: Uuid,
     pub token: String,
     pub keep_cancelled: bool,
     pub refresh_minutes: i32,
+    /// Minutes before an exam to ring. None, and nothing rings.
+    pub remind_before_minutes: Option<i32>,
+    pub label: Option<String>,
     pub display_name: Option<String>,
 }
 
@@ -178,51 +182,92 @@ pub struct Feed {
 pub struct FeedPayload {
     pub feed: Feed,
     pub lessons: Vec<Lesson>,
+    pub exams: Vec<Exam>,
     pub etag: Option<String>,
     pub fetched_at: Option<DateTime<Utc>>,
+}
+
+fn feed_from(row: &PgRow, display_name: Option<String>) -> Feed {
+    Feed {
+        id: row.get("id"),
+        token: row.get("token"),
+        keep_cancelled: row.get("keep_cancelled"),
+        refresh_minutes: row.get("refresh_minutes"),
+        remind_before_minutes: row.try_get("remind_before_minutes").ok().flatten(),
+        label: row.try_get("label").ok().flatten(),
+        display_name,
+    }
 }
 
 pub async fn create_feed(pool: &PgPool, account: Uuid, token: &str) -> Result<Feed> {
     let row = sqlx::query(
         "insert into feeds (untis_account_id, token) values ($1, $2)
-         returning token, untis_account_id, keep_cancelled, refresh_minutes",
+         returning id, token, untis_account_id, keep_cancelled, refresh_minutes,
+                   remind_before_minutes, label",
     )
     .bind(account)
     .bind(token)
     .fetch_one(pool)
     .await
     .context("creating the feed")?;
-    Ok(Feed {
-        token: row.get("token"),
-        keep_cancelled: row.get("keep_cancelled"),
-        refresh_minutes: row.get("refresh_minutes"),
-        display_name: None,
-    })
+    Ok(feed_from(&row, None))
+}
+
+/// What a feed's owner may change about it. Bounded here as well as in the
+/// schema: a form is only as honest as the hand that sendeth it.
+pub struct FeedSettings {
+    pub keep_cancelled: bool,
+    pub refresh_minutes: i32,
+    pub remind_before_minutes: Option<i32>,
+    pub label: Option<String>,
+}
+
+/// Updating by owner as well as by id, so another user's feed simply matcheth
+/// nothing and there is no separate check to forget.
+pub async fn update_feed(
+    pool: &PgPool,
+    user_id: Uuid,
+    feed: Uuid,
+    want: &FeedSettings,
+) -> Result<bool> {
+    let done = sqlx::query(
+        "update feeds f
+            set keep_cancelled = $3,
+                refresh_minutes = $4,
+                remind_before_minutes = $5,
+                label = $6
+           from untis_accounts a
+          where f.id = $1 and f.untis_account_id = a.id and a.user_id = $2",
+    )
+    .bind(feed)
+    .bind(user_id)
+    .bind(want.keep_cancelled)
+    .bind(want.refresh_minutes.clamp(5, 1440))
+    .bind(want.remind_before_minutes.map(|m| m.clamp(5, 10_080)))
+    .bind(want.label.as_deref().filter(|l| !l.is_empty()))
+    .execute(pool)
+    .await
+    .context("changing the feed")?;
+    Ok(done.rows_affected() > 0)
 }
 
 pub async fn feeds_of(pool: &PgPool, account: Uuid) -> Result<Vec<Feed>> {
     let rows = sqlx::query(
-        "select token, untis_account_id, keep_cancelled, refresh_minutes
+        "select id, token, untis_account_id, keep_cancelled, refresh_minutes,
+                remind_before_minutes, label
            from feeds where untis_account_id = $1 order by created_at",
     )
     .bind(account)
     .fetch_all(pool)
     .await?;
-    Ok(rows
-        .iter()
-        .map(|r| Feed {
-            token: r.get("token"),
-            keep_cancelled: r.get("keep_cancelled"),
-            refresh_minutes: r.get("refresh_minutes"),
-            display_name: None,
-        })
-        .collect())
+    Ok(rows.iter().map(|row| feed_from(row, None)).collect())
 }
 
 pub async fn feed_by_token(pool: &PgPool, token: &str) -> Result<Option<FeedPayload>> {
     let Some(row) = sqlx::query(
-        "select f.token, f.untis_account_id, f.keep_cancelled, f.refresh_minutes,
-                a.display_name, s.lessons, s.etag, s.last_ok_at
+        "select f.id, f.token, f.untis_account_id, f.keep_cancelled, f.refresh_minutes,
+                f.remind_before_minutes, f.label,
+                a.display_name, s.lessons, s.exams, s.etag, s.last_ok_at
            from feeds f
            join untis_accounts a on a.id = f.untis_account_id
            left join sync_state s on s.untis_account_id = f.untis_account_id
@@ -235,20 +280,25 @@ pub async fn feed_by_token(pool: &PgPool, token: &str) -> Result<Option<FeedPayl
         return Ok(None);
     };
 
-    let raw: Option<serde_json::Value> = row.try_get("lessons").ok().flatten();
-    let lessons: Vec<Lesson> = match raw {
-        Some(value) => serde_json::from_value(value).unwrap_or_default(),
-        None => Vec::new(),
-    };
+    // A cache written by an older build, or by a hand, must not take the feed
+    // down with it: an unreadable column reads as nothing.
+    let lessons: Vec<Lesson> = row
+        .try_get::<Option<serde_json::Value>, _>("lessons")
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    let exams: Vec<Exam> = row
+        .try_get::<Option<serde_json::Value>, _>("exams")
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
 
     Ok(Some(FeedPayload {
-        feed: Feed {
-            token: row.get("token"),
-            keep_cancelled: row.get("keep_cancelled"),
-            refresh_minutes: row.get("refresh_minutes"),
-            display_name: row.try_get("display_name").ok().flatten(),
-        },
+        feed: feed_from(&row, row.try_get("display_name").ok().flatten()),
         lessons,
+        exams,
         etag: row.try_get("etag").ok().flatten(),
         fetched_at: row.try_get("last_ok_at").ok().flatten(),
     }))
@@ -271,18 +321,23 @@ pub async fn store_sync(
     pool: &PgPool,
     account: Uuid,
     lessons: &[Lesson],
+    exams: &[Exam],
     etag: String,
     window: (NaiveDate, NaiveDate),
 ) -> Result<()> {
     let payload = serde_json::to_value(lessons)?;
+    let sat = serde_json::to_value(exams)?;
     sqlx::query(
         "insert into sync_state
-            (untis_account_id, lessons, lesson_count, etag, window_start, window_end,
-             last_ok_at, last_error, last_error_at, consecutive_fails)
-         values ($1, $2, $3, $4, $5, $6, now(), null, null, 0)
+            (untis_account_id, lessons, lesson_count, exams, exam_count, etag,
+             window_start, window_end, last_ok_at, last_error, last_error_at,
+             consecutive_fails)
+         values ($1, $2, $3, $7, $8, $4, $5, $6, now(), null, null, 0)
          on conflict (untis_account_id) do update
             set lessons = excluded.lessons,
                 lesson_count = excluded.lesson_count,
+                exams = excluded.exams,
+                exam_count = excluded.exam_count,
                 etag = excluded.etag,
                 window_start = excluded.window_start,
                 window_end = excluded.window_end,
@@ -298,6 +353,8 @@ pub async fn store_sync(
     .bind(etag)
     .bind(window.0)
     .bind(window.1)
+    .bind(sat)
+    .bind(exams.len() as i32)
     .execute(pool)
     .await
     .context("storing the timetable")?;
@@ -391,8 +448,9 @@ pub async fn replace_password(
 pub async fn forget_stale(pool: &PgPool, days: i64) -> Result<u64> {
     let done = sqlx::query(
         "update sync_state
-            set lessons = '[]'::jsonb, lesson_count = 0, etag = null
-          where lesson_count > 0
+            set lessons = '[]'::jsonb, lesson_count = 0,
+                exams = '[]'::jsonb, exam_count = 0, etag = null
+          where (lesson_count > 0 or exam_count > 0)
             and coalesce(last_ok_at, updated_at) < now() - make_interval(days => $1::int)",
     )
     .bind(days as i32)
@@ -426,19 +484,22 @@ pub async fn delete_account(pool: &PgPool, user_id: Uuid, account: Uuid) -> Resu
 #[derive(Debug, Clone)]
 pub struct SyncStatus {
     pub lesson_count: i32,
+    pub exam_count: i32,
     pub last_ok_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
 }
 
 pub async fn sync_status(pool: &PgPool, account: Uuid) -> Result<Option<SyncStatus>> {
     let row = sqlx::query(
-        "select lesson_count, last_ok_at, last_error from sync_state where untis_account_id = $1",
+        "select lesson_count, exam_count, last_ok_at, last_error
+           from sync_state where untis_account_id = $1",
     )
     .bind(account)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|r| SyncStatus {
         lesson_count: r.get("lesson_count"),
+        exam_count: r.try_get("exam_count").unwrap_or(0),
         last_ok_at: r.try_get("last_ok_at").ok().flatten(),
         last_error: r.try_get("last_error").ok().flatten(),
     }))
