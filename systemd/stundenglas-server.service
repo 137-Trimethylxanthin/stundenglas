@@ -1,0 +1,37 @@
+[Unit]
+Description=The stundenglas service: accounts, scheduler, calendar feeds
+Documentation=https://github.com/OWNER/stundenglas
+# It speaks to Supabase and to the schools the moment it starts.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stundenglas
+# STUNDENGLAS_KEY, DATABASE_URL, SUPABASE_*, PUBLIC_URL, LISTEN, ADMIN_EMAILS
+# and, if you want the Google push, GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.
+# Keep it mode 0600 and owned by root: it holds the key that opens the
+# stored passwords, so it must not sit where the database backups go.
+EnvironmentFile=/etc/stundenglas/server.env
+ExecStart=/usr/local/bin/stundenglas-server
+# Postgres or Supabase being briefly away must not end the service; a
+# subscriber's calendar would simply stop refreshing.
+Restart=always
+RestartSec=10
+# It writes nothing to disk, so it may have nothing. In an unprivileged LXC
+# these need `features: nesting=1` on the container; without it systemd
+# cannot make the mount namespace and the unit refuses to start.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+# AF_UNIX because tokio's signal handling is a socketpair, and AF_NETLINK
+# because glibc's resolver asks the kernel which interfaces exist. Deny
+# either and the service dies before it ever listens.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
