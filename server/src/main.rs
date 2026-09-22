@@ -79,6 +79,12 @@ enum Command {
     },
     /// Refresh every account once and exit.
     SyncNow,
+    /// Re-seal every stored secret under a new key.
+    ///
+    /// Set STUNDENGLAS_KEY to the new key, STUNDENGLAS_KEY_OLD to the one
+    /// being retired, and STUNDENGLAS_KEY_VERSION one higher than it was.
+    /// Safe to run again: rows already at the new version are passed over.
+    RotateKey,
 }
 
 #[tokio::main]
@@ -128,6 +134,33 @@ async fn main() -> Result<()> {
             google::adopt_refresh_token(&state, account, &refresh, &calendar).await?;
             println!("linked; the next refresh will push");
         }
+        Some(Command::RotateKey) => {
+            let Some(old) = state.config.retiring.clone() else {
+                anyhow::bail!(
+                    "STUNDENGLAS_KEY_OLD is not set, so there is no key to retire. \
+                     Set it to the old key, STUNDENGLAS_KEY to the new one, and \
+                     STUNDENGLAS_KEY_VERSION one higher than it was"
+                );
+            };
+            if old.version() >= state.config.sealer.version() {
+                anyhow::bail!(
+                    "STUNDENGLAS_KEY_VERSION is still {}; raise it, or the rotation \
+                     cannot tell a re-sealed row from one yet to do",
+                    state.config.sealer.version()
+                );
+            }
+            let (done, stuck) = db::rotate_key(&state.pool, &old, &state.config.sealer).await?;
+            println!(
+                "re-sealed {done} secret(s) under key version {}",
+                state.config.sealer.version()
+            );
+            if stuck > 0 {
+                println!(
+                    "{stuck} could not be opened by the retiring key and were left alone; \
+                     see the log for which"
+                );
+            }
+        }
         Some(Command::SyncNow) => {
             let done = sync::once(state).await?;
             println!("refreshed {done} account(s)");
@@ -152,6 +185,8 @@ async fn serve(state: AppState) -> Result<()> {
         .route("/links/{id}/delete", post(web::drop_link))
         .route("/links/{id}/password", post(web::new_password))
         .route("/feeds/{id}/settings", post(web::feed_settings))
+        .route("/feeds/{id}/rotate", post(web::rotate_feed))
+        .route("/feeds/{id}/delete", post(web::drop_feed))
         .route("/links/{id}/google", get(google::begin))
         .route("/links/{id}/google/delete", post(google::unlink))
         .route("/google/callback", get(google::callback))

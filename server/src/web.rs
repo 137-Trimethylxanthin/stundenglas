@@ -330,6 +330,16 @@ async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) 
                                 }
                                 p {} button type="submit" { "Save" }
                             }
+                            .actions {
+                                form method="post" action={ "/feeds/" (feed.id) "/rotate" }
+                                     onsubmit="return confirm('Draw a new address? Whatever is subscribed to the old one stops updating.')" {
+                                    button type="submit" { "New address" }
+                                }
+                                form method="post" action={ "/feeds/" (feed.id) "/delete" }
+                                     onsubmit="return confirm('Delete this link? Anything subscribed to it stops updating.')" {
+                                    button.danger type="submit" { "Delete link" }
+                                }
+                            }
                         }
                     }
                     @if *google {
@@ -453,6 +463,42 @@ pub async fn feed_settings(
         Ok(false) => (StatusCode::NOT_FOUND, "no such link").into_response(),
         Err(err) => dashboard(state, user, Some(format!("{err}"))).await,
     }
+}
+
+/// `POST /feeds/{id}/rotate`
+///
+/// A new address for a link whose old one got out, keeping its settings. The
+/// old address stops working at once, so whatever subscribed to it must be
+/// pointed at the new one.
+pub async fn rotate_feed(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(feed): Path<Uuid>,
+) -> Response {
+    let Some(user) = current(&state, &jar).await else {
+        return Redirect::to("/").into_response();
+    };
+    let Ok(token) = crate::admin::mint_token() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "could not draw a new address").into_response();
+    };
+    match db::rotate_token(&state.pool, user.id, feed, &token).await {
+        Ok(true) => Redirect::to("/").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such link").into_response(),
+        Err(err) => dashboard(state, user, Some(format!("{err}"))).await,
+    }
+}
+
+/// `POST /feeds/{id}/delete`
+pub async fn drop_feed(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(feed): Path<Uuid>,
+) -> Response {
+    let Some(user) = current(&state, &jar).await else {
+        return Redirect::to("/").into_response();
+    };
+    let _ = db::delete_feed(&state.pool, user.id, feed).await;
+    Redirect::to("/").into_response()
 }
 
 /// `GET /privacy`

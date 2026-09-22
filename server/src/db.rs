@@ -9,7 +9,7 @@ use sqlx::{PgPool, Row};
 use stundenglas_core::{Credentials, DEFAULT_TZ, Exam, Homework, Lesson};
 use uuid::Uuid;
 
-use crate::crypto::{KEY_VERSION, Sealed, Sealer};
+use crate::crypto::{Sealed, Sealer};
 
 pub async fn connect(url: &str) -> Result<PgPool> {
     PgPoolOptions::new()
@@ -91,7 +91,7 @@ pub async fn add_account(pool: &PgPool, sealer: &Sealer, new: &NewAccount) -> Re
     .bind(&new.username)
     .bind(&sealed.ciphertext)
     .bind(&sealed.nonce)
-    .bind(KEY_VERSION)
+    .bind(sealer.version())
     .bind(new.timezone.name())
     .fetch_one(pool)
     .await
@@ -447,7 +447,7 @@ pub async fn replace_password(
     .bind(user_id)
     .bind(&sealed.ciphertext)
     .bind(&sealed.nonce)
-    .bind(KEY_VERSION)
+    .bind(sealer.version())
     .execute(pool)
     .await
     .context("storing the new password")?;
@@ -573,4 +573,128 @@ pub async fn export_for(pool: &PgPool, user_id: Uuid) -> Result<serde_json::Valu
                  Nor is any Google token, which Google alone can reissue.",
         "schools": schools,
     }))
+}
+
+// ------------------------------------------------------------- rotation ---
+
+/// One row's sealed secret, and where it liveth.
+struct Rotatable {
+    id: Uuid,
+    sealed: Sealed,
+}
+
+/// Re-seal everything the retiring key holdeth under the new one.
+///
+/// Row by row, each in its own statement: a rotation interrupted half way
+/// leaveth every row at one version or the other, never in between, and
+/// running it again finisheth the job rather than starting it afresh.
+pub async fn rotate_key(pool: &PgPool, old: &Sealer, new: &Sealer) -> Result<(usize, usize)> {
+    let mut done = 0;
+    let mut stuck = 0;
+
+    // The school passwords.
+    let rows = sqlx::query(
+        "select id, secret, nonce from untis_accounts where key_version <> $1 order by created_at",
+    )
+    .bind(new.version())
+    .fetch_all(pool)
+    .await
+    .context("listing the accounts to rotate")?;
+
+    for row in &rows {
+        let one = Rotatable {
+            id: row.get("id"),
+            sealed: Sealed { ciphertext: row.get("secret"), nonce: row.get("nonce") },
+        };
+        match old.unseal(&one.sealed).and_then(|plain| new.seal(&plain)) {
+            Ok(sealed) => {
+                sqlx::query(
+                    "update untis_accounts set secret = $2, nonce = $3, key_version = $4
+                      where id = $1",
+                )
+                .bind(one.id)
+                .bind(&sealed.ciphertext)
+                .bind(&sealed.nonce)
+                .bind(new.version())
+                .execute(pool)
+                .await
+                .context("re-sealing an account")?;
+                done += 1;
+            }
+            // A row the retiring key cannot open is left exactly as it was,
+            // and named, rather than quietly lost.
+            Err(err) => {
+                tracing::error!(account = %one.id, "cannot re-seal: {err:#}");
+                stuck += 1;
+            }
+        }
+    }
+
+    // The Google refresh tokens, sealed the same way.
+    let rows = sqlx::query(
+        "select untis_account_id, refresh_secret, refresh_nonce from google_links
+          where key_version <> $1",
+    )
+    .bind(new.version())
+    .fetch_all(pool)
+    .await
+    .context("listing the Google links to rotate")?;
+
+    for row in &rows {
+        let id: Uuid = row.get("untis_account_id");
+        let sealed =
+            Sealed { ciphertext: row.get("refresh_secret"), nonce: row.get("refresh_nonce") };
+        match old.unseal(&sealed).and_then(|plain| new.seal(&plain)) {
+            Ok(fresh) => {
+                sqlx::query(
+                    "update google_links
+                        set refresh_secret = $2, refresh_nonce = $3, key_version = $4
+                      where untis_account_id = $1",
+                )
+                .bind(id)
+                .bind(&fresh.ciphertext)
+                .bind(&fresh.nonce)
+                .bind(new.version())
+                .execute(pool)
+                .await
+                .context("re-sealing a Google link")?;
+                done += 1;
+            }
+            Err(err) => {
+                tracing::error!(account = %id, "cannot re-seal the Google link: {err:#}");
+                stuck += 1;
+            }
+        }
+    }
+    Ok((done, stuck))
+}
+
+/// Deleting by owner as well as by id, as everywhere else here.
+pub async fn delete_feed(pool: &PgPool, user_id: Uuid, feed: Uuid) -> Result<u64> {
+    let done = sqlx::query(
+        "delete from feeds f using untis_accounts a
+          where f.id = $1 and f.untis_account_id = a.id and a.user_id = $2",
+    )
+    .bind(feed)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected())
+}
+
+/// A fresh address for a link, keeping everything else about it. The old
+/// address stops working the moment this returneth.
+pub async fn rotate_token(pool: &PgPool, user_id: Uuid, feed: Uuid, token: &str) -> Result<bool> {
+    let done = sqlx::query(
+        "update feeds f set token = $3
+           from untis_accounts a
+          where f.id = $1 and f.untis_account_id = a.id and a.user_id = $2",
+    )
+    .bind(feed)
+    .bind(user_id)
+    .bind(token)
+    .execute(pool)
+    .await
+    .context("rotating the address")?;
+    Ok(done.rows_affected() > 0)
 }

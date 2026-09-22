@@ -14,7 +14,7 @@ use std::pin::Pin;
 use stundenglas_core::{Lesson, gcal};
 use uuid::Uuid;
 
-use crate::crypto::{KEY_VERSION, Sealed};
+use crate::crypto::Sealed;
 use crate::{AppState, db};
 
 const AUTH: &str = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -149,7 +149,7 @@ async fn finish(state: &AppState, code: &str, account: Uuid) -> Result<()> {
     )?;
 
     let sealed = state.config.sealer.seal(&refresh)?;
-    put_link(&state.pool, account, &sealed).await
+    put_link(&state.pool, account, &sealed, state.config.sealer.version()).await
 }
 
 pub async fn unlink(
@@ -195,7 +195,7 @@ async fn spend_state(pool: &PgPool, token: &str) -> Result<Option<(Uuid, Uuid)>>
     Ok(row.map(|r| (r.get("user_id"), r.get("untis_account_id"))))
 }
 
-async fn put_link(pool: &PgPool, account: Uuid, sealed: &Sealed) -> Result<()> {
+async fn put_link(pool: &PgPool, account: Uuid, sealed: &Sealed, version: i32) -> Result<()> {
     sqlx::query(
         "insert into google_links (untis_account_id, refresh_secret, refresh_nonce, key_version)
          values ($1, $2, $3, $4)
@@ -207,7 +207,7 @@ async fn put_link(pool: &PgPool, account: Uuid, sealed: &Sealed) -> Result<()> {
     .bind(account)
     .bind(&sealed.ciphertext)
     .bind(&sealed.nonce)
-    .bind(KEY_VERSION)
+    .bind(version)
     .execute(pool)
     .await
     .context("storing the Google link")?;
@@ -248,7 +248,7 @@ pub async fn adopt_refresh_token(
     calendar_name: &str,
 ) -> Result<()> {
     let sealed = state.config.sealer.seal(refresh)?;
-    put_link(&state.pool, account, &sealed).await?;
+    put_link(&state.pool, account, &sealed, state.config.sealer.version()).await?;
     sqlx::query("update google_links set calendar_name = $2 where untis_account_id = $1")
         .bind(account)
         .bind(calendar_name)

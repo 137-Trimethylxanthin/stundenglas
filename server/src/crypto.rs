@@ -9,8 +9,9 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-/// The version stamped on every row, so a key may one day be retired without
-/// rendering what it sealed unreadable.
+/// The version stamped on a row sealed by the first key. A rotation raiseth
+/// it, and the number on the row is what telleth which key openeth it — and,
+/// during a rotation, which rows are already done.
 pub const KEY_VERSION: i32 = 1;
 
 const NONCE_LEN: usize = 12;
@@ -19,6 +20,7 @@ const KEY_LEN: usize = 32;
 #[derive(Clone)]
 pub struct Sealer {
     cipher: Aes256Gcm,
+    version: i32,
 }
 
 impl std::fmt::Debug for Sealer {
@@ -46,7 +48,17 @@ impl Sealer {
             bail!("the key must be {KEY_LEN} bytes, but {} were given", bytes.len());
         }
         let key = Key::<Aes256Gcm>::from_slice(bytes);
-        Ok(Self { cipher: Aes256Gcm::new(key) })
+        Ok(Self { cipher: Aes256Gcm::new(key), version: KEY_VERSION })
+    }
+
+    /// Which generation this key is. Stamped on every row it sealeth.
+    pub fn version(&self) -> i32 {
+        self.version
+    }
+
+    pub fn with_version(mut self, version: i32) -> Self {
+        self.version = version;
+        self
     }
 
     /// A fresh key, for the operator to store and never lose.
@@ -81,6 +93,22 @@ impl Sealer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_rotation_is_a_new_key_and_a_new_version() {
+        let old = Sealer::from_bytes(&[1; 32]).unwrap();
+        let new = Sealer::from_bytes(&[2; 32]).unwrap().with_version(2);
+        assert_eq!(old.version(), 1, "the first key is version one");
+        assert_eq!(new.version(), 2);
+
+        let sealed = old.seal("hunter2").unwrap();
+        assert!(new.unseal(&sealed).is_err(), "the new key must not open the old ciphertext");
+
+        // What rotation does, in two lines.
+        let resealed = new.seal(&old.unseal(&sealed).unwrap()).unwrap();
+        assert_eq!(new.unseal(&resealed).unwrap(), "hunter2");
+        assert!(old.unseal(&resealed).is_err(), "and the retired key no longer opens it");
+    }
+
     use super::*;
 
     fn sealer() -> Sealer {

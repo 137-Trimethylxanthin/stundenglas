@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::crypto::{KEY_VERSION, Sealed};
+use crate::crypto::Sealed;
 
 /// What a user hath enrolled.
 #[derive(Debug, Clone, Serialize)]
@@ -241,7 +241,7 @@ pub async fn park(state: &AppState, user: Uuid, factor: Uuid, gotrue: &str) -> R
     .bind(factor)
     .bind(&sealed.ciphertext)
     .bind(&sealed.nonce)
-    .bind(KEY_VERSION)
+    .bind(state.config.sealer.version())
     .bind(Utc::now() + Duration::minutes(10))
     .execute(&state.pool)
     .await

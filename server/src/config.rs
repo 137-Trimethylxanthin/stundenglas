@@ -28,6 +28,8 @@ pub struct Config {
     pub supabase_service_key: String,
     /// Sealeth and unsealeth the stored passwords.
     pub sealer: Sealer,
+    /// The key being retired, while a rotation is under way.
+    pub retiring: Option<Sealer>,
     /// How often each account is refreshed from WebUntis.
     pub sync_every: Duration,
     /// How many accounts are refreshed at once.
@@ -53,7 +55,18 @@ impl Config {
             "no encryption key. Generate one with `stundenglas-server --generate-key` \
              and keep it somewhere the database is not",
         )?;
-        let sealer = Sealer::from_base64(&key)?;
+        let version: i32 = or("STUNDENGLAS_KEY_VERSION", "1").parse().unwrap_or(1);
+        let sealer = Sealer::from_base64(&key)?.with_version(version);
+
+        // Only wanted while a rotation is running, and best removed after.
+        let retiring = match std::env::var("STUNDENGLAS_KEY_OLD") {
+            Ok(old) if !old.is_empty() => Some(
+                Sealer::from_base64(&old)
+                    .context("STUNDENGLAS_KEY_OLD is not a valid key")?
+                    .with_version(version - 1),
+            ),
+            _ => None,
+        };
 
         let minutes: u64 = or("SYNC_EVERY_MINUTES", "30").parse().unwrap_or(30);
         if minutes < 5 {
@@ -69,6 +82,7 @@ impl Config {
             supabase_anon_key: need("SUPABASE_ANON_KEY")?,
             supabase_service_key: need("SUPABASE_SERVICE_KEY")?,
             sealer,
+            retiring,
             sync_every: Duration::from_secs(minutes * 60),
             sync_lanes: lanes.clamp(1, 32),
             google: match (std::env::var("GOOGLE_CLIENT_ID"), std::env::var("GOOGLE_CLIENT_SECRET"))
@@ -138,6 +152,7 @@ mod tests {
             supabase_anon_key: "anon-key-material".to_owned(),
             supabase_service_key: "service-key-material".to_owned(),
             sealer: Sealer::from_bytes(&[7; 32]).unwrap(),
+            retiring: None,
             sync_every: Duration::from_secs(1800),
             sync_lanes: 4,
             google: Some(GoogleClient {
@@ -165,6 +180,7 @@ mod tests {
             supabase_anon_key: String::new(),
             supabase_service_key: String::new(),
             sealer: Sealer::from_bytes(&[0; 32]).unwrap(),
+            retiring: None,
             sync_every: Duration::from_secs(1800),
             sync_lanes: 1,
             google: None,
