@@ -839,6 +839,15 @@ pub async fn new_password(
         // Owned by someone else, or gone: say nothing either way.
         Ok(false) => (StatusCode::NOT_FOUND, "no such school").into_response(),
         Ok(true) => {
+            // Said once already; should it be refused again, it is worth
+            // saying again.
+            crate::post::forget(
+                &state.pool,
+                user.id,
+                crate::post::Notice::PasswordRefused,
+                account,
+            )
+            .await;
             // Try it at once, so they learn straight away whether it took.
             let soon = state.clone();
             tokio::spawn(async move {
@@ -1244,7 +1253,12 @@ pub async fn admin_decide(
     if !people::profile(&state.pool, user.id).await.is_some_and(|p| p.is_admin) {
         return (StatusCode::NOT_FOUND, "no such page").into_response();
     }
-    let _ = people::set_approved(&state.pool, who, user.id, what == "approve").await;
+    let admitting = what == "approve";
+    let _ = people::set_approved(&state.pool, who, user.id, admitting).await;
+    if admitting {
+        // They signed up and were told to wait; this is the end of the waiting.
+        let _ = crate::post::tell(&state, who, crate::post::Notice::Admitted, None).await;
+    }
     Redirect::to("/admin").into_response()
 }
 

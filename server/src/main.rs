@@ -11,6 +11,7 @@ mod google;
 mod guard;
 mod mfa;
 mod people;
+mod post;
 mod schools;
 mod sync;
 mod web;
@@ -32,6 +33,9 @@ pub struct AppState {
     pub pool: PgPool,
     /// Counts misses at the feed route, and turns away whoever is guessing.
     pub guard: Arc<guard::Guard>,
+    /// How to reach people who are not looking at the page. None, and nobody
+    /// is told anything, which is the default.
+    pub mail: Option<Arc<post::Mailer>>,
     pub config: Arc<Config>,
     /// One client, so connections to Supabase are kept and reused.
     pub http: reqwest::Client,
@@ -112,6 +116,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         pool,
         guard: Arc::new(guard::Guard::default()),
+        mail: post::Mailer::from_env()?.map(Arc::new),
         config: Arc::new(config),
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
@@ -176,6 +181,9 @@ async fn main() -> Result<()> {
 
 async fn serve(state: AppState) -> Result<()> {
     tracing::info!(config = ?state.config, "starting");
+    if state.mail.is_none() {
+        tracing::info!("no SMTP_URL; nobody will be told anything by email");
+    }
     let scheduler = tokio::spawn(sync::run(state.clone()));
 
     let listen = state.config.listen.clone();

@@ -28,6 +28,7 @@ pub async fn run(state: AppState) {
         if let Err(err) = once(state.clone()).await {
             tracing::error!("sync round failed: {err:#}");
         }
+        tell_the_stalled(&state).await;
     }
 }
 
@@ -61,6 +62,17 @@ pub async fn once(state: AppState) -> Result<usize> {
                     // the account, the other should be tried again shortly.
                     let kind = if untis::was_rejected(&err) {
                         tracing::warn!(account = %id, "login refused; waiting for a new password");
+                        // Nobody is looking at the page when this happens, and
+                        // nothing refreshes until they do something about it.
+                        if let Some(owner) = crate::db::owner_of(&state.pool, id).await {
+                            let _ = crate::post::tell(
+                                &state,
+                                owner,
+                                crate::post::Notice::PasswordRefused,
+                                Some(id),
+                            )
+                            .await;
+                        }
                         Failure::Rejected
                     } else {
                         tracing::warn!(account = %id, "refresh failed: {err:#}");
@@ -81,6 +93,21 @@ pub async fn once(state: AppState) -> Result<usize> {
         }
     }
     Ok(done)
+}
+
+/// A link that has been failing for a day is worth a word. A refused password
+/// has already had its own, and is left out here.
+async fn tell_the_stalled(state: &AppState) {
+    let stalled = match crate::db::stalled_since(&state.pool, 24).await {
+        Ok(found) => found,
+        Err(err) => {
+            tracing::warn!("could not look for stalled links: {err:#}");
+            return;
+        }
+    };
+    for (account, owner) in stalled {
+        let _ = crate::post::tell(state, owner, crate::post::Notice::Stalled, Some(account)).await;
+    }
 }
 
 async fn fetch_one(state: AppState, entry: crate::db::AccountWithSecret) -> Result<usize> {

@@ -815,3 +815,47 @@ pub async fn health(pool: &PgPool) -> Result<Vec<Health>> {
         })
         .collect())
 }
+
+/// Links that have not refreshed in this many hours, and whose they are. A
+/// refused password is left out: it has had a word of its own, and saying both
+/// would be saying the same thing twice.
+pub async fn stalled_since(pool: &PgPool, hours: i64) -> Result<Vec<(Uuid, Uuid)>> {
+    let rows = sqlx::query(
+        "select a.id, a.user_id
+           from untis_accounts a
+           join sync_state s on s.untis_account_id = a.id
+          where a.enabled
+            and not a.credentials_rejected
+            and s.consecutive_fails > 0
+            and coalesce(s.last_ok_at, s.updated_at) < now() - make_interval(hours => $1::int)",
+    )
+    .bind(hours as i32)
+    .fetch_all(pool)
+    .await
+    .context("looking for stalled links")?;
+    Ok(rows.iter().map(|r| (r.get("id"), r.get("user_id"))).collect())
+}
+
+/// Whose link this is, for telling them about it.
+pub async fn owner_of(pool: &PgPool, account: Uuid) -> Option<Uuid> {
+    sqlx::query("select user_id from untis_accounts where id = $1")
+        .bind(account)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .map(|row| row.get("user_id"))
+}
+
+/// How to name one school link to its owner: the school as they typed it.
+pub async fn name_of(pool: &PgPool, account: Uuid) -> Result<Option<String>> {
+    let row = sqlx::query("select school, username from untis_accounts where id = $1")
+        .bind(account)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| {
+        let school: String = r.get("school");
+        let username: String = r.get("username");
+        format!("{school} ({username})")
+    }))
+}

@@ -68,6 +68,11 @@ export SUPABASE_SERVICE_KEY=…      PUBLIC_URL=https://your.host
 export GOOGLE_CLIENT_ID=…          GOOGLE_CLIENT_SECRET=…
 # optional: how long a timetable nobody refreshes is kept (default 180 days)
 export KEEP_DAYS=180
+# optional, to tell people when something needs them — a refused password,
+# a link that has stalled for a day, an account admitted. Without it the
+# pages say all of this and nothing is sent:
+export SMTP_URL=smtps://user:pass@smtp.example.test:465
+export MAIL_FROM="stundenglas <noreply@example.test>"
 cargo run -p stundenglas-server
 ```
 
