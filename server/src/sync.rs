@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use stundenglas_core::{Lesson, untis};
 
 use crate::AppState;
+use crate::db::Failure;
 
 /// One WebUntis session lasteth half an hour, so each run logs in afresh
 /// rather than holding sessions open for every account at once.
@@ -17,6 +18,13 @@ pub async fn run(state: AppState) {
         ticker.tick().await;
         crate::auth::sweep(&state.pool).await;
         crate::mfa::sweep(&state).await;
+        // A timetable nobody is refreshing is stale, and is still somebody's
+        // whereabouts. Forget the lessons, keep the link.
+        match crate::db::forget_stale(&state.pool, state.config.keep_days).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(count = n, "forgot stale timetables"),
+            Err(err) => tracing::warn!("could not forget stale timetables: {err:#}"),
+        }
         if let Err(err) = once(state.clone()).await {
             tracing::error!("sync round failed: {err:#}");
         }
@@ -48,8 +56,18 @@ pub async fn once(state: AppState) -> Result<usize> {
                     true
                 }
                 Err(err) => {
-                    tracing::warn!(account = %id, "refresh failed: {err:#}");
-                    let _ = crate::db::store_failure(&state.pool, id, format!("{err:#}")).await;
+                    // A refused password and an unreachable school want
+                    // opposite answers: one must stop before the school locks
+                    // the account, the other should be tried again shortly.
+                    let kind = if untis::was_rejected(&err) {
+                        tracing::warn!(account = %id, "login refused; waiting for a new password");
+                        Failure::Rejected
+                    } else {
+                        tracing::warn!(account = %id, "refresh failed: {err:#}");
+                        Failure::Transient
+                    };
+                    let _ =
+                        crate::db::store_failure(&state.pool, id, format!("{err:#}"), kind).await;
                     false
                 }
             }

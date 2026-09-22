@@ -108,6 +108,30 @@ async fn post(
     Ok((status, reply.text().await.unwrap_or_default()))
 }
 
+/// Erase the account itself. The service key is wanted here and nowhere else:
+/// only an administrator of the project may delete a user.
+///
+/// Everything this service holdeth hangeth off `auth.users` by a cascading
+/// key, so the sealed passwords, the feeds and the cached timetables go with
+/// it. There is no second sweep to forget.
+pub async fn delete_user(state: &AppState, who: uuid::Uuid) -> Result<()> {
+    let reply = state
+        .http
+        .delete(format!("{}/auth/v1/admin/users/{who}", state.config.supabase_url))
+        .header("apikey", &state.config.supabase_service_key)
+        .bearer_auth(&state.config.supabase_service_key)
+        .send()
+        .await
+        .context("reaching the account service")?;
+
+    if !reply.status().is_success() {
+        let status = reply.status();
+        let body = reply.text().await.unwrap_or_default();
+        bail!("{}", complain(&body, &format!("the account service refused to delete ({status})")));
+    }
+    Ok(())
+}
+
 // --------------------------------------------------------------- sessions ---
 
 fn hash(token: &str) -> Vec<u8> {

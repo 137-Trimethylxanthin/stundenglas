@@ -35,6 +35,8 @@ pub struct Config {
     pub google: Option<GoogleClient>,
     /// Addresses admitted at once, and allowed to admit others.
     pub admin_emails: Vec<String>,
+    /// How long a timetable nobody refresheth is kept before it is forgotten.
+    pub keep_days: i64,
 }
 
 fn need(key: &str) -> Result<String> {
@@ -76,6 +78,7 @@ impl Config {
                 }
                 _ => None,
             },
+            keep_days: or("KEEP_DAYS", "180").parse().unwrap_or(180).clamp(7, 3650),
             admin_emails: or("ADMIN_EMAILS", "")
                 .split(',')
                 .map(|a| a.trim().to_ascii_lowercase())
@@ -102,6 +105,7 @@ impl std::fmt::Debug for Config {
             .field("sync_every", &self.sync_every)
             .field("sync_lanes", &self.sync_lanes)
             .field("google", &self.google.as_ref().map(|_| "<configured>"))
+            .field("keep_days", &self.keep_days)
             .field("admin_emails", &self.admin_emails)
             .finish()
     }
@@ -128,6 +132,7 @@ mod tests {
                 secret: "client-secret-material".to_owned(),
             }),
             admin_emails: vec![],
+            keep_days: 180,
         };
         let shown = format!("{config:?}");
         for secret in
@@ -151,6 +156,7 @@ mod tests {
             sync_lanes: 1,
             google: None,
             admin_emails: vec![],
+            keep_days: 180,
         };
         assert_eq!(config.feed_url("abc"), "https://example.test/cal/abc.ics");
         config.public_url = "https://example.test".to_owned();

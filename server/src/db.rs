@@ -29,6 +29,9 @@ pub struct UntisAccount {
     pub display_name: Option<String>,
     pub enabled: bool,
     pub timezone: Tz,
+    /// The school refused this login. Nothing is tried again until the owner
+    /// enters a new password.
+    pub credentials_rejected: bool,
 }
 
 /// An account together with what is needed to log in as it.
@@ -52,6 +55,7 @@ fn account_from(row: &PgRow) -> UntisAccount {
             .ok()
             .and_then(|name| name.parse().ok())
             .unwrap_or(DEFAULT_TZ),
+        credentials_rejected: row.try_get("credentials_rejected").unwrap_or(false),
     }
 }
 
@@ -78,7 +82,8 @@ pub async fn add_account(pool: &PgPool, sealer: &Sealer, new: &NewAccount) -> Re
                 key_version = excluded.key_version,
                 timezone = excluded.timezone,
                 enabled = true
-         returning id, server, school, username, display_name, enabled, timezone",
+         returning id, server, school, username, display_name, enabled, timezone,
+                   credentials_rejected",
     )
     .bind(new.user_id)
     .bind(&new.server)
@@ -96,7 +101,8 @@ pub async fn add_account(pool: &PgPool, sealer: &Sealer, new: &NewAccount) -> Re
 
 pub async fn accounts_of(pool: &PgPool, user_id: Uuid) -> Result<Vec<UntisAccount>> {
     let rows = sqlx::query(
-        "select id, server, school, username, display_name, enabled, timezone
+        "select id, server, school, username, display_name, enabled, timezone,
+                credentials_rejected
            from untis_accounts where user_id = $1 order by created_at",
     )
     .bind(user_id)
@@ -108,8 +114,14 @@ pub async fn accounts_of(pool: &PgPool, user_id: Uuid) -> Result<Vec<UntisAccoun
 /// Every account the scheduler should refresh, with its password unsealed.
 pub async fn accounts_to_sync(pool: &PgPool, sealer: &Sealer) -> Result<Vec<AccountWithSecret>> {
     let rows = sqlx::query(
-        "select id, server, school, username, display_name, enabled, timezone, secret, nonce
-           from untis_accounts where enabled order by created_at",
+        "select a.id, a.server, a.school, a.username, a.display_name, a.enabled,
+                a.timezone, a.credentials_rejected, a.secret, a.nonce
+           from untis_accounts a
+           left join sync_state s on s.untis_account_id = a.id
+          where a.enabled
+            and not a.credentials_rejected
+            and (s.next_attempt_at is null or s.next_attempt_at <= now())
+          order by a.created_at",
     )
     .fetch_all(pool)
     .await?;
@@ -277,7 +289,8 @@ pub async fn store_sync(
                 last_ok_at = now(),
                 last_error = null,
                 last_error_at = null,
-                consecutive_fails = 0",
+                consecutive_fails = 0,
+                next_attempt_at = null",
     )
     .bind(account)
     .bind(payload)
@@ -291,20 +304,102 @@ pub async fn store_sync(
     Ok(())
 }
 
-pub async fn store_failure(pool: &PgPool, account: Uuid, why: String) -> Result<()> {
+/// What went wrong, and therefore how soon we may try again.
+pub enum Failure {
+    /// The school refused the login. Trying again is how an account gets
+    /// locked, so it is not tried again at all.
+    Rejected,
+    /// The school was unreachable, or answered something we could not read.
+    /// Worth another go, but not immediately.
+    Transient,
+}
+
+pub async fn store_failure(pool: &PgPool, account: Uuid, why: String, kind: Failure) -> Result<()> {
+    let why = why.chars().take(500).collect::<String>();
+
+    // Five minutes, then ten, twenty, and so on to a ceiling of six hours. A
+    // school that is down for a morning is asked a handful of times, not
+    // ninety.
     sqlx::query(
-        "insert into sync_state (untis_account_id, last_error, last_error_at, consecutive_fails)
-         values ($1, $2, now(), 1)
+        "insert into sync_state
+            (untis_account_id, last_error, last_error_at, consecutive_fails, next_attempt_at)
+         values ($1, $2, now(), 1, now() + interval '5 minutes')
          on conflict (untis_account_id) do update
             set last_error = excluded.last_error,
                 last_error_at = now(),
-                consecutive_fails = sync_state.consecutive_fails + 1",
+                consecutive_fails = sync_state.consecutive_fails + 1,
+                next_attempt_at = now() + least(
+                    interval '6 hours',
+                    interval '5 minutes' * power(2, least(sync_state.consecutive_fails, 7)))",
     )
     .bind(account)
-    .bind(why.chars().take(500).collect::<String>())
+    .bind(&why)
     .execute(pool)
     .await?;
+
+    if matches!(kind, Failure::Rejected) {
+        sqlx::query(
+            "update untis_accounts
+                set credentials_rejected = true, rejected_at = now()
+              where id = $1 and not credentials_rejected",
+        )
+        .bind(account)
+        .execute(pool)
+        .await?;
+    }
     Ok(())
+}
+
+/// A new password for a link the school refused. Re-sealing and clearing the
+/// refusal are one act: either the owner is back in, or nothing changed.
+pub async fn replace_password(
+    pool: &PgPool,
+    sealer: &Sealer,
+    user_id: Uuid,
+    account: Uuid,
+    password: &str,
+) -> Result<bool> {
+    let sealed = sealer.seal(password)?;
+    let done = sqlx::query(
+        "update untis_accounts
+            set secret = $3, nonce = $4, key_version = $5,
+                credentials_rejected = false, rejected_at = null
+          where id = $1 and user_id = $2",
+    )
+    .bind(account)
+    .bind(user_id)
+    .bind(&sealed.ciphertext)
+    .bind(&sealed.nonce)
+    .bind(KEY_VERSION)
+    .execute(pool)
+    .await
+    .context("storing the new password")?;
+
+    if done.rows_affected() > 0 {
+        // Let it be tried at once rather than after the backoff it earned.
+        sqlx::query("update sync_state set next_attempt_at = null where untis_account_id = $1")
+            .bind(account)
+            .execute(pool)
+            .await?;
+    }
+    Ok(done.rows_affected() > 0)
+}
+
+/// A timetable nobody has refreshed in a long while is stale and is still
+/// somebody's whereabouts. Drop the cached lessons, keep the link itself, so
+/// the owner finds their account as they left it and merely empty.
+pub async fn forget_stale(pool: &PgPool, days: i64) -> Result<u64> {
+    let done = sqlx::query(
+        "update sync_state
+            set lessons = '[]'::jsonb, lesson_count = 0, etag = null
+          where lesson_count > 0
+            and coalesce(last_ok_at, updated_at) < now() - make_interval(days => $1::int)",
+    )
+    .bind(days as i32)
+    .execute(pool)
+    .await
+    .context("forgetting stale timetables")?;
+    Ok(done.rows_affected())
 }
 
 /// Whether this user owneth that school link. Asked before anything is changed.
@@ -346,5 +441,52 @@ pub async fn sync_status(pool: &PgPool, account: Uuid) -> Result<Option<SyncStat
         lesson_count: r.get("lesson_count"),
         last_ok_at: r.try_get("last_ok_at").ok().flatten(),
         last_error: r.try_get("last_error").ok().flatten(),
+    }))
+}
+
+/// Everything this service holdeth about one person, save the two things it
+/// must not hand back: the sealed password, which is theirs already, and the
+/// Google refresh token, which is Google's to reissue.
+pub async fn export_for(pool: &PgPool, user_id: Uuid) -> Result<serde_json::Value> {
+    let mut schools = Vec::new();
+    for account in accounts_of(pool, user_id).await? {
+        let feeds = feeds_of(pool, account.id).await?;
+        let lessons = sqlx::query(
+            "select lessons, lesson_count, window_start, window_end, last_ok_at
+               from sync_state where untis_account_id = $1",
+        )
+        .bind(account.id)
+        .fetch_optional(pool)
+        .await?;
+
+        schools.push(serde_json::json!({
+            "server": account.server,
+            "school": account.school,
+            "username": account.username,
+            "display_name": account.display_name,
+            "timezone": account.timezone.name(),
+            "enabled": account.enabled,
+            "credentials_rejected": account.credentials_rejected,
+            "feeds": feeds.iter().map(|feed| serde_json::json!({
+                "token": feed.token,
+                "keep_cancelled": feed.keep_cancelled,
+                "refresh_minutes": feed.refresh_minutes,
+            })).collect::<Vec<_>>(),
+            "timetable": lessons.as_ref().map(|row| serde_json::json!({
+                "lesson_count": row.try_get::<i32, _>("lesson_count").unwrap_or_default(),
+                "window_start": row.try_get::<Option<NaiveDate>, _>("window_start").ok().flatten(),
+                "window_end": row.try_get::<Option<NaiveDate>, _>("window_end").ok().flatten(),
+                "refreshed_at": row.try_get::<Option<DateTime<Utc>>, _>("last_ok_at").ok().flatten(),
+                "lessons": row.try_get::<serde_json::Value, _>("lessons")
+                    .unwrap_or(serde_json::Value::Null),
+            })),
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "exported_at": Utc::now(),
+        "note": "Your WebUntis password is not here: it is sealed, and it is yours already. \
+                 Nor is any Google token, which Google alone can reissue.",
+        "schools": schools,
     }))
 }

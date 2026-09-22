@@ -202,6 +202,25 @@ pub struct Client {
     pub year: (NaiveDate, NaiveDate),
 }
 
+/// The school said no: a wrong password, or a login that wanteth a code we
+/// cannot give it. Worth a type of its own because the answer to it is the
+/// opposite of the answer to an outage — stop, rather than try again.
+#[derive(Debug)]
+pub struct Rejected(pub String);
+
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for Rejected {}
+
+/// Whether anywhere in this failure's chain the school refused the login.
+pub fn was_rejected(err: &anyhow::Error) -> bool {
+    err.chain().any(|link| link.is::<Rejected>())
+}
+
 impl Client {
     pub fn new(settings: Credentials) -> Result<Self> {
         let http = reqwest::Client::builder()
@@ -258,10 +277,14 @@ impl Client {
             && let Some(state) = json.get("state").and_then(|s| s.as_str())
             && state != "SUCCESS"
         {
-            bail!("login rejected: {state}");
+            return Err(Rejected(format!("the school refused the login: {state}")).into());
         }
         if status.is_redirection() && !location.contains("index.do") {
-            bail!("login failed (redirected to {location})");
+            // Sent back to the login page: the username or password is wrong.
+            return Err(Rejected(format!(
+                "the school refused the login (it sent us back to {location})"
+            ))
+            .into());
         }
 
         let token = self
@@ -610,6 +633,22 @@ struct AbsenceRaw {
 
 #[cfg(test)]
 mod tests {
+    use super::{Rejected, was_rejected};
+
+    #[test]
+    fn a_refusal_is_recognised_through_the_context_it_gathers() {
+        let err = anyhow::Error::new(Rejected("sent back to the login page".into()))
+            .context("logging in")
+            .context("refreshing the timetable");
+        assert!(was_rejected(&err), "the scheduler must still see the refusal under its context");
+    }
+
+    #[test]
+    fn an_outage_is_not_mistaken_for_a_refusal() {
+        let err = anyhow::anyhow!("connection timed out").context("reaching WebUntis");
+        assert!(!was_rejected(&err), "a school that is merely down must be tried again");
+    }
+
     use super::*;
 
     fn lesson(ids: Vec<i64>, status: Status, day: u32, from: u32, to: u32) -> Lesson {

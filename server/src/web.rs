@@ -55,7 +55,10 @@ fn page(title: &str, user: Option<CurrentUser>, body: Markup) -> Markup {
                     }
                 }
                 main { (body) }
-                footer { "Your timetable, in your own calendar." }
+                footer {
+                    "Your timetable, in your own calendar. · "
+                    a href="/privacy" { "What is kept, and why" }
+                }
             }
         }
     }
@@ -93,6 +96,11 @@ code.feed { display: block; word-break: break-all; font-size: .8rem; padding: .5
 .note { border-left: 3px solid var(--edge); padding: .4rem 0 .4rem .9rem; opacity: .8;
         font-size: .9rem; }
 .bad { color: #b3261e; }
+/* A refused password stops everything, so it is framed rather than mentioned. */
+.notice { border: 1px solid #b3261e; border-radius: .5rem; padding: .2rem .9rem .9rem;
+          margin: .75rem 0; }
+.notice p { opacity: 1; }
+button.danger { border-color: #b3261e; color: #b3261e; }
 .actions { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .5rem; }
 .actions form { margin: 0; }
 "#;
@@ -192,6 +200,22 @@ async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) 
                     p.meta {
                         (account.school) " · " (account.server) " · " (account.timezone.name())
                     }
+                    @if account.credentials_rejected {
+                        .bad.notice {
+                            p {
+                                strong { "The school refused this login." }
+                                " Nothing more will be tried until you enter the password "
+                                "again — repeating a refused password is how a WebUntis "
+                                "account gets locked."
+                            }
+                            form.stack method="post" action={ "/links/" (account.id) "/password" } {
+                                label for={ "pw-" (account.id) } { "WebUntis password" }
+                                input id={ "pw-" (account.id) } type="password" name="password"
+                                      required autocomplete="off";
+                                p {} button type="submit" { "Try this one" }
+                            }
+                        }
+                    }
                     p.meta {
                         @match status {
                             Some(s) if s.last_error.is_some() => {
@@ -239,6 +263,20 @@ async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) 
                 p.note { "No school linked yet. Add one below and a calendar link appears." }
             }
 
+            h2 { "Your data" }
+            p.note {
+                "Everything here is yours to take or to be rid of. Deleting the account "
+                "removes the schools, the calendar links and the stored passwords with it, "
+                "at once and for good."
+            }
+            .actions {
+                a href="/account/export.json" { button type="button" { "Download my data" } }
+                form method="post" action="/account/delete"
+                     onsubmit="return confirm('Delete the account, the schools and every calendar link? This cannot be undone.')" {
+                    button.danger type="submit" { "Delete my account" }
+                }
+            }
+
             h2 { "Link a school" }
             form.stack method="post" action="/links" {
                 label for="server" { "WebUntis server" }
@@ -271,6 +309,195 @@ async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) 
         },
     )
     .into_response()
+}
+
+/// `GET /privacy`
+///
+/// The README saith to tell people plainly what they are handing over. This
+/// is where the service itself saith it, to the person doing the handing.
+pub async fn privacy(State(state): State<AppState>, jar: CookieJar) -> Response {
+    let user = current(&state, &jar).await;
+    let admins = if state.config.admin_emails.is_empty() {
+        "whoever runs this instance".to_owned()
+    } else {
+        state.config.admin_emails.join(", ")
+    };
+    let keep_days = state.config.keep_days;
+    let signed_in = user.is_some();
+
+    page(
+        "What is kept, and why",
+        user,
+        html! {
+            h1 { "What is kept, and why" }
+            p.lede {
+                "This service signs in to your school's WebUntis as you, reads your "
+                "timetable, and publishes it at a secret address your calendar can "
+                "subscribe to."
+            }
+
+            h2 { "Your WebUntis password" }
+            p {
+                "WebUntis offers students no OAuth and no application token, so anything "
+                "that reads your timetable on your behalf must hold your school password. "
+                "There is no way around it, and it is the thing worth understanding before "
+                "you sign up."
+            }
+            p { "What is done about it:" }
+            ul {
+                li { "It is stored as AES-256-GCM ciphertext, never in the clear." }
+                li {
+                    "The key lives in this server's environment, not in the database, so a "
+                    "stolen copy of the database alone opens nothing."
+                }
+                li {
+                    "Those columns are not readable through the database's own API at all: "
+                    "the grant is revoked from every role but this server's."
+                }
+                li { "Your browser never speaks to the database. It speaks only to this server." }
+            }
+            p.note {
+                "None of which changes the underlying fact. If you would rather not hand "
+                "over a school password, do not sign up — and it is worth knowing what your "
+                "school's own rules say about it."
+            }
+
+            h2 { "What else is kept" }
+            ul {
+                li { "Your email address, so you can sign in and be recognised." }
+                li { "The schools you link: the server, the school name and your username." }
+                li {
+                    "Your timetable as last read — lessons, teachers, rooms and times — "
+                    "cached so that a calendar refreshing the link never waits on the school."
+                }
+                li {
+                    "Each calendar link, when it was last fetched and how often. That is how "
+                    "a link that has stopped working can be told from one nobody uses."
+                }
+                li {
+                    "If you connected Google Calendar, a token allowing writes to the one "
+                    "calendar this service made. It writes nothing else and reads nothing."
+                }
+            }
+            p {
+                "A timetable that has not been refreshed in " (keep_days) " days is forgotten, "
+                "and the link left empty."
+            }
+
+            h2 { "Who can see it" }
+            p {
+                "The administrators of this instance — " (admins) " — can see who has an "
+                "account and whether their sync is working. They cannot read your password: "
+                "it is sealed, and nothing in the interface unseals it."
+            }
+            p {
+                "Anyone holding a calendar link can read that timetable. That is what makes it "
+                "work in a calendar without a login, and why the address is long and secret. "
+                "Share it as you would a password."
+            }
+
+            h2 { "Getting your data, and getting rid of it" }
+            p {
+                "Signed in, you can download everything held about you as one file, and you "
+                "can delete the account outright. Deletion takes the schools, the calendar "
+                "links, the stored passwords and the cached timetables with it, at once. "
+                "There is no copy kept elsewhere, though ordinary database backups may hold "
+                "one for a short while before they in turn expire."
+            }
+            p {
+                a href="/" { @if signed_in { "Back to your timetables" } @else { "Back" } }
+            }
+        },
+    )
+    .into_response()
+}
+
+/// `GET /account/export.json`
+pub async fn export(State(state): State<AppState>, jar: CookieJar) -> Response {
+    let Some(user) = current(&state, &jar).await else {
+        return Redirect::to("/").into_response();
+    };
+    match db::export_for(&state.pool, user.id).await {
+        Ok(payload) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/json; charset=utf-8".to_owned()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"stundenglas.json\"".to_owned(),
+                ),
+            ],
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into()),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::error!("export failed: {err:#}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "could not gather your data").into_response()
+        }
+    }
+}
+
+/// `POST /account/delete`
+///
+/// Deleting the user cascadeth through every table that hangeth off it, so
+/// this one call is the whole erasure.
+pub async fn delete_account(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> impl axum::response::IntoResponse {
+    let Some(user) = current(&state, &jar).await else {
+        return (jar, Redirect::to("/"));
+    };
+    if let Err(err) = auth::delete_user(&state, user.id).await {
+        tracing::error!(user = %user.id, "could not delete the account: {err:#}");
+        return (jar, Redirect::to("/?trouble=delete"));
+    }
+    tracing::info!(user = %user.id, "account deleted at its owner's asking");
+
+    // The session row went with the user; the cookie must go too.
+    let secure = state.config.public_url.starts_with("https");
+    (jar.add(auth::cookie_gone(secure)), Redirect::to("/"))
+}
+
+#[derive(Deserialize)]
+pub struct NewPassword {
+    password: String,
+}
+
+/// `POST /links/{id}/password`
+///
+/// The way back from a refused login: a new password, and the refusal lifted
+/// so the scheduler will try once more.
+pub async fn new_password(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(account): Path<Uuid>,
+    Form(form): Form<NewPassword>,
+) -> Response {
+    let Some(user) = current(&state, &jar).await else {
+        return Redirect::to("/").into_response();
+    };
+    if form.password.is_empty() {
+        return dashboard(state, user, Some("a password is wanted".into())).await;
+    }
+
+    match db::replace_password(&state.pool, &state.config.sealer, user.id, account, &form.password)
+        .await
+    {
+        // Owned by someone else, or gone: say nothing either way.
+        Ok(false) => (StatusCode::NOT_FOUND, "no such school").into_response(),
+        Ok(true) => {
+            // Try it at once, so they learn straight away whether it took.
+            let soon = state.clone();
+            tokio::spawn(async move {
+                if let Err(err) = crate::sync::once(soon).await {
+                    tracing::warn!("refresh after a new password failed: {err:#}");
+                }
+            });
+            Redirect::to("/").into_response()
+        }
+        Err(err) => dashboard(state, user, Some(format!("{err}"))).await,
+    }
 }
 
 // ------------------------------------------------------------------ forms ---
