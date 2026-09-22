@@ -4,7 +4,7 @@
 use anyhow::Result;
 use chrono::{Duration as Days, Local, NaiveDate};
 use sha2::{Digest, Sha256};
-use stundenglas_core::{Exam, Lesson, untis};
+use stundenglas_core::{Exam, Homework, Lesson, untis};
 
 use crate::AppState;
 use crate::db::Failure;
@@ -114,9 +114,22 @@ async fn fetch_one(state: AppState, entry: crate::db::AccountWithSecret) -> Resu
         Vec::new()
     });
 
-    let etag = fingerprint(&lessons, &exams);
-    crate::db::store_sync(&state.pool, entry.account.id, &lessons, &exams, etag, (from, to))
-        .await?;
+    let homework = client.fetch_homework(from, to).await.unwrap_or_else(|err| {
+        tracing::warn!(account = %entry.account.id, "no homework read: {err:#}");
+        Vec::new()
+    });
+
+    let etag = fingerprint(&lessons, &exams, &homework);
+    crate::db::store_sync(
+        &state.pool,
+        entry.account.id,
+        &lessons,
+        &exams,
+        &homework,
+        etag,
+        (from, to),
+    )
+    .await?;
 
     // Those who asked for it get the same timetable written into Google, so
     // they need not wait for Google to look at the subscribed link.
@@ -144,7 +157,7 @@ fn window(year: (NaiveDate, NaiveDate)) -> (NaiveDate, NaiveDate) {
 
 /// Changeth only when something a subscriber would notice changeth, so an
 /// unchanged timetable answereth 304 and costeth nothing.
-fn fingerprint(lessons: &[Lesson], exams: &[Exam]) -> String {
+fn fingerprint(lessons: &[Lesson], exams: &[Exam], homework: &[Homework]) -> String {
     let mut hasher = Sha256::new();
     for lesson in lessons {
         hasher.update(lesson.event_id().as_bytes());
@@ -165,6 +178,13 @@ fn fingerprint(lessons: &[Lesson], exams: &[Exam]) -> String {
         hasher.update([0]);
         hasher.update(exam.start.to_rfc3339().as_bytes());
         hasher.update(exam.end.to_rfc3339().as_bytes());
+        hasher.update(*b"\n");
+    }
+    for piece in homework {
+        hasher.update(piece.event_id().as_bytes());
+        hasher.update([0]);
+        hasher.update(piece.title().as_bytes());
+        hasher.update(piece.due.to_string().as_bytes());
         hasher.update(*b"\n");
     }
     hasher.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()

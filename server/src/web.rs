@@ -254,6 +254,9 @@ async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) 
                             Some(s) => {
                                 (s.lesson_count) " lessons"
                                 @if s.exam_count > 0 { ", " (s.exam_count) " exams" }
+                                @if s.homework_count > 0 {
+                                    ", " (s.homework_count) " homework"
+                                }
                                 @if let Some(when) = s.last_ok_at {
                                     ", refreshed " (when.format("%d %b %H:%M UTC").to_string())
                                 }
@@ -319,6 +322,11 @@ async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) 
                                     input type="checkbox" name="keep_cancelled" value="1"
                                           checked[feed.keep_cancelled];
                                     " Keep cancelled lessons, shown as free time"
+                                }
+                                label {
+                                    input type="checkbox" name="with_homework" value="1"
+                                          checked[feed.with_homework];
+                                    " Carry homework, on the day it is due"
                                 }
                                 p {} button type="submit" { "Save" }
                             }
@@ -436,6 +444,7 @@ pub async fn feed_settings(
         keep_cancelled: form.keep_cancelled.is_some(),
         refresh_minutes: form.refresh_minutes.unwrap_or(60),
         remind_before_minutes: form.remind_before_minutes.filter(|m| *m > 0),
+        with_homework: form.with_homework.is_some(),
         label: form.label.map(|l| l.trim().chars().take(60).collect()),
     };
 
@@ -602,6 +611,7 @@ pub struct FeedForm {
     #[serde(default, deserialize_with = "empty_as_none")]
     remind_before_minutes: Option<i32>,
     keep_cancelled: Option<String>,
+    with_homework: Option<String>,
 }
 
 /// A select whose "never" option hath an empty value sendeth `""`, which is

@@ -258,6 +258,46 @@ impl Exam {
     }
 }
 
+/// A piece of homework, which belongeth to the day it is due rather than the
+/// hour it was set.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Homework {
+    pub id: i64,
+    /// The day it is due. Homework hath no hour, so it is rendered whole-day.
+    pub due: NaiveDate,
+    pub subject: String,
+    pub text: String,
+    pub remark: String,
+    pub done: bool,
+}
+
+impl Homework {
+    /// `📚 M — Kapitel 4 lesen`
+    pub fn title(&self) -> String {
+        let what = if self.text.is_empty() { "Hausübung" } else { &self.text };
+        if self.subject.is_empty() {
+            format!("📚 {what}")
+        } else {
+            format!("📚 {} — {what}", self.subject)
+        }
+    }
+
+    pub fn description(&self) -> String {
+        let mut lines = Vec::new();
+        if !self.remark.is_empty() {
+            lines.push(self.remark.clone());
+        }
+        if self.done {
+            lines.push("Als erledigt vermerkt.".to_owned());
+        }
+        lines.join("\n")
+    }
+
+    pub fn event_id(&self) -> String {
+        format!("hw{}", self.id)
+    }
+}
+
 /// The school said no: a wrong password, or a login that wanteth a code we
 /// cannot give it. Worth a type of its own because the answer to it is the
 /// opposite of the answer to an outage — stop, rather than try again.
@@ -431,6 +471,35 @@ impl Client {
 
     /// `excuseStatusId=-1` meaneth *all*; the web page defaulteth to `-3`,
     /// which showeth only the unexcused and so hideth an approved leave.
+    /// Homework, from the classic endpoint. The subject liveth in a separate
+    /// `lessons` array keyed by lesson id, so the two are joined here rather
+    /// than leaving every entry nameless.
+    ///
+    /// As with exams, a school that keepeth none, or withholdeth them, is not
+    /// worth failing a refresh over.
+    pub async fn fetch_homework(&self, from: NaiveDate, to: NaiveDate) -> Result<Vec<Homework>> {
+        let reply = self
+            .http
+            .get(format!("{}/WebUntis/api/homeworks/lessons", self.base))
+            .query(&[
+                ("startDate", from.format("%Y%m%d").to_string()),
+                ("endDate", to.format("%Y%m%d").to_string()),
+            ])
+            .send()
+            .await
+            .context("fetching homework")?;
+
+        let status = reply.status();
+        let body = reply.text().await?;
+        if !status.is_success() {
+            bail!("{status} fetching homework: {}", body.chars().take(200).collect::<String>());
+        }
+
+        let envelope: HomeworkEnvelope =
+            serde_json::from_str(&body).context("decoding homework")?;
+        Ok(envelope.into_homework())
+    }
+
     /// Exams, from the classic endpoint: cookie-authenticated, compact dates,
     /// and `klasseId=-1` without which it answereth nothing. Both are traps
     /// SCOUT.md recordeth.
@@ -517,6 +586,83 @@ fn itoa(value: i64) -> String {
 }
 
 /// Untis keepeth dates as 20260914 and hours as 800 or 2155.
+#[derive(Deserialize)]
+struct HomeworkEnvelope {
+    #[serde(default)]
+    data: Option<HomeworkData>,
+    #[serde(default)]
+    homeworks: Option<Vec<HomeworkRaw>>,
+}
+
+#[derive(Deserialize)]
+struct HomeworkData {
+    #[serde(default)]
+    homeworks: Option<Vec<HomeworkRaw>>,
+    /// Lesson id to subject. Without it every entry would be nameless.
+    #[serde(default)]
+    lessons: Option<Vec<HomeworkLesson>>,
+}
+
+#[derive(Deserialize)]
+struct HomeworkLesson {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    subject: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HomeworkRaw {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    lesson_id: i64,
+    #[serde(default)]
+    due_date: Option<i64>,
+    #[serde(default)]
+    date: Option<i64>,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    remark: String,
+    #[serde(default)]
+    completed: bool,
+}
+
+impl HomeworkEnvelope {
+    fn into_homework(self) -> Vec<Homework> {
+        let (raw, lessons) = match self.data {
+            Some(data) => (data.homeworks.unwrap_or_default(), data.lessons.unwrap_or_default()),
+            None => (self.homeworks.unwrap_or_default(), Vec::new()),
+        };
+        raw.into_iter()
+            .filter_map(|one| {
+                // The due date is the point of it; the date it was set is a
+                // poor substitute but better than dropping the entry.
+                let day = compact_date(one.due_date.or(one.date)?)?;
+                Some(Homework {
+                    id: one.id,
+                    due: day,
+                    subject: lessons
+                        .iter()
+                        .find(|lesson| lesson.id == one.lesson_id)
+                        .map(|lesson| lesson.subject.clone())
+                        .unwrap_or_default(),
+                    text: one.text,
+                    remark: one.remark,
+                    done: one.completed,
+                })
+            })
+            .collect()
+    }
+}
+
+/// `20260921` as the classic endpoints spell a date.
+fn compact_date(raw: i64) -> Option<NaiveDate> {
+    NaiveDate::from_ymd_opt((raw / 10_000) as i32, ((raw / 100) % 100) as u32, (raw % 100) as u32)
+}
+
 /// `{"data": {"exams": []}}` is what one tenant answered; a bare `{"exams": []}`
 /// is what another did. Neither is worth a failed refresh, so both are read.
 #[derive(Deserialize)]
@@ -804,6 +950,35 @@ struct AbsenceRaw {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn homework_takes_its_subject_from_the_lesson_it_belongs_to() {
+        let body = r#"{"data":{"homeworks":[{"id":5,"lessonId":99,"dueDate":20260925,
+            "text":"Kapitel 4 lesen","remark":"","completed":false}],
+            "lessons":[{"id":99,"subject":"D"}]}}"#;
+        let envelope: super::HomeworkEnvelope = serde_json::from_str(body).unwrap();
+        let work = envelope.into_homework();
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].title(), "📚 D — Kapitel 4 lesen");
+        assert_eq!(work[0].due.to_string(), "2026-09-25");
+    }
+
+    #[test]
+    fn homework_without_a_matching_lesson_is_still_shown() {
+        let body = r#"{"data":{"homeworks":[{"id":6,"lessonId":1,"dueDate":20260925,
+            "text":"Vokabeln"}],"lessons":[]}}"#;
+        let work = serde_json::from_str::<super::HomeworkEnvelope>(body).unwrap().into_homework();
+        assert_eq!(work.len(), 1, "a nameless subject is no reason to drop the work");
+        assert_eq!(work[0].title(), "📚 Vokabeln");
+    }
+
+    #[test]
+    fn homework_falls_back_to_the_day_it_was_set() {
+        let body = r#"{"data":{"homeworks":[{"id":7,"lessonId":1,"date":20260921}]}}"#;
+        let work = serde_json::from_str::<super::HomeworkEnvelope>(body).unwrap().into_homework();
+        assert_eq!(work[0].due.to_string(), "2026-09-21");
+        assert_eq!(work[0].title(), "📚 Hausübung", "no text, but still a marker");
+    }
+
     #[test]
     fn exams_are_read_in_the_compact_shape() {
         let body = r#"{"data":{"exams":[{"id":42,"examDate":20260921,"startTime":800,

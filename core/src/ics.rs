@@ -5,7 +5,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::untis::{Exam, Lesson, Status};
+use crate::untis::{Exam, Homework, Lesson, Status};
 
 const PRODID: &str = "-//stundenglas//WebUntis timetable//EN";
 
@@ -18,6 +18,9 @@ pub struct Feed<'a> {
     pub refresh_minutes: u32,
     /// Cancelled lessons kept as transparent entries, or left out entirely.
     pub keep_cancelled: bool,
+    /// Whether homework is carried at all. Whole-day entries add up, and not
+    /// everyone wanteth them in the same calendar as their hours.
+    pub with_homework: bool,
     /// How long before an exam to ring, if at all. Ordinary lessons never
     /// ring: a calendar that alarms forty times a week is one nobody keeps.
     pub remind_before: Option<u32>,
@@ -25,12 +28,24 @@ pub struct Feed<'a> {
 
 impl Default for Feed<'_> {
     fn default() -> Self {
-        Self { name: "Stundenplan", refresh_minutes: 60, keep_cancelled: true, remind_before: None }
+        Self {
+            name: "Stundenplan",
+            refresh_minutes: 60,
+            keep_cancelled: true,
+            with_homework: true,
+            remind_before: None,
+        }
     }
 }
 
 impl Feed<'_> {
-    pub fn render(&self, lessons: &[Lesson], exams: &[Exam], stamp: DateTime<Utc>) -> String {
+    pub fn render(
+        &self,
+        lessons: &[Lesson],
+        exams: &[Exam],
+        homework: &[Homework],
+        stamp: DateTime<Utc>,
+    ) -> String {
         let mut out = String::with_capacity(256 + lessons.len() * 320);
 
         line(&mut out, "BEGIN:VCALENDAR");
@@ -52,6 +67,11 @@ impl Feed<'_> {
         }
         for exam in exams {
             self.exam(&mut out, exam, stamp);
+        }
+        if self.with_homework {
+            for piece in homework {
+                Self::homework(&mut out, piece, stamp);
+            }
         }
 
         line(&mut out, "END:VCALENDAR");
@@ -136,6 +156,35 @@ impl Feed<'_> {
         }
         line(out, "END:VEVENT");
     }
+
+    /// Homework hath a day but no hour, so it goeth out as a whole-day entry
+    /// on the day it is due — transparent, because it blocketh no time.
+    ///
+    /// `DTEND` for a whole-day entry is the morning *after*: the standard
+    /// readeth it as exclusive, and a client given the same day showeth
+    /// nothing at all.
+    fn homework(out: &mut String, piece: &Homework, stamp: DateTime<Utc>) {
+        line(out, "BEGIN:VEVENT");
+        line(out, &format!("UID:{}@stundenglas", piece.event_id()));
+        line(out, &format!("DTSTAMP:{}", utc(stamp)));
+        line(out, &format!("DTSTART;VALUE=DATE:{}", piece.due.format("%Y%m%d")));
+        line(
+            out,
+            &format!(
+                "DTEND;VALUE=DATE:{}",
+                (piece.due + chrono::Duration::days(1)).format("%Y%m%d")
+            ),
+        );
+        line(out, &format!("SUMMARY:{}", escape(&piece.title())));
+        let what = piece.description();
+        if !what.is_empty() {
+            line(out, &format!("DESCRIPTION:{}", escape(&what)));
+        }
+        line(out, "TRANSP:TRANSPARENT");
+        line(out, "STATUS:CONFIRMED");
+        line(out, "CATEGORIES:HOMEWORK");
+        line(out, "END:VEVENT");
+    }
 }
 
 fn utc(when: DateTime<Utc>) -> String {
@@ -189,6 +238,17 @@ mod tests {
         l.lesson_info = "Gruppe 1".to_owned();
         l.notes = "Ümläüte, Kommas; und \\ Schrägstriche".to_owned();
         l
+    }
+
+    fn homework() -> crate::Homework {
+        crate::Homework {
+            id: 5,
+            due: NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
+            subject: "D".to_owned(),
+            text: "Kapitel 4 lesen".to_owned(),
+            remark: String::new(),
+            done: false,
+        }
     }
 
     fn exam() -> crate::Exam {
@@ -246,7 +306,12 @@ mod tests {
     }
 
     fn render(lessons: &[Lesson]) -> String {
-        Feed::default().render(lessons, &[], Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap())
+        Feed::default().render(
+            lessons,
+            &[],
+            &[],
+            Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
+        )
     }
 
     #[test]
@@ -304,6 +369,7 @@ mod tests {
         let out = feed.render(
             &[lesson(Status::Cancelled, "MAT")],
             &[],
+            &[],
             Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
         );
         assert_eq!(out.matches("BEGIN:VEVENT").count(), 0);
@@ -321,7 +387,7 @@ mod tests {
     #[test]
     fn a_refresh_hint_is_offered() {
         let feed = Feed { refresh_minutes: 15, ..Feed::default() };
-        let out = feed.render(&[], &[], Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap());
+        let out = feed.render(&[], &[], &[], Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap());
         assert!(out.contains("REFRESH-INTERVAL;VALUE=DURATION:PT15M"));
         assert!(out.contains("X-PUBLISHED-TTL:PT15M"));
     }
@@ -331,6 +397,7 @@ mod tests {
         let out = Feed::default().render(
             &[],
             &[exam()],
+            &[],
             Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
         );
         assert!(out.contains("CATEGORIES:EXAM"), "a calendar should be able to colour them");
@@ -344,6 +411,7 @@ mod tests {
         let out = Feed::default().render(
             &[lesson(Status::Regular, "MAT")],
             &[exam()],
+            &[],
             Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
         );
         assert!(!out.contains("BEGIN:VALARM"), "an unasked-for alarm is an unkept calendar");
@@ -355,6 +423,7 @@ mod tests {
         let out = feed.render(
             &[lesson(Status::Regular, "MAT")],
             &[exam()],
+            &[],
             Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
         );
         assert_eq!(out.matches("BEGIN:VALARM").count(), 1, "only the exam rings");
@@ -364,8 +433,38 @@ mod tests {
     #[test]
     fn a_whole_day_is_said_as_a_day() {
         let feed = Feed { remind_before: Some(1440), ..Feed::default() };
-        let out = feed.render(&[], &[exam()], Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap());
+        let out =
+            feed.render(&[], &[exam()], &[], Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap());
         assert!(out.contains("TRIGGER:-P1D"), "clients read this better than -PT1440M");
+    }
+
+    #[test]
+    fn homework_lands_whole_day_on_the_day_it_is_due() {
+        let out = Feed::default().render(
+            &[],
+            &[],
+            &[homework()],
+            Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
+        );
+        assert!(out.contains("DTSTART;VALUE=DATE:20260925"));
+        // Exclusive, per RFC 5545: the same day would show nothing at all.
+        assert!(out.contains("DTEND;VALUE=DATE:20260926"));
+        assert!(out.contains("SUMMARY:📚 D — Kapitel 4 lesen"));
+        assert!(out.contains("TRANSP:TRANSPARENT"), "homework blocks no time");
+        assert!(!out.contains("BEGIN:VALARM"), "only exams ring");
+    }
+
+    #[test]
+    fn a_link_may_refuse_homework_without_refusing_the_rest() {
+        let feed = Feed { with_homework: false, ..Feed::default() };
+        let out = feed.render(
+            &[lesson(Status::Regular, "MAT")],
+            &[exam()],
+            &[homework()],
+            Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
+        );
+        assert!(!out.contains("CATEGORIES:HOMEWORK"));
+        assert!(out.contains("CATEGORIES:EXAM"), "the rest is untouched");
     }
 }
 
@@ -389,6 +488,6 @@ mod round_trip {
         // and the rendering is byte-identical
         let stamp = chrono::Utc::now();
         let feed = super::Feed::default();
-        assert_eq!(feed.render(&[before], &[], stamp), feed.render(&[after], &[], stamp));
+        assert_eq!(feed.render(&[before], &[], &[], stamp), feed.render(&[after], &[], &[], stamp));
     }
 }

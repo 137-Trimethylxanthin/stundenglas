@@ -115,15 +115,17 @@ async fn run() -> Result<usize> {
 
     if let Some(path) = &args.ics {
         let exams = untis.fetch_exams(from, to).await.unwrap_or_default();
+        let homework = untis.fetch_homework(from, to).await.unwrap_or_default();
         let feed = stundenglas_core::ics::Feed {
             name: &format!("Stundenplan {}", untis.person_name),
             refresh_minutes: 60,
             keep_cancelled: true,
+            with_homework: true,
             // A file written once cannot be re-read; whoever wants an alarm
             // can set one where the file lands.
             remind_before: None,
         };
-        let body = feed.render(&lessons, &exams, chrono::Utc::now());
+        let body = feed.render(&lessons, &exams, &homework, chrono::Utc::now());
         std::fs::write(path, &body).with_context(|| format!("writing {}", path.display()))?;
         println!("Wrote   : {} ({} bytes, {} events)", path.display(), body.len(), lessons.len());
         return Ok(0);
