@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::auth::{self, CurrentUser};
 use crate::db::{self, NewAccount};
-use crate::words::Lang;
+use crate::words::{Lang, Words};
 use crate::{AppState, people, schools};
 
 // A short list of the zones a European school is likely to keep, with the rest
@@ -42,12 +42,16 @@ fn page(lang: Lang, title: &str, user: Option<CurrentUser>, body: Markup) -> Mar
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                // The tab colour follows the page, so a pinned tab is not a
+                // white slab beside a dark one.
+                meta name="color-scheme" content="light dark";
+                meta name="description" content="A WebUntis timetable as a calendar you can subscribe to.";
                 title { (title) " — stundenglas" }
                 style { (maud::PreEscaped(STYLE)) }
             }
             body {
                 header {
-                    a.brand href="/" { "stundenglas" }
+                    a.brand href="/" { (MARK) "stundenglas" }
                     nav {
                         @if user.is_some() {
                             form method="post" action="/logout" {
@@ -70,54 +74,283 @@ fn page(lang: Lang, title: &str, user: Option<CurrentUser>, body: Markup) -> Mar
     }
 }
 
+/// An hourglass, drawn rather than fetched: one more request for one small
+/// picture is one more thing to fail, and a service about a school timetable
+/// should not reach out to a font CDN to draw its own name.
+const MARK: maud::PreEscaped<&str> = maud::PreEscaped(
+    r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+         <path d="M6 2h12M6 22h12"/>
+         <path d="M7 2v4.5a5 5 0 0 0 2.5 4.3L12 12l-2.5 1.2A5 5 0 0 0 7 17.5V22"/>
+         <path d="M17 2v4.5a5 5 0 0 1-2.5 4.3L12 12l2.5 1.2a5 5 0 0 1 2.5 4.3V22"/>
+       </svg>"#,
+);
+
 const STYLE: &str = r#"
-:root { color-scheme: light dark; --edge: color-mix(in oklab, currentColor 18%, transparent); }
+/* ---------------------------------------------------------------- tokens --
+   One palette, stated twice. Light first, because that is what a school
+   projector shows; dark follows the system, since a timetable is mostly
+   looked at late.                                                          */
+:root {
+  color-scheme: light dark;
+
+  --ink:        oklch(23% 0.02 260);
+  --ink-soft:   oklch(48% 0.02 260);
+  --ink-faint:  oklch(62% 0.02 260);
+  --paper:      oklch(99% 0.004 260);
+  --raised:     oklch(100% 0 0);
+  --sunken:     oklch(97% 0.006 260);
+  --edge:       oklch(90% 0.008 260);
+  --edge-firm:  oklch(84% 0.012 260);
+
+  --accent:     oklch(52% 0.19 275);
+  --accent-ink: oklch(99% 0.01 275);
+  --accent-wash: oklch(96% 0.03 275);
+
+  --warn:       oklch(58% 0.14 75);
+  --warn-wash:  oklch(96% 0.05 75);
+  --bad:        oklch(53% 0.20 25);
+  --bad-wash:   oklch(96% 0.04 25);
+  --good:       oklch(52% 0.13 155);
+
+  --lift: 0 1px 2px oklch(23% 0.02 260 / 0.05),
+          0 4px 12px oklch(23% 0.02 260 / 0.04);
+  --ring: 0 0 0 3px oklch(52% 0.19 275 / 0.35);
+
+  --radius: 0.7rem;
+  --radius-sm: 0.45rem;
+  --gutter: clamp(1rem, 4vw, 2.5rem);
+  --measure: 46rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink:        oklch(93% 0.012 260);
+    --ink-soft:   oklch(74% 0.015 260);
+    --ink-faint:  oklch(60% 0.015 260);
+    --paper:      oklch(17% 0.015 265);
+    --raised:     oklch(21% 0.016 265);
+    --sunken:     oklch(19% 0.016 265);
+    --edge:       oklch(28% 0.018 265);
+    --edge-firm:  oklch(36% 0.02 265);
+
+    --accent:     oklch(72% 0.15 275);
+    --accent-ink: oklch(18% 0.03 275);
+    --accent-wash: oklch(26% 0.05 275);
+
+    --warn:       oklch(78% 0.13 75);
+    --warn-wash:  oklch(28% 0.05 75);
+    --bad:        oklch(70% 0.16 25);
+    --bad-wash:   oklch(27% 0.06 25);
+    --good:       oklch(72% 0.13 155);
+
+    --lift: 0 1px 2px oklch(0% 0 0 / 0.3), 0 6px 16px oklch(0% 0 0 / 0.25);
+  }
+}
+
+/* ------------------------------------------------------------- the frame -- */
 * { box-sizing: border-box; }
-body { margin: 0; font: 16px/1.55 system-ui, sans-serif; }
-header { display: flex; justify-content: space-between; align-items: center;
-         padding: 1rem clamp(1rem, 4vw, 3rem); border-bottom: 1px solid var(--edge); }
-.brand { font-weight: 650; letter-spacing: -0.01em; text-decoration: none; color: inherit; }
-main { max-width: 46rem; margin: 0 auto; padding: 2rem clamp(1rem, 4vw, 3rem) 4rem; }
-footer { max-width: 46rem; margin: 0 auto; padding: 0 clamp(1rem, 4vw, 3rem) 3rem;
-         opacity: .6; font-size: .875rem; }
-h1 { font-size: 1.6rem; letter-spacing: -0.02em; margin: 0 0 .25rem; }
-h2 { font-size: 1.05rem; margin: 2.5rem 0 .75rem; }
-p.lede { opacity: .75; margin-top: 0; }
-label { display: block; margin: .85rem 0 .25rem; font-size: .875rem; opacity: .8; }
-input, select, button { font: inherit; }
-input, select { width: 100%; padding: .55rem .7rem; border: 1px solid var(--edge);
-                border-radius: .4rem; background: transparent; color: inherit; }
-button { padding: .55rem 1rem; border: 1px solid var(--edge); border-radius: .4rem;
-         background: color-mix(in oklab, currentColor 8%, transparent); color: inherit;
-         cursor: pointer; }
-button.link { border: 0; background: none; padding: 0; text-decoration: underline; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+
+header {
+  display: flex; justify-content: space-between; align-items: center; gap: 1rem;
+  padding: 0.9rem var(--gutter);
+  border-bottom: 1px solid var(--edge);
+  background: var(--raised);
+  position: sticky; top: 0; z-index: 5;
+}
+.brand {
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  font-weight: 650; letter-spacing: -0.015em; text-decoration: none; color: inherit;
+}
+.brand svg { width: 1.15rem; height: 1.15rem; color: var(--accent); }
+header nav { display: flex; align-items: center; gap: 0.9rem; font-size: 0.9rem; }
+
+main { max-width: var(--measure); margin: 0 auto; padding: 2.25rem var(--gutter) 3rem; }
+footer {
+  max-width: var(--measure); margin: 0 auto;
+  padding: 0 var(--gutter) 3rem;
+  /* Soft rather than faint: at 0.85rem the faint tone falls under 4.5:1 on
+     white, and a footer is still something people read. */
+  color: var(--ink-soft); font-size: 0.85rem;
+}
+footer a { color: inherit; }
+
+/* --------------------------------------------------------------- reading -- */
+h1 { font-size: clamp(1.5rem, 1.2rem + 1.4vw, 2rem); line-height: 1.2;
+     letter-spacing: -0.025em; margin: 0 0 0.4rem; font-weight: 680; }
+h2 { font-size: 1.1rem; letter-spacing: -0.012em; margin: 2.75rem 0 0.85rem;
+     font-weight: 640; }
+h3 { margin: 0; font-size: 1rem; font-weight: 620; letter-spacing: -0.01em; }
+p { margin: 0 0 0.9rem; }
+p.lede { color: var(--ink-soft); font-size: 1.05rem; margin-top: 0; }
+ul { padding-left: 1.15rem; }
+li { margin-bottom: 0.35rem; }
+a { color: var(--accent); text-underline-offset: 0.15em; }
+strong { font-weight: 640; }
+.meta { font-size: 0.85rem; color: var(--ink-soft); margin: 0; }
+.meta + .meta { margin-top: 0.15rem; }
+.note {
+  border-left: 2px solid var(--edge-firm);
+  padding: 0.1rem 0 0.1rem 0.9rem;
+  color: var(--ink-soft); font-size: 0.92rem;
+}
+.bad { color: var(--bad); }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; }
+
+/* ---------------------------------------------------------------- fields -- */
+input, select, button, textarea { font: inherit; color: inherit; }
+label { display: block; margin: 0.9rem 0 0.3rem; font-size: 0.875rem;
+        font-weight: 550; color: var(--ink-soft); }
+input[type="text"], input[type="email"], input[type="password"], select {
+  width: 100%; padding: 0.6rem 0.75rem;
+  border: 1px solid var(--edge-firm); border-radius: var(--radius-sm);
+  background: var(--paper);
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+input:hover, select:hover { border-color: var(--ink-faint); }
+input:focus-visible, select:focus-visible, button:focus-visible, a:focus-visible,
+summary:focus-visible {
+  outline: none; border-color: var(--accent); box-shadow: var(--ring);
+}
+input::placeholder { color: var(--ink-faint); }
+label:has(input[type="checkbox"]) {
+  display: flex; align-items: center; gap: 0.5rem;
+  font-weight: 450; color: var(--ink); cursor: pointer;
+}
+input[type="checkbox"] { width: auto; accent-color: var(--accent); margin: 0; }
 form.stack { margin-bottom: 1rem; }
-.row { display: flex; gap: .75rem; flex-wrap: wrap; }
-.row > * { flex: 1 1 12rem; }
-.card { border: 1px solid var(--edge); border-radius: .6rem; padding: 1rem 1.15rem; margin: .75rem 0; }
-.card h3 { margin: 0 0 .2rem; font-size: 1rem; }
-.meta { font-size: .85rem; opacity: .7; margin: 0; }
-code.feed { display: block; word-break: break-all; font-size: .8rem; padding: .5rem .6rem;
-            border: 1px solid var(--edge); border-radius: .4rem; margin: .6rem 0 .4rem; }
-.note { border-left: 3px solid var(--edge); padding: .4rem 0 .4rem .9rem; opacity: .8;
-        font-size: .9rem; }
-.bad { color: #b3261e; }
-/* A refused password stops everything, so it is framed rather than mentioned. */
-.notice { border: 1px solid #b3261e; border-radius: .5rem; padding: .2rem .9rem .9rem;
-          margin: .75rem 0; }
-.notice p { opacity: 1; }
-button.danger { border-color: #b3261e; color: #b3261e; }
-.actions { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .5rem; }
-.subjects { display: flex; gap: .4rem; flex-wrap: wrap; margin: .3rem 0 .2rem; }
-.pill { display: inline-flex; align-items: center; gap: .15rem; margin: 0;
-        border: 1px solid var(--edge); border-radius: 1rem; padding: .1rem .6rem .1rem .4rem;
-        font-size: .85rem; opacity: 1; }
-details.qr { margin: .5rem 0; font-size: .9rem; }
-details.qr summary { cursor: pointer; opacity: .8; }
-.qrbox { background: #fff; padding: .6rem; border-radius: .5rem; width: max-content;
-         margin-top: .5rem; }
-.qrbox svg { display: block; width: 190px; height: 190px; }
+.row { display: flex; gap: 0.85rem; flex-wrap: wrap; }
+.row > * { flex: 1 1 13rem; min-width: 0; }
+
+/* --------------------------------------------------------------- buttons -- */
+button {
+  display: inline-flex; align-items: center; justify-content: center; gap: 0.4rem;
+  padding: 0.55rem 0.95rem;
+  border: 1px solid var(--edge-firm); border-radius: var(--radius-sm);
+  background: var(--raised);
+  font-size: 0.925rem; font-weight: 550; line-height: 1.35;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, transform 0.06s;
+}
+button:hover { background: var(--sunken); border-color: var(--ink-faint); }
+button:active { transform: translateY(1px); }
+/* One primary action per form, so the eye knows where to go. */
+form.stack > p + button, button.primary {
+  background: var(--accent); border-color: var(--accent); color: var(--accent-ink);
+}
+form.stack > p + button:hover, button.primary:hover {
+  background: color-mix(in oklab, var(--accent) 88%, black); border-color: transparent;
+}
+button.link {
+  border: 0; background: none; padding: 0; color: var(--ink-soft);
+  text-decoration: underline; font-weight: 450;
+}
+button.link:hover { background: none; color: var(--ink); }
+button.danger { border-color: color-mix(in oklab, var(--bad) 45%, transparent); color: var(--bad); }
+button.danger:hover { background: var(--bad-wash); border-color: var(--bad); }
+.actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.75rem; }
 .actions form { margin: 0; }
+.actions a { text-decoration: none; }
+
+/* ----------------------------------------------------------------- cards -- */
+.card {
+  border: 1px solid var(--edge); border-radius: var(--radius);
+  background: var(--raised); box-shadow: var(--lift);
+  padding: 1.1rem 1.25rem; margin: 0.85rem 0;
+}
+.card-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 0.75rem; flex-wrap: wrap;
+}
+
+/* A word for how a link is faring, so the state is seen before it is read. */
+.badge {
+  display: inline-flex; align-items: center; gap: 0.35rem;
+  padding: 0.15rem 0.55rem; border-radius: 999px;
+  font-size: 0.78rem; font-weight: 600; letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+.badge::before { content: ""; width: 0.45rem; height: 0.45rem; border-radius: 50%;
+                 background: currentColor; }
+.badge.ok   { background: color-mix(in oklab, var(--good) 14%, transparent); color: var(--good); }
+.badge.warn { background: var(--warn-wash); color: var(--warn); }
+.badge.bad  { background: var(--bad-wash); color: var(--bad); }
+.badge.idle { background: var(--sunken); color: var(--ink-soft); }
+
+/* A refused password stops everything, so it is framed rather than mentioned. */
+.notice {
+  border: 1px solid color-mix(in oklab, var(--bad) 40%, transparent);
+  background: var(--bad-wash);
+  border-radius: var(--radius-sm);
+  padding: 0.9rem 1rem; margin: 0.9rem 0;
+}
+.notice p:last-of-type { margin-bottom: 0; }
+.notice label { color: inherit; }
+
+/* ------------------------------------------------------------ the feed -- */
+.feedbox {
+  background: var(--sunken); border: 1px solid var(--edge);
+  border-radius: var(--radius-sm); padding: 0.7rem 0.8rem; margin: 0.85rem 0 0;
+}
+code.feed {
+  display: block; word-break: break-all; font-size: 0.8rem; line-height: 1.5;
+  color: var(--ink-soft);
+}
+.feedbox .actions { margin-top: 0.65rem; }
+
+details { margin: 0.6rem 0; }
+details summary {
+  cursor: pointer; font-size: 0.9rem; font-weight: 550; color: var(--ink-soft);
+  padding: 0.3rem 0; list-style: none; display: flex; align-items: center; gap: 0.4rem;
+}
+details summary::-webkit-details-marker { display: none; }
+details summary::before {
+  content: "›"; display: inline-block; transition: transform 0.15s;
+  font-size: 1.1em; line-height: 1;
+}
+details[open] summary::before { transform: rotate(90deg); }
+details summary:hover { color: var(--ink); }
+details > *:not(summary) { margin-left: 1.05rem; }
+
+.qrbox {
+  background: #fff; padding: 0.7rem; border-radius: var(--radius-sm);
+  width: max-content; margin-top: 0.5rem; box-shadow: var(--lift);
+}
+.qrbox svg { display: block; width: 190px; height: 190px; }
+
+.subjects { display: flex; gap: 0.4rem; flex-wrap: wrap; margin: 0.4rem 0 0.2rem; }
+.pill {
+  display: inline-flex; align-items: center; gap: 0.35rem; margin: 0;
+  border: 1px solid var(--edge-firm); border-radius: 999px;
+  padding: 0.22rem 0.7rem 0.22rem 0.55rem;
+  font-size: 0.85rem; font-weight: 450; color: var(--ink); cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+.pill:hover { border-color: var(--ink-faint); background: var(--sunken); }
+.pill:has(input:checked) {
+  background: var(--accent-wash); border-color: color-mix(in oklab, var(--accent) 50%, transparent);
+  color: color-mix(in oklab, var(--accent) 75%, var(--ink));
+}
+
+/* ------------------------------------------------------------ the front -- */
+.hero { margin-bottom: 2rem; }
+.hero h1 { max-width: 20ch; }
+.points { list-style: none; padding: 0; margin: 1.25rem 0 0; display: grid;
+          gap: 0.55rem; font-size: 0.95rem; color: var(--ink-soft); }
+.points li { display: flex; gap: 0.6rem; align-items: flex-start; margin: 0; }
+.points li::before { content: "✓"; color: var(--accent); font-weight: 700; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
 "#;
 
 // ----------------------------------------------------------------- landing ---
@@ -140,43 +373,7 @@ pub async fn index(
     let w = lang.words();
     match current(&state, &jar).await {
         Some(user) => dashboard_with(state, user, None, chosen, lang).await,
-        None => page(
-            lang,
-            w.sign_in,
-            None,
-            html! {
-                h1 { (w.welcome) }
-                p.lede { (w.lede) }
-                div.row {
-                    form.stack method="post" action="/signup" {
-                        h2 { (w.create_account) }
-                        label for="su-email" { (w.email) }
-                        input #su-email type="email" name="email" required autocomplete="email";
-                        label for="su-pw" { (w.password_ten) }
-                        input #su-pw type="password" name="password" required
-                              autocomplete="new-password" minlength="10";
-                        p {} button type="submit" { (w.sign_up) }
-                    }
-                    form.stack method="post" action="/login" {
-                        h2 { (w.sign_in) }
-                        label for="li-email" { (w.email) }
-                        input #li-email type="email" name="email" required autocomplete="email";
-                        label for="li-pw" { (w.password) }
-                        input #li-pw type="password" name="password" required
-                              autocomplete="current-password";
-                        p {} button type="submit" { (w.sign_in) }
-                    }
-                }
-                p.note {
-                    "WebUntis gives students no way to grant access without a password, so this "
-                    "service has to store your school password to read your timetable for you. "
-                    "It is encrypted, and the key is kept apart from the database — but you "
-                    "should know that before you hand it over, and check what your school's "
-                    "rules say."
-                }
-            },
-        )
-        .into_response(),
+        None => page(lang, w.sign_in, None, front(w)).into_response(),
     }
 }
 
@@ -204,6 +401,62 @@ fn qr_svg(url: &str) -> Option<maud::PreEscaped<String>> {
     // that prolog is not markup but litter, so it is cut away.
     let from = drawn.find("<svg")?;
     Some(maud::PreEscaped(drawn[from..].to_owned()))
+}
+
+/// The page a stranger sees. Apart so that it may be looked at without a
+/// database behind it, which is how it came to be looked at at all.
+fn front(w: &'static Words) -> Markup {
+    html! {
+                .hero {
+                    h1 { (w.welcome) }
+                    p.lede { (w.lede) }
+                    ul.points {
+                        li { (w.point_cancelled) }
+                        li { (w.point_exams) }
+                        li { (w.point_nothing) }
+                    }
+                }
+                div.row {
+                    form.stack.card method="post" action="/signup" {
+                        h2 { (w.create_account) }
+                        label for="su-email" { (w.email) }
+                        input #su-email type="email" name="email" required autocomplete="email";
+                        label for="su-pw" { (w.password_ten) }
+                        input #su-pw type="password" name="password" required
+                              autocomplete="new-password" minlength="10";
+                        p {} button type="submit" { (w.sign_up) }
+                    }
+                    form.stack.card method="post" action="/login" {
+                        h2 { (w.sign_in) }
+                        label for="li-email" { (w.email) }
+                        input #li-email type="email" name="email" required autocomplete="email";
+                        label for="li-pw" { (w.password) }
+                        input #li-pw type="password" name="password" required
+                              autocomplete="current-password";
+                        p {} button type="submit" { (w.sign_in) }
+                    }
+                }
+                p.note { (w.front_warning) " " a href="/privacy" { (w.privacy_link) } "." }
+    }
+}
+
+/// How a link is faring, in the one word a badge has room for.
+enum Standing {
+    Well,
+    Failing,
+    Refused,
+    Waiting,
+}
+
+fn standing(account: &db::UntisAccount, status: Option<&db::SyncStatus>) -> Standing {
+    if account.credentials_rejected {
+        return Standing::Refused;
+    }
+    match status {
+        Some(state) if state.last_error.is_some() => Standing::Failing,
+        Some(state) if state.last_ok_at.is_some() => Standing::Well,
+        _ => Standing::Waiting,
+    }
 }
 
 async fn dashboard(
@@ -263,7 +516,20 @@ async fn dashboard_with(
 
             @for (account, feeds, status, google, subjects) in &cards {
                 .card {
-                    h3 { (account.display_name.clone().unwrap_or_else(|| account.username.clone())) }
+                    .card-head {
+                        h3 {
+                            (account.display_name.clone()
+                                .unwrap_or_else(|| account.username.clone()))
+                        }
+                        // The state before the detail: a glance should be
+                        // enough to know whether anything wants doing.
+                        @match standing(account, status.as_ref()) {
+                            Standing::Refused => span.badge.bad { (w.state_refused) }
+                            Standing::Failing => span.badge.warn { (w.state_failing) }
+                            Standing::Waiting => span.badge.idle { (w.state_waiting) }
+                            Standing::Well => span.badge.ok { (w.state_well) }
+                        }
+                    }
                     p.meta {
                         (account.school) " · " (account.server) " · " (account.timezone.name())
                     }
@@ -301,20 +567,24 @@ async fn dashboard_with(
                         }
                     }
                     @for feed in feeds {
-                        code.feed { (state.config.feed_url(&feed.token)) }
-                        .actions {
-                            a href=(state.config.webcal_url(&feed.token)) {
-                                button type="button" { (w.subscribe_here) }
+                        .feedbox {
+                            @if let Some(name) = &feed.label {
+                                p.meta { (name) }
                             }
-                        }
+                            code.feed { (state.config.feed_url(&feed.token)) }
+                            .actions {
+                                a href=(state.config.webcal_url(&feed.token)) {
+                                    button.primary type="button" { (w.subscribe_here) }
+                                }
+                            }
                         @if let Some(qr) = qr_svg(&state.config.feed_url(&feed.token)) {
-                            details.qr {
+                            details {
                                 summary { (w.show_qr) }
                                 p.meta { (w.qr_warning) }
                                 .qrbox { (qr) }
                             }
                         }
-                        details.qr {
+                        details {
                             summary { (w.link_settings) }
                             form.stack method="post"
                                  action={ "/feeds/" (feed.id) "/settings" } {
@@ -389,6 +659,7 @@ async fn dashboard_with(
                                     button.danger type="submit" { (w.delete_link) }
                                 }
                             }
+                        }
                         }
                     }
                     @if *google {
@@ -1727,5 +1998,137 @@ mod page_tests {
             assert!(text.contains("180"), "and the retention it actually runs with");
             assert!(text.contains("you@example.test"), "and who to ask");
         }
+    }
+}
+
+/// Renders the pages to `target/preview/` so a person may look at them.
+///
+/// A stylesheet cannot be judged by reading it, and the pages that carry most
+/// of the design need neither a database nor a school to be drawn. Run it with
+/// `cargo test -p stundenglas-server preview` and open what it names.
+#[cfg(test)]
+mod preview {
+    use super::*;
+    use crate::words::Lang;
+
+    fn feed_settings_demo(w: &'static Words) -> Markup {
+        html! {
+            details {
+                summary { (w.link_settings) }
+                form.stack {
+                    label { (w.what_to_call_it) }
+                    input type="text" value="Handy";
+                    label { (w.ask_every) }
+                    select { option { "30 minutes" } }
+                    p.meta { (w.refresh_note) }
+                    label { (w.remind_before) }
+                    select { option { (w.never) } option selected { "the day before" } }
+                    p.meta { (w.only_exams_ring) }
+                    label { input type="checkbox" checked; (w.keep_cancelled) }
+                    label { input type="checkbox" checked; (w.carry_homework) }
+                    label { input type="checkbox"; (w.mark_holidays) }
+                    label { (w.leave_out) }
+                    p.meta { (w.leave_out_note) }
+                    .subjects {
+                        @for (subject, left_out) in
+                            [("D", false), ("E", false), ("M", false), ("RK", true), ("BSP", false)]
+                        {
+                            label.pill {
+                                input type="checkbox" checked[left_out];
+                                " " (subject)
+                            }
+                        }
+                    }
+                    p {} button.primary type="submit" { (w.save) }
+                }
+            }
+        }
+    }
+
+    /// A dashboard as it looks with something to show: one link faring well,
+    /// one whose password the school has refused.
+    fn dashboard_demo(w: &'static Words) -> Markup {
+        let url = "https://stundenglas.example.test/cal/7Qb3xY_kLm2pR9sTvW4eZa8nFgH1jK5c.ics";
+        html! {
+            h1 { (w.your_timetables) }
+            p.lede { (w.one_link_each) }
+            p.meta { a href="/security" { (w.security_keys) } " · " a href="/admin" { (w.who_may_join) } }
+
+            .card {
+                .card-head {
+                    h3 { "Anna Beispiel" }
+                    span.badge.ok { (w.state_well) }
+                }
+                p.meta { "bg-beispiel · neilo.webuntis.com · Europe/Vienna" }
+                p.meta { "312 " (w.lessons) ", 4 " (w.exams) ", 6 " (w.homework_count)
+                         ", " (w.refreshed) " 22 Sep 08:30 UTC" }
+                .feedbox {
+                    p.meta { "Handy" }
+                    code.feed { (url) }
+                    .actions { button.primary type="button" { (w.subscribe_here) } }
+                    details {
+                        summary { (w.show_qr) }
+                        p.meta { (w.qr_warning) }
+                        @if let Some(qr) = qr_svg(url) { .qrbox { (qr) } }
+                    }
+                    (feed_settings_demo(w))
+                    .actions {
+                        button type="submit" { (w.new_address) }
+                        button.danger type="submit" { (w.delete_link) }
+                    }
+                }
+                .actions {
+                    button type="submit" { (w.new_link) }
+                    button type="button" { (w.push_to_google) }
+                    button.danger type="submit" { (w.remove_school) }
+                }
+            }
+
+            .card {
+                .card-head {
+                    h3 { "Max Beispiel" }
+                    span.badge.bad { (w.state_refused) }
+                }
+                p.meta { "bg-beispiel · neilo.webuntis.com · Europe/Vienna" }
+                .notice {
+                    p { strong { (w.refused_title) } (w.refused_body) }
+                    form.stack {
+                        label { (w.untis_password) }
+                        input type="password";
+                        p {} button.primary type="submit" { (w.try_this_one) }
+                    }
+                }
+            }
+
+            h2 { (w.your_data) }
+            p.note { (w.your_data_note) }
+            .actions {
+                button type="button" { (w.download_my_data) }
+                button.danger type="submit" { (w.delete_my_account) }
+            }
+        }
+    }
+
+    #[test]
+    fn draw_the_pages_for_the_eye() {
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/preview");
+        std::fs::create_dir_all(&out).expect("somewhere to put them");
+
+        for lang in [Lang::En, Lang::De] {
+            let w = lang.words();
+            let code = lang.code();
+            let pages: [(&str, Markup); 3] = [
+                ("front", front(w)),
+                ("dashboard", dashboard_demo(w)),
+                ("privacy", privacy_text(lang, "you@example.test", 180)),
+            ];
+            for (name, body) in pages {
+                let who = (name != "front").then_some(CurrentUser { id: uuid::Uuid::nil() });
+                let html = page(lang, name, who, body).into_string();
+                assert!(html.contains("<html lang="), "a page should be a page");
+                std::fs::write(out.join(format!("{name}.{code}.html")), html).expect("writing");
+            }
+        }
+        println!("\\npreview written to {}\\n", out.canonicalize().unwrap_or(out).display());
     }
 }

@@ -93,6 +93,10 @@ pub struct Words {
     pub email: &'static str,
     pub password: &'static str,
     pub password_ten: &'static str,
+    pub point_cancelled: &'static str,
+    pub point_exams: &'static str,
+    pub point_nothing: &'static str,
+    pub front_warning: &'static str,
 
     // The dashboard
     pub your_timetables: &'static str,
@@ -111,6 +115,10 @@ pub struct Words {
     pub refreshed: &'static str,
     pub last_refresh_failed: &'static str,
     pub waiting_first: &'static str,
+    pub state_well: &'static str,
+    pub state_failing: &'static str,
+    pub state_refused: &'static str,
+    pub state_waiting: &'static str,
     pub subscribe_here: &'static str,
     pub show_qr: &'static str,
     pub qr_warning: &'static str,
@@ -192,6 +200,16 @@ pub static ENGLISH: Words = Words {
     email: "Email",
     password: "Password",
     password_ten: "Password (ten characters or more)",
+    point_cancelled: "Cancelled hours stay visible, so you can see the free period rather than \
+                      wonder where it went.",
+    point_exams: "Exams, homework and holidays come along, and an exam can remind you the day \
+                  before.",
+    point_nothing: "Nothing to install, and nothing to grant: one secret link your calendar \
+                    subscribes to.",
+    front_warning: "WebUntis gives students no way to grant access without a password, so this \
+                    service has to store your school password to read your timetable. It is \
+                    encrypted and the key is kept apart from the database — but know that \
+                    before you hand it over, and check what your school's rules say:",
 
     your_timetables: "Your timetables",
     one_link_each: "One link per school. Each keeps its own clock.",
@@ -211,6 +229,10 @@ pub static ENGLISH: Words = Words {
     refreshed: "refreshed",
     last_refresh_failed: "last refresh failed: ",
     waiting_first: "waiting for the first refresh",
+    state_well: "up to date",
+    state_failing: "not refreshing",
+    state_refused: "needs your password",
+    state_waiting: "waiting",
     subscribe_here: "Subscribe on this device",
     show_qr: "Show a QR code for a phone",
     qr_warning: "Point a camera at it. Treat it as you would the address itself: whoever scans \
@@ -299,6 +321,17 @@ pub static GERMAN: Words = Words {
     email: "E-Mail",
     password: "Passwort",
     password_ten: "Passwort (mindestens zehn Zeichen)",
+    point_cancelled: "Entfallene Stunden bleiben sichtbar — du siehst die Freistunde, statt dich \
+                      zu wundern, wo sie hin ist.",
+    point_exams: "Schularbeiten, Hausübungen und Ferien kommen mit, und eine Schularbeit kann \
+                  dich am Vortag erinnern.",
+    point_nothing: "Nichts zu installieren, nichts freizugeben: ein geheimer Link, den dein \
+                    Kalender abonniert.",
+    front_warning: "WebUntis bietet Schülerinnen und Schülern keine Freigabe ohne Passwort. \
+                    Dieser Dienst muss dein Schulpasswort also speichern, um deinen Stundenplan \
+                    zu lesen. Es ist verschlüsselt und der Schlüssel liegt getrennt von der \
+                    Datenbank — aber das solltest du wissen, bevor du es aus der Hand gibst, \
+                    und in der Hausordnung deiner Schule nachsehen:",
 
     your_timetables: "Deine Stundenpläne",
     one_link_each: "Ein Link je Schule. Jede behält ihre eigene Zeitzone.",
@@ -320,6 +353,10 @@ pub static GERMAN: Words = Words {
     refreshed: "aktualisiert",
     last_refresh_failed: "letzte Aktualisierung fehlgeschlagen: ",
     waiting_first: "wartet auf die erste Aktualisierung",
+    state_well: "aktuell",
+    state_failing: "aktualisiert nicht",
+    state_refused: "braucht dein Passwort",
+    state_waiting: "wartet",
     subscribe_here: "Auf diesem Gerät abonnieren",
     show_qr: "QR-Code fürs Handy zeigen",
     qr_warning: "Kamera darauf richten. Behandle ihn wie die Adresse selbst: wer ihn scannt, \
