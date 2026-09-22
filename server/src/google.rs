@@ -32,13 +32,16 @@ pub fn redirect_uri(state: &AppState) -> String {
 pub async fn begin(
     State(state): State<AppState>,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
     Path(account): Path<Uuid>,
 ) -> Response {
+    let lang = crate::words::Lang::of(&jar, &headers);
     let Some(user) = crate::web::signed_in(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
     let Some(client) = state.config.google.clone() else {
         return crate::web::say(
+            lang,
             "Not offered here",
             "This server has no Google client configured, so linking a Google \
              Calendar is not on offer. The calendar link works regardless.",
@@ -81,17 +84,28 @@ pub struct Returned {
     error: Option<String>,
 }
 
-pub async fn callback(State(app): State<AppState>, Query(back): Query<Returned>) -> Response {
+pub async fn callback(
+    State(app): State<AppState>,
+    jar: CookieJar,
+    headers: axum::http::HeaderMap,
+    Query(back): Query<Returned>,
+) -> Response {
+    let lang = crate::words::Lang::of(&jar, &headers);
     if let Some(err) = back.error {
-        return crate::web::say("Google said no", &format!("Consent was refused: {err}"));
+        return crate::web::say(lang, "Google said no", &format!("Consent was refused: {err}"));
     }
     let (Some(code), Some(state)) = (back.code, back.state) else {
-        return crate::web::say("Something is missing", "That return from Google made no sense.");
+        return crate::web::say(
+            lang,
+            "Something is missing",
+            "That return from Google made no sense.",
+        );
     };
 
     // The state is spent on use, so a replayed link buys nothing.
     let Ok(Some((user, account))) = spend_state(&app.pool, &state).await else {
         return crate::web::say(
+            lang,
             "That link is stale",
             "Start the connection again from your timetables.",
         );
@@ -110,7 +124,7 @@ pub async fn callback(State(app): State<AppState>, Query(back): Query<Returned>)
         }
         Err(err) => {
             tracing::warn!("google link failed: {err:#}");
-            crate::web::say("That did not work", &format!("{err}"))
+            crate::web::say(lang, "That did not work", &format!("{err}"))
         }
     }
 }

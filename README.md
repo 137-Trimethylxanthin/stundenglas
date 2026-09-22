@@ -32,6 +32,9 @@ It is deliberately more careful than the export WebUntis itself would give you:
 
 Markers: ❌ cancelled · ⚠️ changed · 📌 event · 📝 exam.
 
+The interface is English and German. It follows the browser's `Accept-Language`
+unless a reader says otherwise, and the footer offers the other one.
+
 Each link carries its own settings — what to call it, how often calendars are
 asked to look again, whether cancelled hours are kept, and whether exams ring.
 Alongside the address there is a `webcal://` link, which subscribes in one tap

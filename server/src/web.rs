@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::auth::{self, CurrentUser};
 use crate::db::{self, NewAccount};
+use crate::words::Lang;
 use crate::{AppState, people, schools};
 
 // A short list of the zones a European school is likely to keep, with the rest
@@ -33,10 +34,11 @@ const COMMON_ZONES: &[&str] = &[
     "UTC",
 ];
 
-fn page(title: &str, user: Option<CurrentUser>, body: Markup) -> Markup {
+fn page(lang: Lang, title: &str, user: Option<CurrentUser>, body: Markup) -> Markup {
+    let w = lang.words();
     html! {
         (DOCTYPE)
-        html lang="en" {
+        html lang=(lang.code()) {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
@@ -49,15 +51,19 @@ fn page(title: &str, user: Option<CurrentUser>, body: Markup) -> Markup {
                     nav {
                         @if user.is_some() {
                             form method="post" action="/logout" {
-                                button.link type="submit" { "sign out" }
+                                button.link type="submit" { (w.sign_out) }
                             }
                         }
                     }
                 }
                 main { (body) }
                 footer {
-                    "Your timetable, in your own calendar. · "
-                    a href="/privacy" { "What is kept, and why" }
+                    (w.footer) " · "
+                    a href="/privacy" { (w.privacy_link) }
+                    " · "
+                    // Plain links: a language toggle that needs script is one
+                    // that fails for whoever most needs it.
+                    a href={ "/language/" (lang.other().code()) } { (lang.other().own_name()) }
                 }
             }
         }
@@ -127,38 +133,38 @@ pub struct Prefill {
 pub async fn index(
     State(state): State<AppState>,
     jar: CookieJar,
+    headers: HeaderMap,
     Query(chosen): Query<Prefill>,
 ) -> Response {
+    let lang = Lang::of(&jar, &headers);
+    let w = lang.words();
     match current(&state, &jar).await {
-        Some(user) => dashboard_with(state, user, None, chosen).await,
+        Some(user) => dashboard_with(state, user, None, chosen, lang).await,
         None => page(
-            "Sign in",
+            lang,
+            w.sign_in,
             None,
             html! {
-                h1 { "Your school timetable, in the calendar you already use" }
-                p.lede {
-                    "stundenglas reads your WebUntis timetable and publishes it as a private "
-                    "calendar link. Google Calendar, iOS, Outlook and Thunderbird can all "
-                    "subscribe to it. Cancelled lessons stay visible so you can see the free hour."
-                }
+                h1 { (w.welcome) }
+                p.lede { (w.lede) }
                 div.row {
                     form.stack method="post" action="/signup" {
-                        h2 { "Create an account" }
-                        label for="su-email" { "Email" }
+                        h2 { (w.create_account) }
+                        label for="su-email" { (w.email) }
                         input #su-email type="email" name="email" required autocomplete="email";
-                        label for="su-pw" { "Password (ten characters or more)" }
+                        label for="su-pw" { (w.password_ten) }
                         input #su-pw type="password" name="password" required
                               autocomplete="new-password" minlength="10";
-                        p {} button type="submit" { "Sign up" }
+                        p {} button type="submit" { (w.sign_up) }
                     }
                     form.stack method="post" action="/login" {
-                        h2 { "Sign in" }
-                        label for="li-email" { "Email" }
+                        h2 { (w.sign_in) }
+                        label for="li-email" { (w.email) }
                         input #li-email type="email" name="email" required autocomplete="email";
-                        label for="li-pw" { "Password" }
+                        label for="li-pw" { (w.password) }
                         input #li-pw type="password" name="password" required
                               autocomplete="current-password";
-                        p {} button type="submit" { "Sign in" }
+                        p {} button type="submit" { (w.sign_in) }
                     }
                 }
                 p.note {
@@ -200,8 +206,13 @@ fn qr_svg(url: &str) -> Option<maud::PreEscaped<String>> {
     Some(maud::PreEscaped(drawn[from..].to_owned()))
 }
 
-async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) -> Response {
-    dashboard_with(state, user, problem, Prefill::default()).await
+async fn dashboard(
+    state: AppState,
+    user: CurrentUser,
+    problem: Option<String>,
+    lang: Lang,
+) -> Response {
+    dashboard_with(state, user, problem, Prefill::default(), lang).await
 }
 
 async fn dashboard_with(
@@ -209,11 +220,13 @@ async fn dashboard_with(
     user: CurrentUser,
     problem: Option<String>,
     chosen: Prefill,
+    lang: Lang,
 ) -> Response {
+    let w = lang.words();
     let me = people::profile(&state.pool, user.id).await;
     let admin = me.as_ref().is_some_and(|p| p.is_admin);
     if !me.as_ref().is_some_and(|p| p.approved) {
-        return waiting_room(admin);
+        return waiting_room(admin, lang);
     }
     let accounts = db::accounts_of(&state.pool, user.id).await.unwrap_or_default();
 
@@ -230,21 +243,18 @@ async fn dashboard_with(
     // Filled in when they came back from the school search, empty otherwise.
     let prefill = (schools::tidy_server(&chosen.server), chosen.school.trim().to_owned());
     page(
-        "Your timetables",
+        lang,
+        w.your_timetables,
         Some(user),
         html! {
-            h1 { "Your timetables" }
-            p.lede { "One link per school. Each keeps its own clock." }
+            h1 { (w.your_timetables) }
+            p.lede { (w.one_link_each) }
             p.meta {
-                a href="/security" { "Security keys" }
-                @if admin { " · " a href="/admin" { "Who may join" } }
+                a href="/security" { (w.security_keys) }
+                @if admin { " · " a href="/admin" { (w.who_may_join) } }
             }
             @if has_google {
-                p.note {
-                    "A subscribed link is refreshed on your calendar's own schedule — Google "
-                    "often takes hours. Connect Google to have changes written the moment we "
-                    "see them."
-                }
+                p.note { (w.google_note) }
             }
 
             @if let Some(why) = &problem {
@@ -260,65 +270,60 @@ async fn dashboard_with(
                     @if account.credentials_rejected {
                         .bad.notice {
                             p {
-                                strong { "The school refused this login." }
-                                " Nothing more will be tried until you enter the password "
-                                "again — repeating a refused password is how a WebUntis "
-                                "account gets locked."
+                                strong { (w.refused_title) }
+                                (w.refused_body)
                             }
                             form.stack method="post" action={ "/links/" (account.id) "/password" } {
-                                label for={ "pw-" (account.id) } { "WebUntis password" }
+                                label for={ "pw-" (account.id) } { (w.untis_password) }
                                 input id={ "pw-" (account.id) } type="password" name="password"
                                       required autocomplete="off";
-                                p {} button type="submit" { "Try this one" }
+                                p {} button type="submit" { (w.try_this_one) }
                             }
                         }
                     }
                     p.meta {
                         @match status {
                             Some(s) if s.last_error.is_some() => {
-                                span.bad { "last refresh failed: "
+                                span.bad { (w.last_refresh_failed)
                                     (s.last_error.clone().unwrap_or_default()) }
                             }
                             Some(s) => {
-                                (s.lesson_count) " lessons"
-                                @if s.exam_count > 0 { ", " (s.exam_count) " exams" }
+                                (s.lesson_count) " " (w.lessons)
+                                @if s.exam_count > 0 { ", " (s.exam_count) " " (w.exams) }
                                 @if s.homework_count > 0 {
-                                    ", " (s.homework_count) " homework"
+                                    ", " (s.homework_count) " " (w.homework_count)
                                 }
                                 @if let Some(when) = s.last_ok_at {
-                                    ", refreshed " (when.format("%d %b %H:%M UTC").to_string())
+                                    ", " (w.refreshed) " " (when.format("%d %b %H:%M UTC").to_string())
                                 }
                             }
-                            None => { "waiting for the first refresh" }
+                            None => { (w.waiting_first) }
                         }
                     }
                     @for feed in feeds {
                         code.feed { (state.config.feed_url(&feed.token)) }
                         .actions {
                             a href=(state.config.webcal_url(&feed.token)) {
-                                button type="button" { "Subscribe on this device" }
+                                button type="button" { (w.subscribe_here) }
                             }
                         }
                         @if let Some(qr) = qr_svg(&state.config.feed_url(&feed.token)) {
                             details.qr {
-                                summary { "Show a QR code for a phone" }
-                                p.meta {
-                                    "Point a camera at it. Treat it as you would the address "
-                                    "itself: whoever scans it can read this timetable."
-                                }
+                                summary { (w.show_qr) }
+                                p.meta { (w.qr_warning) }
                                 .qrbox { (qr) }
                             }
                         }
                         details.qr {
-                            summary { "Settings for this link" }
+                            summary { (w.link_settings) }
                             form.stack method="post"
                                  action={ "/feeds/" (feed.id) "/settings" } {
-                                label { "What to call it" }
+                                label { (w.what_to_call_it) }
                                 input type="text" name="label" maxlength="60"
                                       placeholder="Phone, laptop, …"
                                       value=(feed.label.clone().unwrap_or_default());
 
-                                label { "Ask calendars to look again every" }
+                                label { (w.ask_every) }
                                 select name="refresh_minutes" {
                                     @for choice in [15_i32, 30, 60, 180, 360, 720, 1440] {
                                         option value=(choice)
@@ -327,15 +332,12 @@ async fn dashboard_with(
                                         }
                                     }
                                 }
-                                p.meta {
-                                    "A wish, not a rule. iOS honours it; Google refreshes on "
-                                    "its own schedule whatever is asked."
-                                }
+                                p.meta { (w.refresh_note) }
 
-                                label { "Remind me before an exam" }
+                                label { (w.remind_before) }
                                 select name="remind_before_minutes" {
                                     option value="" selected[feed.remind_before_minutes.is_none()] {
-                                        "Never"
+                                        (w.never)
                                     }
                                     @for choice in [30_i32, 60, 180, 720, 1440, 2880] {
                                         option value=(choice)
@@ -344,29 +346,26 @@ async fn dashboard_with(
                                         }
                                     }
                                 }
-                                p.meta { "Only exams ring. Ordinary lessons never do." }
+                                p.meta { (w.only_exams_ring) }
 
                                 label {
                                     input type="checkbox" name="keep_cancelled" value="1"
                                           checked[feed.keep_cancelled];
-                                    " Keep cancelled lessons, shown as free time"
+                                    (w.keep_cancelled)
                                 }
                                 label {
                                     input type="checkbox" name="with_homework" value="1"
                                           checked[feed.with_homework];
-                                    " Carry homework, on the day it is due"
+                                    (w.carry_homework)
                                 }
                                 label {
                                     input type="checkbox" name="with_holidays" value="1"
                                           checked[feed.with_holidays];
-                                    " Mark the school's holidays"
+                                    (w.mark_holidays)
                                 }
                                 @if !subjects.is_empty() {
-                                    label { "Leave out" }
-                                    p.meta {
-                                        "Subjects ticked here are kept out of this link "
-                                        "entirely — the lessons, their exams and their homework."
-                                    }
+                                    label { (w.leave_out) }
+                                    p.meta { (w.leave_out_note) }
                                     .subjects {
                                         @for subject in subjects {
                                             label.pill {
@@ -378,93 +377,89 @@ async fn dashboard_with(
                                         }
                                     }
                                 }
-                                p {} button type="submit" { "Save" }
+                                p {} button type="submit" { (w.save) }
                             }
                             .actions {
                                 form method="post" action={ "/feeds/" (feed.id) "/rotate" }
-                                     onsubmit="return confirm('Draw a new address? Whatever is subscribed to the old one stops updating.')" {
-                                    button type="submit" { "New address" }
+                                     onsubmit={ "return confirm('" (w.new_address_warning) "')" } {
+                                    button type="submit" { (w.new_address) }
                                 }
                                 form method="post" action={ "/feeds/" (feed.id) "/delete" }
-                                     onsubmit="return confirm('Delete this link? Anything subscribed to it stops updating.')" {
-                                    button.danger type="submit" { "Delete link" }
+                                     onsubmit={ "return confirm('" (w.delete_link_warning) "')" } {
+                                    button.danger type="submit" { (w.delete_link) }
                                 }
                             }
                         }
                     }
                     @if *google {
-                        p.meta { "Pushed into Google Calendar as well as the link above." }
+                        p.meta { (w.pushed_to_google) }
                     }
                     .actions {
                         form method="post" action={ "/links/" (account.id) "/feeds" } {
-                            button type="submit" { "New link" }
+                            button type="submit" { (w.new_link) }
                         }
                         @if has_google {
                             @if *google {
                                 form method="post" action={ "/links/" (account.id) "/google/delete" } {
-                                    button type="submit" { "Disconnect Google" }
+                                    button type="submit" { (w.disconnect_google) }
                                 }
                             } @else {
                                 a href={ "/links/" (account.id) "/google" } {
-                                    button type="button" { "Push to Google Calendar" }
+                                    button type="button" { (w.push_to_google) }
                                 }
                             }
                         }
                         form method="post" action={ "/links/" (account.id) "/delete" } {
-                            button type="submit" { "Remove school" }
+                            button type="submit" { (w.remove_school) }
                         }
                     }
                 }
             }
 
             @if cards.is_empty() {
-                p.note { "No school linked yet. Add one below and a calendar link appears." }
+                p.note { (w.nothing_linked) }
             }
 
-            h2 { "Your data" }
-            p.note {
-                "Everything here is yours to take or to be rid of. Deleting the account "
-                "removes the schools, the calendar links and the stored passwords with it, "
-                "at once and for good."
-            }
+            h2 { (w.your_data) }
+            p.note { (w.your_data_note) }
             .actions {
-                a href="/account/export.json" { button type="button" { "Download my data" } }
+                a href="/account/export.json" { button type="button" { (w.download_my_data) } }
                 form method="post" action="/account/delete"
-                     onsubmit="return confirm('Delete the account, the schools and every calendar link? This cannot be undone.')" {
-                    button.danger type="submit" { "Delete my account" }
+                     onsubmit={ "return confirm('" (w.delete_account_warning) "')" } {
+                    button.danger type="submit" { (w.delete_my_account) }
                 }
             }
 
-            h2 { "Link a school" }
+            h2 { (w.link_a_school) }
             form.stack method="post" action="/links" {
-                label for="server" { "WebUntis server" }
+                label for="server" { (w.webuntis_server) }
                 input #server type="text" name="server" required placeholder="example.webuntis.com"
                       list="known-servers" value=(prefill.0);
-                label for="school" { "School login name" }
+                label for="school" { (w.school_login_name) }
                 input #school type="text" name="school" required placeholder="example-school"
                       value=(prefill.1);
                 p.meta {
-                    a href="/schools" { "Find your school by name" }
-                    " — or take both from the URL webuntis.com sends you to, "
+                    a href="/schools" { (w.find_by_name) }
+                    (w.or_from_url)
                     code { "https://<server>/WebUntis/?school=<name>" } "."
                 }
                 .row {
                     div {
-                        label for="username" { "WebUntis username" }
+                        label for="username" { (w.untis_username) }
                         input #username type="text" name="username" required autocomplete="off";
                     }
                     div {
-                        label for="password" { "WebUntis password" }
+                        label for="password" { (w.untis_password) }
                         input #password type="password" name="password" required autocomplete="off";
                     }
                 }
-                label for="timezone" { "The school's timezone" }
+                label for="timezone" { (w.school_timezone) }
                 select #timezone name="timezone" {
                     @for zone in COMMON_ZONES {
                         option value=(zone) selected[*zone == "Europe/Vienna"] { (zone) }
                     }
                 }
-                p {} button type="submit" { "Link school" }
+                p {} button type="submit" { (w.link_school) }
             }
         },
     )
@@ -495,8 +490,10 @@ pub async fn feed_settings(
     State(state): State<AppState>,
     jar: CookieJar,
     Path(feed): Path<Uuid>,
+    headers: HeaderMap,
     Form(form): Form<FeedForm>,
 ) -> Response {
+    let lang = Lang::of(&jar, &headers);
     let Some(user) = current(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
@@ -517,7 +514,7 @@ pub async fn feed_settings(
     match db::update_feed(&state.pool, user.id, feed, &want).await {
         Ok(true) => Redirect::to("/").into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "no such link").into_response(),
-        Err(err) => dashboard(state, user, Some(format!("{err}"))).await,
+        Err(err) => dashboard(state, user, Some(format!("{err}")), lang).await,
     }
 }
 
@@ -527,6 +524,35 @@ pub struct Search {
     q: String,
 }
 
+/// A plain page for telling the user something went one way or another.
+pub fn say(lang: Lang, title: &str, body: &str) -> Response {
+    page(
+        lang,
+        title,
+        None,
+        html! {
+            h1 { (title) }
+            p.lede { (body) }
+            p { a href="/" { "←" } }
+        },
+    )
+    .into_response()
+}
+
+/// `GET /language/{code}`
+///
+/// Remembered in a cookie of its own. A preference, not a secret: nothing
+/// turneth on it, and a stranger setting it can do no more than read German.
+pub async fn set_language(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(code): Path<String>,
+) -> impl axum::response::IntoResponse {
+    let secure = state.config.public_url.starts_with("https");
+    let chosen = crate::words::Lang::from_code(&code);
+    (jar.add(crate::words::cookie_for(chosen, secure)), Redirect::to("/"))
+}
+
 /// `GET /schools?q=`
 ///
 /// WebUntis' own directory, so nobody need dig a server name and a login name
@@ -534,8 +560,11 @@ pub struct Search {
 pub async fn schools_page(
     State(state): State<AppState>,
     jar: CookieJar,
+    headers: HeaderMap,
     Query(search): Query<Search>,
 ) -> Response {
+    let lang = Lang::of(&jar, &headers);
+    let w = lang.words();
     let Some(user) = current(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
@@ -550,23 +579,21 @@ pub async fn schools_page(
     };
 
     page(
-        "Find your school",
+        lang,
+        w.find_your_school,
         Some(user),
         html! {
-            h1 { "Find your school" }
-            p.lede { "The same directory the WebUntis login page searches." }
+            h1 { (w.find_your_school) }
+            p.lede { (w.find_lede) }
             form.stack method="get" action="/schools" {
-                label for="q" { "School, or the town it is in" }
+                label for="q" { (w.school_or_town) }
                 input #q type="text" name="q" value=(query) required
                       placeholder="BG Beispiel, or Wien";
-                p {} button type="submit" { "Search" }
+                p {} button type="submit" { (w.search) }
             }
 
             @if query.chars().count() >= 3 && found.is_empty() {
-                p.note {
-                    "Nothing found. The directory knows schools by their official name, "
-                    "which is not always the one people use — try the town instead."
-                }
+                p.note { (w.nothing_found) }
             }
             @for school in &found {
                 .card {
@@ -576,13 +603,13 @@ pub async fn schools_page(
                     .actions {
                         a href={ "/?server=" (urlencode(&school.server))
                                  "&school=" (urlencode(&school.login_name)) } {
-                            button type="button" { "Use this one" }
+                            button type="button" { (w.use_this_one) }
                         }
                     }
                 }
             }
             @if !query.is_empty() && query.chars().count() < 3 {
-                p.note { "Three letters or more, or the directory returns the world." }
+                p.note { (w.three_letters) }
             }
         },
     )
@@ -610,8 +637,10 @@ fn urlencode(raw: &str) -> String {
 pub async fn rotate_feed(
     State(state): State<AppState>,
     jar: CookieJar,
+    headers: HeaderMap,
     Path(feed): Path<Uuid>,
 ) -> Response {
+    let lang = Lang::of(&jar, &headers);
     let Some(user) = current(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
@@ -621,7 +650,7 @@ pub async fn rotate_feed(
     match db::rotate_token(&state.pool, user.id, feed, &token).await {
         Ok(true) => Redirect::to("/").into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "no such link").into_response(),
-        Err(err) => dashboard(state, user, Some(format!("{err}"))).await,
+        Err(err) => dashboard(state, user, Some(format!("{err}")), lang).await,
     }
 }
 
@@ -642,7 +671,12 @@ pub async fn drop_feed(
 ///
 /// The README saith to tell people plainly what they are handing over. This
 /// is where the service itself saith it, to the person doing the handing.
-pub async fn privacy(State(state): State<AppState>, jar: CookieJar) -> Response {
+pub async fn privacy(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Response {
+    let lang = Lang::of(&jar, &headers);
     let user = current(&state, &jar).await;
     let admins = if state.config.admin_emails.is_empty() {
         "whoever runs this instance".to_owned()
@@ -650,27 +684,36 @@ pub async fn privacy(State(state): State<AppState>, jar: CookieJar) -> Response 
         state.config.admin_emails.join(", ")
     };
     let keep_days = state.config.keep_days;
-    let signed_in = user.is_some();
-
     page(
-        "What is kept, and why",
+        lang,
+        lang.words().privacy_link,
         user,
         html! {
+            (privacy_text(lang, &admins, keep_days))
+            p { a href="/" { "←" } }
+        },
+    )
+    .into_response()
+}
+
+/// The privacy notice, written out whole in each tongue rather than assembled
+/// from fragments. It is the one page where the wording matters most and where
+/// a sentence stitched together from four labels would read like one.
+fn privacy_text(lang: Lang, admins: &str, keep_days: i64) -> Markup {
+    match lang {
+        Lang::En => html! {
             h1 { "What is kept, and why" }
             p.lede {
-                "This service signs in to your school's WebUntis as you, reads your "
-                "timetable, and publishes it at a secret address your calendar can "
-                "subscribe to."
+                "This service signs in to your school's WebUntis as you, reads your timetable, "
+                "and publishes it at a secret address your calendar can subscribe to."
             }
 
             h2 { "Your WebUntis password" }
             p {
-                "WebUntis offers students no OAuth and no application token, so anything "
-                "that reads your timetable on your behalf must hold your school password. "
-                "There is no way around it, and it is the thing worth understanding before "
-                "you sign up."
+                "WebUntis offers students no OAuth and no application token, so anything that "
+                "reads your timetable on your behalf must hold your school password. There is "
+                "no way around it, and it is the thing worth understanding before you sign up."
             }
-            p { "What is done about it:" }
             ul {
                 li { "It is stored as AES-256-GCM ciphertext, never in the clear." }
                 li {
@@ -678,15 +721,19 @@ pub async fn privacy(State(state): State<AppState>, jar: CookieJar) -> Response 
                     "stolen copy of the database alone opens nothing."
                 }
                 li {
-                    "Those columns are not readable through the database's own API at all: "
-                    "the grant is revoked from every role but this server's."
+                    "Those columns are not readable through the database's own API at all: the "
+                    "grant is revoked from every role but this server's."
                 }
                 li { "Your browser never speaks to the database. It speaks only to this server." }
+                li {
+                    "A password the school refuses is not tried again, so this service cannot "
+                    "get your school account locked."
+                }
             }
             p.note {
-                "None of which changes the underlying fact. If you would rather not hand "
-                "over a school password, do not sign up — and it is worth knowing what your "
-                "school's own rules say about it."
+                "None of which changes the underlying fact. If you would rather not hand over a "
+                "school password, do not sign up — and it is worth knowing what your school's "
+                "own rules say about it."
             }
 
             h2 { "What else is kept" }
@@ -694,12 +741,13 @@ pub async fn privacy(State(state): State<AppState>, jar: CookieJar) -> Response 
                 li { "Your email address, so you can sign in and be recognised." }
                 li { "The schools you link: the server, the school name and your username." }
                 li {
-                    "Your timetable as last read — lessons, teachers, rooms and times — "
-                    "cached so that a calendar refreshing the link never waits on the school."
+                    "Your timetable as last read — lessons, teachers, rooms and times, and your "
+                    "exams, homework and holidays — cached so that a calendar refreshing the "
+                    "link never waits on the school."
                 }
                 li {
-                    "Each calendar link, when it was last fetched and how often. That is how "
-                    "a link that has stopped working can be told from one nobody uses."
+                    "Each calendar link, when it was last fetched and how often. That is how a "
+                    "link that has stopped working can be told from one nobody uses."
                 }
                 li {
                     "If you connected Google Calendar, a token allowing writes to the one "
@@ -714,29 +762,114 @@ pub async fn privacy(State(state): State<AppState>, jar: CookieJar) -> Response 
             h2 { "Who can see it" }
             p {
                 "The administrators of this instance — " (admins) " — can see who has an "
-                "account and whether their sync is working. They cannot read your password: "
-                "it is sealed, and nothing in the interface unseals it."
+                "account and whether their sync is working. They cannot read your password: it "
+                "is sealed, and nothing in the interface unseals it."
             }
             p {
                 "Anyone holding a calendar link can read that timetable. That is what makes it "
                 "work in a calendar without a login, and why the address is long and secret. "
-                "Share it as you would a password."
+                "Share it as you would a password, and draw a new one if it gets out."
             }
 
             h2 { "Getting your data, and getting rid of it" }
             p {
-                "Signed in, you can download everything held about you as one file, and you "
-                "can delete the account outright. Deletion takes the schools, the calendar "
-                "links, the stored passwords and the cached timetables with it, at once. "
-                "There is no copy kept elsewhere, though ordinary database backups may hold "
-                "one for a short while before they in turn expire."
-            }
-            p {
-                a href="/" { @if signed_in { "Back to your timetables" } @else { "Back" } }
+                "Signed in, you can download everything held about you as one file, and you can "
+                "delete the account outright. Deletion takes the schools, the calendar links, "
+                "the stored passwords and the cached timetables with it, at once. There is no "
+                "copy kept elsewhere, though ordinary database backups may hold one for a short "
+                "while before they in turn expire."
             }
         },
-    )
-    .into_response()
+        Lang::De => html! {
+            h1 { "Was gespeichert wird, und warum" }
+            p.lede {
+                "Dieser Dienst meldet sich in deinem Namen bei WebUntis an, liest deinen "
+                "Stundenplan und veröffentlicht ihn unter einer geheimen Adresse, die dein "
+                "Kalender abonnieren kann."
+            }
+
+            h2 { "Dein WebUntis-Passwort" }
+            p {
+                "WebUntis bietet Schülerinnen und Schülern weder OAuth noch ein App-Token. Alles, "
+                "was den Stundenplan in deinem Namen liest, muss daher dein Schulpasswort "
+                "aufbewahren. Daran führt kein Weg vorbei, und das ist das Wesentliche, bevor du "
+                "dich registrierst."
+            }
+            ul {
+                li { "Es wird als AES-256-GCM-Chiffrat gespeichert, nie im Klartext." }
+                li {
+                    "Der Schlüssel liegt in der Umgebung dieses Servers, nicht in der Datenbank. "
+                    "Eine gestohlene Kopie der Datenbank allein öffnet also nichts."
+                }
+                li {
+                    "Diese Spalten sind über die API der Datenbank überhaupt nicht lesbar: die "
+                    "Berechtigung ist allen Rollen außer der dieses Servers entzogen."
+                }
+                li {
+                    "Dein Browser spricht nie mit der Datenbank, sondern ausschließlich mit "
+                    "diesem Server."
+                }
+                li {
+                    "Ein Passwort, das die Schule ablehnt, wird nicht erneut versucht. Dieser "
+                    "Dienst kann dein Schulkonto also nicht sperren lassen."
+                }
+            }
+            p.note {
+                "Nichts davon ändert etwas an der Tatsache selbst. Wenn du dein Schulpasswort "
+                "lieber nicht aus der Hand gibst, registriere dich nicht — und es lohnt sich zu "
+                "wissen, was die Hausordnung deiner Schule dazu sagt."
+            }
+
+            h2 { "Was sonst gespeichert wird" }
+            ul {
+                li { "Deine E-Mail-Adresse, damit du dich anmelden kannst." }
+                li {
+                    "Die Schulen, die du verknüpfst: Server, Schulkürzel und dein Benutzername."
+                }
+                li {
+                    "Deinen zuletzt gelesenen Stundenplan — Stunden, Lehrkräfte, Räume und "
+                    "Zeiten, dazu Schularbeiten, Hausübungen und Ferien — zwischengespeichert, "
+                    "damit ein Kalender beim Aktualisieren nie auf die Schule warten muss."
+                }
+                li {
+                    "Zu jedem Kalender-Link, wann er zuletzt und wie oft abgerufen wurde. Nur so "
+                    "lässt sich ein defekter Link von einem ungenutzten unterscheiden."
+                }
+                li {
+                    "Falls du Google Calendar verbunden hast, ein Token, das Schreibzugriff auf "
+                    "genau den einen Kalender erlaubt, den dieser Dienst angelegt hat. Er "
+                    "schreibt sonst nichts und liest nichts."
+                }
+            }
+            p {
+                "Ein Stundenplan, der seit " (keep_days) " Tagen nicht aktualisiert wurde, wird "
+                "vergessen; der Link bleibt dann leer."
+            }
+
+            h2 { "Wer es sehen kann" }
+            p {
+                "Die Administration dieser Instanz — " (admins) " — sieht, wer ein Konto hat und "
+                "ob dessen Abgleich funktioniert. Dein Passwort kann sie nicht lesen: es ist "
+                "versiegelt, und nichts in der Oberfläche entsiegelt es."
+            }
+            p {
+                "Wer einen Kalender-Link hat, kann diesen Stundenplan lesen. Genau deshalb "
+                "funktioniert er im Kalender ohne Anmeldung, und genau deshalb ist die Adresse "
+                "lang und geheim. Behandle sie wie ein Passwort, und erzeuge eine neue, wenn sie "
+                "in falsche Hände gerät."
+            }
+
+            h2 { "Deine Daten mitnehmen oder loswerden" }
+            p {
+                "Angemeldet kannst du alles, was über dich gespeichert ist, als eine Datei "
+                "herunterladen und das Konto vollständig löschen. Die Löschung nimmt die "
+                "Schulen, die Kalender-Links, die gespeicherten Passwörter und die "
+                "zwischengespeicherten Stundenpläne sofort mit. Es wird keine Kopie anderswo "
+                "aufbewahrt; gewöhnliche Datenbank-Sicherungen können allerdings für kurze Zeit "
+                "eine enthalten, bis auch sie ablaufen."
+            }
+        },
+    }
 }
 
 /// `GET /account/export.json`
@@ -824,13 +957,15 @@ pub async fn new_password(
     State(state): State<AppState>,
     jar: CookieJar,
     Path(account): Path<Uuid>,
+    headers: HeaderMap,
     Form(form): Form<NewPassword>,
 ) -> Response {
+    let lang = Lang::of(&jar, &headers);
     let Some(user) = current(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
     if form.password.is_empty() {
-        return dashboard(state, user, Some("a password is wanted".into())).await;
+        return dashboard(state, user, Some("a password is wanted".into()), lang).await;
     }
 
     match db::replace_password(&state.pool, &state.config.sealer, user.id, account, &form.password)
@@ -857,7 +992,7 @@ pub async fn new_password(
             });
             Redirect::to("/").into_response()
         }
-        Err(err) => dashboard(state, user, Some(format!("{err}"))).await,
+        Err(err) => dashboard(state, user, Some(format!("{err}")), lang).await,
     }
 }
 
@@ -885,7 +1020,7 @@ pub async fn sign_up(
             }
             begin(&state, jar, &headers, who).await
         }
-        Err(err) => refuse(&state, &format!("{err}")).await,
+        Err(err) => refuse(&state, &format!("{err}"), Lang::of(&jar, &headers)).await,
     }
 }
 
@@ -895,6 +1030,7 @@ pub async fn sign_in(
     headers: HeaderMap,
     Form(form): Form<Login>,
 ) -> Response {
+    let lang = Lang::of(&jar, &headers);
     let email = form.email.trim().to_ascii_lowercase();
     match auth::sign_in(&state, &email, &form.password).await {
         Ok(who) => {
@@ -909,17 +1045,17 @@ pub async fn sign_in(
                             token,
                             state.config.public_url.starts_with("https"),
                         ));
-                        (jar, key_prompt(&factor.friendly_name)).into_response()
+                        (jar, key_prompt(&factor.friendly_name, lang)).into_response()
                     }
                     Err(err) => {
                         tracing::error!("could not park the sign-in: {err:#}");
-                        refuse(&state, "could not sign you in just now").await
+                        refuse(&state, "could not sign you in just now", lang).await
                     }
                 };
             }
             begin(&state, jar, &headers, who).await
         }
-        Err(err) => refuse(&state, &format!("{err}")).await,
+        Err(err) => refuse(&state, &format!("{err}"), Lang::of(&jar, &headers)).await,
     }
 }
 
@@ -929,6 +1065,7 @@ async fn begin(
     headers: &HeaderMap,
     who: auth::Admitted,
 ) -> Response {
+    let lang = Lang::of(&jar, headers);
     let agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
     match auth::open_session(state, who.user, &who.gotrue, agent).await {
         Ok(token) => {
@@ -938,15 +1075,16 @@ async fn begin(
         }
         Err(err) => {
             tracing::error!("could not open a session: {err:#}");
-            refuse(state, "could not sign you in just now").await
+            refuse(state, "could not sign you in just now", lang).await
         }
     }
 }
 
-async fn refuse(_state: &AppState, why: &str) -> Response {
+async fn refuse(_state: &AppState, why: &str, lang: Lang) -> Response {
     (
         StatusCode::BAD_REQUEST,
         page(
+            lang,
             "Sorry",
             None,
             html! {
@@ -979,8 +1117,10 @@ pub struct LinkForm {
 pub async fn add_link(
     State(state): State<AppState>,
     jar: CookieJar,
+    headers: HeaderMap,
     Form(form): Form<LinkForm>,
 ) -> Response {
+    let lang = Lang::of(&jar, &headers);
     let Some(user) = current(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
@@ -989,11 +1129,12 @@ pub async fn add_link(
         return Redirect::to("/").into_response();
     }
     let Ok(timezone) = form.timezone.parse::<Tz>() else {
-        return dashboard(state, user, Some("that is not a timezone I know".into())).await;
+        return dashboard(state, user, Some("that is not a timezone I know".into()), lang).await;
     };
     let server = schools::tidy_server(&form.server);
     if server.is_empty() || form.school.trim().is_empty() {
-        return dashboard(state, user, Some("a server and a school name are wanted".into())).await;
+        return dashboard(state, user, Some("a server and a school name are wanted".into()), lang)
+            .await;
     }
 
     let new = NewAccount {
@@ -1016,7 +1157,7 @@ pub async fn add_link(
             });
             Redirect::to("/").into_response()
         }
-        Err(err) => dashboard(state, user, Some(format!("{err}"))).await,
+        Err(err) => dashboard(state, user, Some(format!("{err}")), lang).await,
     }
 }
 
@@ -1060,20 +1201,6 @@ pub async fn signed_in(state: &AppState, jar: &CookieJar) -> Option<CurrentUser>
     current(state, jar).await
 }
 
-/// A plain page for telling the user something went one way or another.
-pub fn say(title: &str, body: &str) -> Response {
-    page(
-        title,
-        None,
-        html! {
-            h1 { (title) }
-            p { (body) }
-            p { a href="/" { "Back to your timetables" } }
-        },
-    )
-    .into_response()
-}
-
 async fn current(state: &AppState, jar: &CookieJar) -> Option<CurrentUser> {
     let cookie = jar.get(auth::COOKIE)?;
     auth::user_of(&state.pool, cookie.value()).await
@@ -1081,16 +1208,15 @@ async fn current(state: &AppState, jar: &CookieJar) -> Option<CurrentUser> {
 
 // ------------------------------------------------------------ the gateway ---
 
-fn waiting_room(admin: bool) -> Response {
+fn waiting_room(admin: bool, lang: Lang) -> Response {
+    let w = lang.words();
     page(
-        "Waiting to be let in",
+        lang,
+        w.waiting_title,
         Some(CurrentUser { id: Uuid::nil() }),
         html! {
-            h1 { "Your account is waiting" }
-            p.lede {
-                "Anyone may sign up here, but an administrator lets people in one at a time. "
-                "Yours is on the list. Come back once you hear that it has been approved."
-            }
+            h1 { (w.waiting_title) }
+            p.lede { (w.waiting_body) }
             @if admin {
                 p { a href="/admin" { "You are an administrator — review the list" } }
             }
@@ -1104,7 +1230,12 @@ fn waiting_room(admin: bool) -> Response {
 /// What an administrator would otherwise go to the database for: who is
 /// failing, who has never been subscribed to, and who is merely waiting out a
 /// backoff.
-pub async fn health_page(State(state): State<AppState>, jar: CookieJar) -> Response {
+pub async fn health_page(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Response {
+    let lang = Lang::of(&jar, &headers);
     let Some(user) = current(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
@@ -1118,6 +1249,7 @@ pub async fn health_page(State(state): State<AppState>, jar: CookieJar) -> Respo
     let now = chrono::Utc::now();
 
     page(
+        lang,
         "How it fares",
         Some(user),
         html! {
@@ -1192,7 +1324,13 @@ fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
 
-pub async fn admin_page(State(state): State<AppState>, jar: CookieJar) -> Response {
+pub async fn admin_page(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Response {
+    let lang = Lang::of(&jar, &headers);
+    let w = lang.words();
     let Some(user) = current(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
@@ -1203,11 +1341,12 @@ pub async fn admin_page(State(state): State<AppState>, jar: CookieJar) -> Respon
     let waiting = folk.iter().filter(|p| !p.approved).count();
 
     page(
+        lang,
         "Who may join",
         Some(user),
         html! {
             h1 { "Who may join" }
-            p.meta { a href="/admin/health" { "How it fares" } }
+            p.meta { a href="/admin/health" { (lang.words().how_it_fares) } }
             p.lede {
                 @if waiting == 0 { "Nobody is waiting." }
                 @else if waiting == 1 { "One person is waiting." }
@@ -1236,7 +1375,7 @@ pub async fn admin_page(State(state): State<AppState>, jar: CookieJar) -> Respon
                     }
                 }
             }
-            p { a href="/" { "Back to your timetables" } }
+            p { a href="/" { (w.back_to_timetables) } }
         },
     )
     .into_response()
@@ -1331,8 +1470,9 @@ async function useKey() {
 }
 "#;
 
-fn key_prompt(name: &str) -> Markup {
+fn key_prompt(name: &str, lang: Lang) -> Markup {
     page(
+        lang,
         "Your security key",
         None,
         html! {
@@ -1349,7 +1489,13 @@ fn key_prompt(name: &str) -> Markup {
     )
 }
 
-pub async fn security_page(State(state): State<AppState>, jar: CookieJar) -> Response {
+pub async fn security_page(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Response {
+    let lang = Lang::of(&jar, &headers);
+    let w = lang.words();
     let Some(user) = current(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
@@ -1358,32 +1504,32 @@ pub async fn security_page(State(state): State<AppState>, jar: CookieJar) -> Res
     let keys = crate::mfa::factors(&state, &bearer).await.unwrap_or_default();
 
     page(
-        "Security keys",
+        lang,
+        lang.words().security_keys,
         Some(user),
         html! {
-            h1 { "Security keys" }
+            h1 { (w.security_keys) }
             p.lede {
-                "A key is asked for after your password. It is a second factor, not a "
-                "replacement: this account service offers no passwordless sign-in yet."
+                (w.key_lede)
             }
             p.bad #problem hidden {}
             @for key in &keys {
                 .card {
                     h3 { (key.friendly_name) }
-                    p.meta { @if key.verified { "registered" } @else { "never finished" } }
+                    p.meta { @if key.verified { (w.registered) } @else { (w.never_finished) } }
                     .actions {
                         form method="post" action={ "/security/" (key.id) "/forget" } {
-                            button type="submit" { "Remove" }
+                            button type="submit" { (w.forget) }
                         }
                     }
                 }
             }
-            @if keys.is_empty() { p.note { "No key registered yet." } }
-            h2 { "Register a key" }
-            label for="keyname" { "A name you will recognise" }
-            input #keyname type="text" value="Security key";
-            p {} button type="button" onclick="enrolKey()" { "Register this device or key" }
-            p.meta { a href="/" { "Back to your timetables" } }
+            @if keys.is_empty() { p.note { (w.no_key_yet) } }
+            h2 { (w.register_a_key) }
+            label for="keyname" { (w.a_name_youll_know) }
+            input #keyname type="text" value=(w.security_key);
+            p {} button type="button" onclick="enrolKey()" { (w.register_this_one) }
+            p.meta { a href="/" { (w.back_to_timetables) } }
             script { (maud::PreEscaped(CEREMONY_JS)) }
         },
     )
@@ -1548,5 +1694,38 @@ mod tests {
         assert!(drawn.0.starts_with("<svg"), "an XML prolog is litter inside a page");
         assert!(!drawn.0.contains("<?xml"), "the prolog must be cut away, not merely skipped");
         assert!(drawn.0.len() > 500, "suspiciously small for a QR of that address");
+    }
+}
+
+#[cfg(test)]
+mod page_tests {
+    use crate::words::Lang;
+
+    #[test]
+    fn the_shell_speaks_whichever_tongue_was_asked_for() {
+        let english =
+            super::page(Lang::En, "Title", None, maud::html! { p { "body" } }).into_string();
+        assert!(english.contains("<html lang=\"en\""), "the tag a screen reader reads");
+        assert!(english.contains("Your timetable, in your own calendar."));
+        assert!(english.contains("Deutsch"), "and the toggle offers the other one");
+
+        let german =
+            super::page(Lang::De, "Titel", None, maud::html! { p { "body" } }).into_string();
+        assert!(german.contains("<html lang=\"de\""));
+        assert!(german.contains("Dein Stundenplan, in deinem eigenen Kalender."));
+        assert!(german.contains("English"));
+        assert!(german.contains("/language/en"), "and a way back");
+    }
+
+    #[test]
+    fn the_privacy_notice_exists_whole_in_both() {
+        for (lang, expected) in
+            [(Lang::En, "AES-256-GCM ciphertext"), (Lang::De, "AES-256-GCM-Chiffrat")]
+        {
+            let text = super::privacy_text(lang, "you@example.test", 180).into_string();
+            assert!(text.contains(expected), "the part that matters most, in both tongues");
+            assert!(text.contains("180"), "and the retention it actually runs with");
+            assert!(text.contains("you@example.test"), "and who to ask");
+        }
     }
 }
