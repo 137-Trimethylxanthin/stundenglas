@@ -2,7 +2,7 @@
 //! needeth none of it.
 
 use axum::Form;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::CookieJar;
@@ -116,9 +116,21 @@ details.qr summary { cursor: pointer; opacity: .8; }
 
 // ----------------------------------------------------------------- landing ---
 
-pub async fn index(State(state): State<AppState>, jar: CookieJar) -> Response {
+#[derive(Deserialize, Default)]
+pub struct Prefill {
+    #[serde(default)]
+    server: String,
+    #[serde(default)]
+    school: String,
+}
+
+pub async fn index(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Query(chosen): Query<Prefill>,
+) -> Response {
     match current(&state, &jar).await {
-        Some(user) => dashboard(state, user, None).await,
+        Some(user) => dashboard_with(state, user, None, chosen).await,
         None => page(
             "Sign in",
             None,
@@ -189,6 +201,15 @@ fn qr_svg(url: &str) -> Option<maud::PreEscaped<String>> {
 }
 
 async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) -> Response {
+    dashboard_with(state, user, problem, Prefill::default()).await
+}
+
+async fn dashboard_with(
+    state: AppState,
+    user: CurrentUser,
+    problem: Option<String>,
+    chosen: Prefill,
+) -> Response {
     let me = people::profile(&state.pool, user.id).await;
     let admin = me.as_ref().is_some_and(|p| p.is_admin);
     if !me.as_ref().is_some_and(|p| p.approved) {
@@ -206,6 +227,8 @@ async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) 
     }
 
     let has_google = state.config.google.is_some();
+    // Filled in when they came back from the school search, empty otherwise.
+    let prefill = (schools::tidy_server(&chosen.server), chosen.school.trim().to_owned());
     page(
         "Your timetables",
         Some(user),
@@ -416,11 +439,13 @@ async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) 
             form.stack method="post" action="/links" {
                 label for="server" { "WebUntis server" }
                 input #server type="text" name="server" required placeholder="example.webuntis.com"
-                      list="known-servers";
+                      list="known-servers" value=(prefill.0);
                 label for="school" { "School login name" }
-                input #school type="text" name="school" required placeholder="example-school";
+                input #school type="text" name="school" required placeholder="example-school"
+                      value=(prefill.1);
                 p.meta {
-                    "Search your school at webuntis.com; it sends you to "
+                    a href="/schools" { "Find your school by name" }
+                    " — or take both from the URL webuntis.com sends you to, "
                     code { "https://<server>/WebUntis/?school=<name>" } "."
                 }
                 .row {
@@ -494,6 +519,87 @@ pub async fn feed_settings(
         Ok(false) => (StatusCode::NOT_FOUND, "no such link").into_response(),
         Err(err) => dashboard(state, user, Some(format!("{err}"))).await,
     }
+}
+
+#[derive(Deserialize)]
+pub struct Search {
+    #[serde(default)]
+    q: String,
+}
+
+/// `GET /schools?q=`
+///
+/// WebUntis' own directory, so nobody need dig a server name and a login name
+/// out of a URL. Choosing one returneth to the form with both filled in.
+pub async fn schools_page(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Query(search): Query<Search>,
+) -> Response {
+    let Some(user) = current(&state, &jar).await else {
+        return Redirect::to("/").into_response();
+    };
+    let query = search.q.trim().to_owned();
+    let found = if query.chars().count() >= 3 {
+        stundenglas_core::find_schools(&state.http, &query).await.unwrap_or_else(|err| {
+            tracing::warn!("school search failed: {err:#}");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+
+    page(
+        "Find your school",
+        Some(user),
+        html! {
+            h1 { "Find your school" }
+            p.lede { "The same directory the WebUntis login page searches." }
+            form.stack method="get" action="/schools" {
+                label for="q" { "School, or the town it is in" }
+                input #q type="text" name="q" value=(query) required
+                      placeholder="BG Beispiel, or Wien";
+                p {} button type="submit" { "Search" }
+            }
+
+            @if query.chars().count() >= 3 && found.is_empty() {
+                p.note {
+                    "Nothing found. The directory knows schools by their official name, "
+                    "which is not always the one people use — try the town instead."
+                }
+            }
+            @for school in &found {
+                .card {
+                    h3 { (school.display_name) }
+                    @if !school.address.is_empty() { p.meta { (school.address) } }
+                    p.meta { (school.login_name) " · " (school.server) }
+                    .actions {
+                        a href={ "/?server=" (urlencode(&school.server))
+                                 "&school=" (urlencode(&school.login_name)) } {
+                            button type="button" { "Use this one" }
+                        }
+                    }
+                }
+            }
+            @if !query.is_empty() && query.chars().count() < 3 {
+                p.note { "Three letters or more, or the directory returns the world." }
+            }
+        },
+    )
+    .into_response()
+}
+
+/// Enough escaping for a query value: everything but the unreserved set goes
+/// out as a percent triple.
+fn urlencode(raw: &str) -> String {
+    raw.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
 }
 
 /// `POST /feeds/{id}/rotate`
@@ -1412,6 +1518,15 @@ fn session_token(jar: &CookieJar) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_query_value_survives_being_one() {
+        // Neither appears in a school name often, but a space in a login name
+        // would otherwise cut the link in half.
+        assert_eq!(super::urlencode("bg beispiel"), "bg%20beispiel");
+        assert_eq!(super::urlencode("a&b=c"), "a%26b%3Dc");
+        assert_eq!(super::urlencode("neilo.webuntis.com"), "neilo.webuntis.com");
+    }
+
     #[test]
     fn a_feed_address_becomes_a_scannable_square() {
         let drawn = super::qr_svg("https://example.test/cal/abcdefghijklmnop.ics")

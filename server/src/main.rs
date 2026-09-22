@@ -194,6 +194,7 @@ async fn serve(state: AppState) -> Result<()> {
         .route("/links/{id}/google", get(google::begin))
         .route("/links/{id}/google/delete", post(google::unlink))
         .route("/google/callback", get(google::callback))
+        .route("/schools", get(web::schools_page))
         .route("/privacy", get(web::privacy))
         .route("/account/export.json", get(web::export))
         .route("/account/delete", post(web::delete_account))

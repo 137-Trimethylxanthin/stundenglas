@@ -318,6 +318,83 @@ impl Holiday {
     }
 }
 
+/// A school as the public directory nameth it. `server` and `login_name` are
+/// exactly the two things a student would otherwise have to dig out of a URL.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SchoolHit {
+    pub display_name: String,
+    pub login_name: String,
+    pub server: String,
+    pub address: String,
+}
+
+/// Search WebUntis' own directory of schools. Needeth no account: it is the
+/// same call the login page maketh while one typeth.
+pub async fn find_schools(http: &reqwest::Client, query: &str) -> Result<Vec<SchoolHit>> {
+    let query = query.trim();
+    if query.chars().count() < 3 {
+        return Ok(Vec::new());
+    }
+
+    let reply = http
+        .post("https://mobile.webuntis.com/ms/schoolquery2")
+        .json(&serde_json::json!({
+            "id": "stundenglas",
+            "method": "searchSchool",
+            "params": [{ "search": query }],
+            "jsonrpc": "2.0",
+        }))
+        .send()
+        .await
+        .context("asking WebUntis for its list of schools")?;
+
+    let status = reply.status();
+    let body = reply.text().await?;
+    if !status.is_success() {
+        bail!("{status} searching for schools");
+    }
+
+    let found: SchoolReply = serde_json::from_str(&body).context("decoding the schools")?;
+    Ok(found
+        .result
+        .map(|result| result.schools)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|school| !school.server.is_empty() && !school.login_name.is_empty())
+        .map(|school| SchoolHit {
+            display_name: school.display_name,
+            login_name: school.login_name,
+            // The directory gives the bare host, which is what we want.
+            server: school.server,
+            address: school.address,
+        })
+        .collect())
+}
+
+#[derive(Deserialize)]
+struct SchoolReply {
+    result: Option<SchoolResult>,
+}
+
+#[derive(Deserialize)]
+struct SchoolResult {
+    #[serde(default)]
+    schools: Vec<SchoolRaw>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SchoolRaw {
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    login_name: String,
+    #[serde(default)]
+    server: String,
+    #[serde(default)]
+    address: String,
+}
+
 /// The school said no: a wrong password, or a login that wanteth a code we
 /// cannot give it. Worth a type of its own because the answer to it is the
 /// opposite of the answer to an outage — stop, rather than try again.
@@ -1064,6 +1141,25 @@ struct AbsenceRaw {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_directory_is_read_into_what_the_form_wants() {
+        let body = r#"{"result":{"schools":[
+            {"server":"neilo.webuntis.com","displayName":"BG Beispiel",
+             "loginName":"bg-beispiel","address":"Wien, Beispielgasse 1"},
+            {"server":"","displayName":"Nameless","loginName":"","address":""}]}}"#;
+        let found: super::SchoolReply = serde_json::from_str(body).unwrap();
+        let schools: Vec<_> = found
+            .result
+            .map(|r| r.schools)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !s.server.is_empty() && !s.login_name.is_empty())
+            .collect();
+        assert_eq!(schools.len(), 1, "an entry with no server is of no use to anyone");
+        assert_eq!(schools[0].server, "neilo.webuntis.com");
+        assert_eq!(schools[0].login_name, "bg-beispiel");
+    }
+
     #[test]
     fn homework_takes_its_subject_from_the_lesson_it_belongs_to() {
         let body = r#"{"data":{"homeworks":[{"id":5,"lessonId":99,"dueDate":20260925,
