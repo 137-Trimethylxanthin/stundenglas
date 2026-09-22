@@ -6,7 +6,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
-use stundenglas_core::{Credentials, DEFAULT_TZ, Exam, Homework, Lesson};
+use stundenglas_core::{Credentials, DEFAULT_TZ, Exam, Holiday, Homework, Lesson};
 use uuid::Uuid;
 
 use crate::crypto::{Sealed, Sealer};
@@ -175,6 +175,7 @@ pub struct Feed {
     /// Minutes before an exam to ring. None, and nothing rings.
     pub remind_before_minutes: Option<i32>,
     pub with_homework: bool,
+    pub with_holidays: bool,
     pub hide_subjects: Vec<String>,
     pub label: Option<String>,
     pub display_name: Option<String>,
@@ -186,6 +187,7 @@ pub struct FeedPayload {
     pub lessons: Vec<Lesson>,
     pub exams: Vec<Exam>,
     pub homework: Vec<Homework>,
+    pub holidays: Vec<Holiday>,
     pub etag: Option<String>,
     pub fetched_at: Option<DateTime<Utc>>,
 }
@@ -198,6 +200,7 @@ fn feed_from(row: &PgRow, display_name: Option<String>) -> Feed {
         refresh_minutes: row.get("refresh_minutes"),
         remind_before_minutes: row.try_get("remind_before_minutes").ok().flatten(),
         with_homework: row.try_get("with_homework").unwrap_or(true),
+        with_holidays: row.try_get("with_holidays").unwrap_or(true),
         hide_subjects: row.try_get("hide_subjects").unwrap_or_default(),
         label: row.try_get("label").ok().flatten(),
         display_name,
@@ -208,7 +211,7 @@ pub async fn create_feed(pool: &PgPool, account: Uuid, token: &str) -> Result<Fe
     let row = sqlx::query(
         "insert into feeds (untis_account_id, token) values ($1, $2)
          returning id, token, untis_account_id, keep_cancelled, refresh_minutes,
-                   remind_before_minutes, with_homework, hide_subjects, label",
+                   remind_before_minutes, with_homework, with_holidays, hide_subjects, label",
     )
     .bind(account)
     .bind(token)
@@ -225,6 +228,7 @@ pub struct FeedSettings {
     pub refresh_minutes: i32,
     pub remind_before_minutes: Option<i32>,
     pub with_homework: bool,
+    pub with_holidays: bool,
     pub hide_subjects: Vec<String>,
     pub label: Option<String>,
 }
@@ -243,8 +247,9 @@ pub async fn update_feed(
                 refresh_minutes = $4,
                 remind_before_minutes = $5,
                 with_homework = $6,
-                hide_subjects = $7,
-                label = $8
+                with_holidays = $7,
+                hide_subjects = $8,
+                label = $9
            from untis_accounts a
           where f.id = $1 and f.untis_account_id = a.id and a.user_id = $2",
     )
@@ -254,6 +259,7 @@ pub async fn update_feed(
     .bind(want.refresh_minutes.clamp(5, 1440))
     .bind(want.remind_before_minutes.map(|m| m.clamp(5, 10_080)))
     .bind(want.with_homework)
+    .bind(want.with_holidays)
     .bind(&want.hide_subjects)
     .bind(want.label.as_deref().filter(|l| !l.is_empty()))
     .execute(pool)
@@ -265,7 +271,7 @@ pub async fn update_feed(
 pub async fn feeds_of(pool: &PgPool, account: Uuid) -> Result<Vec<Feed>> {
     let rows = sqlx::query(
         "select id, token, untis_account_id, keep_cancelled, refresh_minutes,
-                remind_before_minutes, with_homework, hide_subjects, label
+                remind_before_minutes, with_homework, with_holidays, hide_subjects, label
            from feeds where untis_account_id = $1 order by created_at",
     )
     .bind(account)
@@ -277,8 +283,8 @@ pub async fn feeds_of(pool: &PgPool, account: Uuid) -> Result<Vec<Feed>> {
 pub async fn feed_by_token(pool: &PgPool, token: &str) -> Result<Option<FeedPayload>> {
     let Some(row) = sqlx::query(
         "select f.id, f.token, f.untis_account_id, f.keep_cancelled, f.refresh_minutes,
-                f.remind_before_minutes, f.with_homework, f.hide_subjects, f.label,
-                a.display_name, s.lessons, s.exams, s.homework, s.etag, s.last_ok_at
+                f.remind_before_minutes, f.with_homework, f.with_holidays, f.hide_subjects, f.label,
+                a.display_name, s.lessons, s.exams, s.homework, s.holidays, s.etag, s.last_ok_at
            from feeds f
            join untis_accounts a on a.id = f.untis_account_id
            left join sync_state s on s.untis_account_id = f.untis_account_id
@@ -313,11 +319,19 @@ pub async fn feed_by_token(pool: &PgPool, token: &str) -> Result<Option<FeedPayl
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default();
 
+    let holidays: Vec<Holiday> = row
+        .try_get::<Option<serde_json::Value>, _>("holidays")
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+
     Ok(Some(FeedPayload {
         feed: feed_from(&row, row.try_get("display_name").ok().flatten()),
         lessons,
         exams,
         homework,
+        holidays,
         etag: row.try_get("etag").ok().flatten(),
         fetched_at: row.try_get("last_ok_at").ok().flatten(),
     }))
@@ -336,24 +350,33 @@ pub async fn note_served(pool: &PgPool, token: &str) {
 
 // ------------------------------------------------------------- sync state ---
 
+/// What one refresh yieldeth, kept together because it is stored together.
+#[derive(Default)]
+pub struct Fetched {
+    pub lessons: Vec<Lesson>,
+    pub exams: Vec<Exam>,
+    pub homework: Vec<Homework>,
+    pub holidays: Vec<Holiday>,
+}
+
 pub async fn store_sync(
     pool: &PgPool,
     account: Uuid,
-    lessons: &[Lesson],
-    exams: &[Exam],
-    homework: &[Homework],
+    got: &Fetched,
     etag: String,
     window: (NaiveDate, NaiveDate),
 ) -> Result<()> {
-    let payload = serde_json::to_value(lessons)?;
-    let sat = serde_json::to_value(exams)?;
-    let set = serde_json::to_value(homework)?;
+    let payload = serde_json::to_value(&got.lessons)?;
+    let sat = serde_json::to_value(&got.exams)?;
+    let set = serde_json::to_value(&got.homework)?;
+    let shut = serde_json::to_value(&got.holidays)?;
     sqlx::query(
         "insert into sync_state
             (untis_account_id, lessons, lesson_count, exams, exam_count,
-             homework, homework_count, etag, window_start, window_end,
-             last_ok_at, last_error, last_error_at, consecutive_fails)
-         values ($1, $2, $3, $7, $8, $9, $10, $4, $5, $6, now(), null, null, 0)
+             homework, homework_count, holidays, holiday_count, etag,
+             window_start, window_end, last_ok_at, last_error, last_error_at,
+             consecutive_fails)
+         values ($1, $2, $3, $7, $8, $9, $10, $11, $12, $4, $5, $6, now(), null, null, 0)
          on conflict (untis_account_id) do update
             set lessons = excluded.lessons,
                 lesson_count = excluded.lesson_count,
@@ -361,6 +384,8 @@ pub async fn store_sync(
                 exam_count = excluded.exam_count,
                 homework = excluded.homework,
                 homework_count = excluded.homework_count,
+                holidays = excluded.holidays,
+                holiday_count = excluded.holiday_count,
                 etag = excluded.etag,
                 window_start = excluded.window_start,
                 window_end = excluded.window_end,
@@ -372,14 +397,16 @@ pub async fn store_sync(
     )
     .bind(account)
     .bind(payload)
-    .bind(lessons.len() as i32)
+    .bind(got.lessons.len() as i32)
     .bind(etag)
     .bind(window.0)
     .bind(window.1)
     .bind(sat)
-    .bind(exams.len() as i32)
+    .bind(got.exams.len() as i32)
     .bind(set)
-    .bind(homework.len() as i32)
+    .bind(got.homework.len() as i32)
+    .bind(shut)
+    .bind(got.holidays.len() as i32)
     .execute(pool)
     .await
     .context("storing the timetable")?;
@@ -475,7 +502,8 @@ pub async fn forget_stale(pool: &PgPool, days: i64) -> Result<u64> {
         "update sync_state
             set lessons = '[]'::jsonb, lesson_count = 0,
                 exams = '[]'::jsonb, exam_count = 0,
-                homework = '[]'::jsonb, homework_count = 0, etag = null
+                homework = '[]'::jsonb, homework_count = 0,
+                holidays = '[]'::jsonb, holiday_count = 0, etag = null
           where (lesson_count > 0 or exam_count > 0 or homework_count > 0)
             and coalesce(last_ok_at, updated_at) < now() - make_interval(days => $1::int)",
     )

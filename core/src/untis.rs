@@ -298,6 +298,26 @@ impl Homework {
     }
 }
 
+/// A stretch of days the school is shut. Whole days, and no hours.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Holiday {
+    pub id: i64,
+    pub name: String,
+    /// Inclusive, both ends, as the school giveth them.
+    pub start: NaiveDate,
+    pub end: NaiveDate,
+}
+
+impl Holiday {
+    pub fn title(&self) -> String {
+        format!("🌴 {}", self.name)
+    }
+
+    pub fn event_id(&self) -> String {
+        format!("hol{}", self.id)
+    }
+}
+
 /// The school said no: a wrong password, or a login that wanteth a code we
 /// cannot give it. Worth a type of its own because the answer to it is the
 /// opposite of the answer to an outage — stop, rather than try again.
@@ -471,6 +491,73 @@ impl Client {
 
     /// `excuseStatusId=-1` meaneth *all*; the web page defaulteth to `-3`,
     /// which showeth only the unexcused and so hideth an approved leave.
+    /// Holidays, from the old mobile JSON-RPC API — the only place that
+    /// offereth them. It keepeth a session of its own, obtained by its own
+    /// `authenticate` call; the cookie jar carrieth it from there.
+    ///
+    /// Everything else here speaketh the newer APIs, so this is the one place
+    /// the old one is wanted, and a school that refuseth it simply hath no
+    /// holidays in its calendar.
+    pub async fn fetch_holidays(&self) -> Result<Vec<Holiday>> {
+        let rpc = format!("{}/WebUntis/jsonrpc.do?school={}", self.base, self.settings.school);
+
+        let hello: RpcReply<RpcSession> = self
+            .http
+            .post(&rpc)
+            .json(&serde_json::json!({
+                "id": "stundenglas",
+                "method": "authenticate",
+                "params": {
+                    "user": self.settings.user,
+                    "password": self.settings.password,
+                    "client": "stundenglas",
+                },
+                "jsonrpc": "2.0",
+            }))
+            .send()
+            .await
+            .context("authenticating against the JSON-RPC API")?
+            .json()
+            .await
+            .context("decoding the JSON-RPC greeting")?;
+
+        if hello.result.as_ref().is_none_or(|session| session.session_id.is_empty()) {
+            bail!("the JSON-RPC API would not open a session");
+        }
+
+        let holidays: RpcReply<Vec<HolidayRaw>> = self
+            .http
+            .post(&rpc)
+            .json(&serde_json::json!({
+                "id": "stundenglas",
+                "method": "getHolidays",
+                "params": {},
+                "jsonrpc": "2.0",
+            }))
+            .send()
+            .await
+            .context("fetching holidays")?
+            .json()
+            .await
+            .context("decoding the holidays")?;
+
+        Ok(holidays
+            .result
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|raw| {
+                let start = compact_date(raw.start_date)?;
+                let end = compact_date(raw.end_date)?;
+                (end >= start).then_some(Holiday {
+                    id: raw.id,
+                    name: if raw.long_name.is_empty() { raw.name } else { raw.long_name },
+                    start,
+                    end,
+                })
+            })
+            .collect())
+    }
+
     /// Homework, from the classic endpoint. The subject liveth in a separate
     /// `lessons` array keyed by lesson id, so the two are joined here rather
     /// than leaving every entry nameless.
@@ -586,6 +673,33 @@ fn itoa(value: i64) -> String {
 }
 
 /// Untis keepeth dates as 20260914 and hours as 800 or 2155.
+#[derive(Deserialize)]
+struct RpcReply<T> {
+    result: Option<T>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RpcSession {
+    #[serde(default)]
+    session_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HolidayRaw {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    long_name: String,
+    #[serde(default)]
+    start_date: i64,
+    #[serde(default)]
+    end_date: i64,
+}
+
 #[derive(Deserialize)]
 struct HomeworkEnvelope {
     #[serde(default)]

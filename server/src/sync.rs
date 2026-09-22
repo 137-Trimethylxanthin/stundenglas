@@ -4,7 +4,7 @@
 use anyhow::Result;
 use chrono::{Duration as Days, Local, NaiveDate};
 use sha2::{Digest, Sha256};
-use stundenglas_core::{Exam, Homework, Lesson, untis};
+use stundenglas_core::untis;
 
 use crate::AppState;
 use crate::db::Failure;
@@ -119,21 +119,20 @@ async fn fetch_one(state: AppState, entry: crate::db::AccountWithSecret) -> Resu
         Vec::new()
     });
 
-    let etag = fingerprint(&lessons, &exams, &homework);
-    crate::db::store_sync(
-        &state.pool,
-        entry.account.id,
-        &lessons,
-        &exams,
-        &homework,
-        etag,
-        (from, to),
-    )
-    .await?;
+    // The school year's holidays change perhaps twice a year, but the call is
+    // one request and keeps the cache honest without a second schedule.
+    let holidays = client.fetch_holidays().await.unwrap_or_else(|err| {
+        tracing::debug!(account = %entry.account.id, "no holidays read: {err:#}");
+        Vec::new()
+    });
+
+    let got = crate::db::Fetched { lessons, exams, homework, holidays };
+    let etag = fingerprint(&got);
+    crate::db::store_sync(&state.pool, entry.account.id, &got, etag, (from, to)).await?;
 
     // Those who asked for it get the same timetable written into Google, so
     // they need not wait for Google to look at the subscribed link.
-    match crate::google::push(state.clone(), entry.account.clone(), lessons.clone()).await {
+    match crate::google::push(state.clone(), entry.account.clone(), got.lessons.clone()).await {
         Ok(Some(tally)) => tracing::info!(
             account = %entry.account.id,
             inserted = tally.inserted, updated = tally.updated,
@@ -144,7 +143,7 @@ async fn fetch_one(state: AppState, entry: crate::db::AccountWithSecret) -> Resu
         // A Google mishap must not lose the timetable we just stored.
         Err(err) => tracing::warn!(account = %entry.account.id, "Google push failed: {err:#}"),
     }
-    Ok(lessons.len())
+    Ok(got.lessons.len())
 }
 
 /// A week behind, and as far ahead as the school year reacheth.
@@ -157,9 +156,9 @@ fn window(year: (NaiveDate, NaiveDate)) -> (NaiveDate, NaiveDate) {
 
 /// Changeth only when something a subscriber would notice changeth, so an
 /// unchanged timetable answereth 304 and costeth nothing.
-fn fingerprint(lessons: &[Lesson], exams: &[Exam], homework: &[Homework]) -> String {
+fn fingerprint(got: &crate::db::Fetched) -> String {
     let mut hasher = Sha256::new();
-    for lesson in lessons {
+    for lesson in &got.lessons {
         hasher.update(lesson.event_id().as_bytes());
         hasher.update([0]);
         hasher.update(lesson.title().as_bytes());
@@ -171,7 +170,7 @@ fn fingerprint(lessons: &[Lesson], exams: &[Exam], homework: &[Homework]) -> Str
         hasher.update(lesson.rooms.join(",").as_bytes());
         hasher.update(*b"\n");
     }
-    for exam in exams {
+    for exam in &got.exams {
         hasher.update(exam.event_id().as_bytes());
         hasher.update([0]);
         hasher.update(exam.title().as_bytes());
@@ -180,11 +179,18 @@ fn fingerprint(lessons: &[Lesson], exams: &[Exam], homework: &[Homework]) -> Str
         hasher.update(exam.end.to_rfc3339().as_bytes());
         hasher.update(*b"\n");
     }
-    for piece in homework {
+    for piece in &got.homework {
         hasher.update(piece.event_id().as_bytes());
         hasher.update([0]);
         hasher.update(piece.title().as_bytes());
         hasher.update(piece.due.to_string().as_bytes());
+        hasher.update(*b"\n");
+    }
+    for shut in &got.holidays {
+        hasher.update(shut.event_id().as_bytes());
+        hasher.update(shut.title().as_bytes());
+        hasher.update(shut.start.to_string().as_bytes());
+        hasher.update(shut.end.to_string().as_bytes());
         hasher.update(*b"\n");
     }
     hasher.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()

@@ -333,6 +333,11 @@ async fn dashboard(state: AppState, user: CurrentUser, problem: Option<String>) 
                                           checked[feed.with_homework];
                                     " Carry homework, on the day it is due"
                                 }
+                                label {
+                                    input type="checkbox" name="with_holidays" value="1"
+                                          checked[feed.with_holidays];
+                                    " Mark the school's holidays"
+                                }
                                 @if !subjects.is_empty() {
                                     label { "Leave out" }
                                     p.meta {
@@ -477,6 +482,7 @@ pub async fn feed_settings(
         refresh_minutes: form.refresh_minutes.unwrap_or(60),
         remind_before_minutes: form.remind_before_minutes.filter(|m| *m > 0),
         with_homework: form.with_homework.is_some(),
+        with_holidays: form.with_holidays.is_some(),
         // Each unticked box sends nothing, so what arrives is exactly the set
         // to leave out.
         hide_subjects: form.hide.unwrap_or_default(),
@@ -683,6 +689,7 @@ pub struct FeedForm {
     remind_before_minutes: Option<i32>,
     keep_cancelled: Option<String>,
     with_homework: Option<String>,
+    with_holidays: Option<String>,
     /// One entry per ticked subject; axum gathers repeated fields into a Vec.
     #[serde(default)]
     hide: Option<Vec<String>>,
