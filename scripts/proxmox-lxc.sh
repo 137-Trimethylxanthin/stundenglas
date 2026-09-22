@@ -163,10 +163,14 @@ ok "network up"
 
 inside() { pct exec "$CTID" -- bash -c "$1"; }
 
+# cmake is for aws-lc-sys, which rustls pulls in: on x86-64 it builds itself
+# with plain cc, but falls back to cmake where that will not do, and a build
+# that stops half way through is a poor way to learn which case one is in.
 msg "installing what the build needs (a few minutes)"
 inside "export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
-        apt-get install -y -qq curl ca-certificates git build-essential nano >/dev/null"
+        apt-get install -y -qq curl ca-certificates git build-essential nano \
+                               cmake pkg-config >/dev/null"
 
 # Debian's rustc is older than this workspace's edition, so the toolchain comes
 # from rustup rather than apt.
