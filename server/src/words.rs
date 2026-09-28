@@ -191,9 +191,8 @@ pub static ENGLISH: Words = Words {
     privacy_link: "What is kept, and why",
 
     welcome: "Your school timetable, in the calendar you already use",
-    lede: "stundenglas reads your WebUntis timetable and publishes it as a private calendar \
-           link. Google Calendar, iOS, Outlook and Thunderbird can all subscribe to it. \
-           Cancelled lessons stay visible so you can see the free hour.",
+    lede: "It reads your WebUntis timetable and publishes it as a private link that Google \
+           Calendar, iOS, Outlook and Thunderbird can all subscribe to.",
     create_account: "Create an account",
     sign_in: "Sign in",
     sign_up: "Sign up",
@@ -312,9 +311,8 @@ pub static GERMAN: Words = Words {
     privacy_link: "Was gespeichert wird, und warum",
 
     welcome: "Dein Stundenplan, im Kalender den du ohnehin verwendest",
-    lede: "stundenglas liest deinen WebUntis-Stundenplan und veröffentlicht ihn als privaten \
-           Kalender-Link. Google Calendar, iOS, Outlook und Thunderbird können ihn abonnieren. \
-           Entfallene Stunden bleiben sichtbar, damit du die Freistunde siehst.",
+    lede: "Er liest deinen WebUntis-Stundenplan und veröffentlicht ihn als privaten Link, den \
+           Google Calendar, iOS, Outlook und Thunderbird abonnieren können.",
     create_account: "Konto erstellen",
     sign_in: "Anmelden",
     sign_up: "Registrieren",

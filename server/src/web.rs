@@ -221,9 +221,11 @@ summary:focus-visible {
   outline: none; border-color: var(--accent); box-shadow: var(--ring);
 }
 input::placeholder { color: var(--ink-faint); }
-label:has(input[type="checkbox"]) {
+label:has(input[type="checkbox"]):not(.pill) {
   display: flex; align-items: center; gap: 0.5rem;
   font-weight: 450; color: var(--ink); cursor: pointer;
+  /* The box is thirteen pixels; the label is what one actually aims at. */
+  min-height: 2rem; padding: 0.15rem 0;
 }
 input[type="checkbox"] { width: auto; accent-color: var(--accent); margin: 0; }
 form.stack { margin-bottom: 1rem; }
@@ -250,8 +252,11 @@ form.stack > p + button:hover, button.primary:hover {
   background: color-mix(in oklab, var(--accent) 88%, black); border-color: transparent;
 }
 button.link {
-  border: 0; background: none; padding: 0; color: var(--ink-soft);
+  border: 0; background: none; color: var(--ink-soft);
   text-decoration: underline; font-weight: 450;
+  /* Padded to a target a thumb can find: unpadded it was twenty pixels tall,
+     under the smallest size anyone should have to aim at. */
+  padding: 0.35rem 0.2rem; min-height: 2rem;
 }
 button.link:hover { background: none; color: var(--ink); }
 button.danger { border-color: color-mix(in oklab, var(--bad) 45%, transparent); color: var(--bad); }
@@ -266,6 +271,9 @@ button.danger:hover { background: var(--bad-wash); border-color: var(--bad); }
   background: var(--raised); box-shadow: var(--lift);
   padding: 1.1rem 1.25rem; margin: 0.85rem 0;
 }
+/* The air above a heading belongs between sections, not inside the box it
+   opens: every card began with an inch of nothing. */
+.card > :first-child, .notice > :first-child, .feedbox > :first-child { margin-top: 0; }
 .card-head {
   display: flex; align-items: baseline; justify-content: space-between;
   gap: 0.75rem; flex-wrap: wrap;
@@ -294,6 +302,11 @@ button.danger:hover { background: var(--bad-wash); border-color: var(--bad); }
 }
 .notice p:last-of-type { margin-bottom: 0; }
 .notice label { color: inherit; }
+.notice > form.stack:last-child { margin-bottom: 0; }
+.notice input {
+  background: var(--raised);
+  border-color: color-mix(in oklab, var(--bad) 30%, var(--edge-firm));
+}
 
 /* ------------------------------------------------------------ the feed -- */
 .feedbox {
