@@ -1,6 +1,6 @@
 [Unit]
 Description=The stundenglas service: accounts, scheduler, calendar feeds
-Documentation=https://github.com/OWNER/stundenglas
+Documentation=https://github.com/137-Trimethylxanthin/stundenglas
 # It speaks to Supabase and to the schools the moment it starts.
 After=network-online.target
 Wants=network-online.target

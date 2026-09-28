@@ -1,6 +1,6 @@
 [Unit]
 Description=Keep the WebUntis timetable in step with Google Calendar
-Documentation=https://github.com/OWNER/stundenglas
+Documentation=https://github.com/137-Trimethylxanthin/stundenglas
 # Don't bother starting when the machine is offline.
 After=network-online.target
 Wants=network-online.target
