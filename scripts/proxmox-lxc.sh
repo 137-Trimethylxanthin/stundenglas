@@ -218,6 +218,15 @@ ADMIN_EMAILS=
 # The redirect URI is <PUBLIC_URL>/google/callback.
 #GOOGLE_CLIENT_ID=
 #GOOGLE_CLIENT_SECRET=
+
+# Only if you want people told when something needs them -- a refused
+# password, a link stalled for a day, an account admitted. Without these
+# the pages say all of it and nothing is sent.
+#SMTP_URL=smtps://user:pass@smtp.example.test:465
+#MAIL_FROM=stundenglas <noreply@example.test>
+
+# How long a timetable nobody refreshes is kept. Default 180 days.
+#KEEP_DAYS=180
 ENV
 inside "chmod 600 /etc/stundenglas/server.env"
 
