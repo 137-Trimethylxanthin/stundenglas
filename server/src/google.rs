@@ -11,7 +11,7 @@ use serde::Deserialize;
 use sqlx::{PgPool, Row};
 use std::future::Future;
 use std::pin::Pin;
-use stundenglas_core::{Lesson, gcal};
+use stundenglas_core::gcal;
 use uuid::Uuid;
 
 use crate::crypto::Sealed;
@@ -319,7 +319,7 @@ async fn access_token(state: &AppState, refresh: &str) -> Result<String> {
 pub fn push(
     state: AppState,
     account: db::UntisAccount,
-    lessons: Vec<Lesson>,
+    want: stundenglas_core::Timetable,
 ) -> Pin<Box<dyn Future<Output = Result<Option<gcal::Tally>>> + Send>> {
     Box::pin(async move {
         let Some(link) = link_of(&state, account.id).await? else {
@@ -342,14 +342,18 @@ pub fn push(
         };
 
         // Reconcile only within the span we actually hold, so nothing outside
-        // it is touched -- the same rule the command-line tool follows.
-        let Some(first) = lessons.iter().map(|l| l.start).min() else {
+        // it is touched -- the same rule the command-line tool follows. The
+        // span must cover the whole-day entries too, or a holiday in July
+        // would be written once and then never looked at again.
+        //
+        // A timetable with nothing in it means a refresh that found nothing;
+        // better to leave the calendar as it stands than to empty it.
+        let Some((first, last)) = want.span(account.timezone) else {
             return Ok(None);
         };
-        let last = lessons.iter().map(|l| l.end).max().unwrap_or(first);
 
         let existing = calendar.existing(&id, first, last).await?;
-        let plan = gcal::plan(&lessons, &existing, account.timezone);
+        let plan = gcal::plan(&want, &existing, account.timezone);
         let tally = calendar.apply(&id, &plan, 6).await?;
 
         sqlx::query("update google_links set last_push_at = now() where untis_account_id = $1")

@@ -7,5 +7,5 @@ pub mod untis;
 
 pub use untis::{
     Absence, Credentials, DEFAULT_TZ, Exam, Holiday, Homework, Lesson, SchoolHit, Stamp, Status,
-    find_schools,
+    Timetable, find_schools,
 };

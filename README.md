@@ -45,7 +45,9 @@ on iOS and macOS, and a QR code for pointing a phone at.
 Google refreshes a subscribed URL on its own schedule — often many hours, and
 not adjustable. iOS lets you pick fifteen minutes. If you want minute-fresh
 updates in Google itself, connect your account and events are written through
-the API the moment we see a change, into a secondary calendar of its own.
+the API the moment we see a change, into a secondary calendar of its own. It
+carries what the link carries — lessons, exams, homework and holidays — and
+touches only events it made.
 
 That is optional, and the server offers it only when a Google OAuth **web**
 client is configured (`GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`, with

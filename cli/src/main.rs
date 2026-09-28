@@ -114,9 +114,12 @@ async fn run() -> Result<usize> {
     );
 
     if let Some(path) = &args.ics {
-        let exams = untis.fetch_exams(from, to).await.unwrap_or_default();
-        let homework = untis.fetch_homework(from, to).await.unwrap_or_default();
-        let holidays = untis.fetch_holidays().await.unwrap_or_default();
+        let what = stundenglas_core::Timetable {
+            lessons: lessons.clone(),
+            exams: untis.fetch_exams(from, to).await.unwrap_or_default(),
+            homework: untis.fetch_homework(from, to).await.unwrap_or_default(),
+            holidays: untis.fetch_holidays().await.unwrap_or_default(),
+        };
         let feed = stundenglas_core::ics::Feed {
             name: &format!("Stundenplan {}", untis.person_name),
             refresh_minutes: 60,
@@ -128,7 +131,7 @@ async fn run() -> Result<usize> {
             // can set one where the file lands.
             remind_before: None,
         };
-        let body = feed.render(&lessons, &exams, &homework, &holidays, chrono::Utc::now());
+        let body = feed.render(&what, chrono::Utc::now());
         std::fs::write(path, &body).with_context(|| format!("writing {}", path.display()))?;
         println!("Wrote   : {} ({} bytes, {} events)", path.display(), body.len(), lessons.len());
         return Ok(0);
@@ -161,7 +164,14 @@ async fn run() -> Result<usize> {
         .fixed_offset();
 
     let existing = calendar.existing(&calendar_id, since, until).await?;
-    let plan = gcal::plan(&lessons, &existing, zone);
+    // The Google run carries what the file does: the whole timetable.
+    let pushing = stundenglas_core::Timetable {
+        lessons: lessons.clone(),
+        exams: untis.fetch_exams(from, to).await.unwrap_or_default(),
+        homework: untis.fetch_homework(from, to).await.unwrap_or_default(),
+        holidays: untis.fetch_holidays().await.unwrap_or_default(),
+    };
+    let plan = gcal::plan(&pushing, &existing, zone);
 
     println!(
         "\nPlan    : +{} new  ~{} changed  -{} removed  ={} unchanged",

@@ -5,7 +5,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::untis::{Exam, Holiday, Homework, Lesson, Status};
+use crate::untis::{Exam, Holiday, Homework, Lesson, Status, Timetable};
 
 const PRODID: &str = "-//stundenglas//WebUntis timetable//EN";
 
@@ -45,14 +45,9 @@ impl Default for Feed<'_> {
 }
 
 impl Feed<'_> {
-    pub fn render(
-        &self,
-        lessons: &[Lesson],
-        exams: &[Exam],
-        homework: &[Homework],
-        holidays: &[Holiday],
-        stamp: DateTime<Utc>,
-    ) -> String {
+    pub fn render(&self, what: &Timetable, stamp: DateTime<Utc>) -> String {
+        let (lessons, exams) = (&what.lessons, &what.exams);
+        let (homework, holidays) = (&what.homework, &what.holidays);
         let mut out = String::with_capacity(256 + lessons.len() * 320);
 
         line(&mut out, "BEGIN:VCALENDAR");
@@ -360,10 +355,7 @@ mod tests {
 
     fn render(lessons: &[Lesson]) -> String {
         Feed::default().render(
-            lessons,
-            &[],
-            &[],
-            &[],
+            &Timetable { lessons: lessons.to_vec(), ..Default::default() },
             Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
         )
     }
@@ -421,10 +413,7 @@ mod tests {
     fn cancelled_can_be_left_out_entirely() {
         let feed = Feed { keep_cancelled: false, ..Feed::default() };
         let out = feed.render(
-            &[lesson(Status::Cancelled, "MAT")],
-            &[],
-            &[],
-            &[],
+            &Timetable { lessons: vec![lesson(Status::Cancelled, "MAT")], ..Default::default() },
             Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
         );
         assert_eq!(out.matches("BEGIN:VEVENT").count(), 0);
@@ -442,8 +431,10 @@ mod tests {
     #[test]
     fn a_refresh_hint_is_offered() {
         let feed = Feed { refresh_minutes: 15, ..Feed::default() };
-        let out =
-            feed.render(&[], &[], &[], &[], Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap());
+        let out = feed.render(
+            &Timetable { ..Default::default() },
+            Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
+        );
         assert!(out.contains("REFRESH-INTERVAL;VALUE=DURATION:PT15M"));
         assert!(out.contains("X-PUBLISHED-TTL:PT15M"));
     }
@@ -451,10 +442,7 @@ mod tests {
     #[test]
     fn an_exam_is_its_own_entry_and_saith_so() {
         let out = Feed::default().render(
-            &[],
-            &[exam()],
-            &[],
-            &[],
+            &Timetable { exams: vec![exam()], ..Default::default() },
             Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
         );
         assert!(out.contains("CATEGORIES:EXAM"), "a calendar should be able to colour them");
@@ -466,10 +454,11 @@ mod tests {
     #[test]
     fn nothing_ringeth_unless_asked() {
         let out = Feed::default().render(
-            &[lesson(Status::Regular, "MAT")],
-            &[exam()],
-            &[],
-            &[],
+            &Timetable {
+                lessons: vec![lesson(Status::Regular, "MAT")],
+                exams: vec![exam()],
+                ..Default::default()
+            },
             Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
         );
         assert!(!out.contains("BEGIN:VALARM"), "an unasked-for alarm is an unkept calendar");
@@ -479,10 +468,11 @@ mod tests {
     fn an_alarm_rings_for_the_exam_and_not_the_lesson() {
         let feed = Feed { remind_before: Some(30), ..Feed::default() };
         let out = feed.render(
-            &[lesson(Status::Regular, "MAT")],
-            &[exam()],
-            &[],
-            &[],
+            &Timetable {
+                lessons: vec![lesson(Status::Regular, "MAT")],
+                exams: vec![exam()],
+                ..Default::default()
+            },
             Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
         );
         assert_eq!(out.matches("BEGIN:VALARM").count(), 1, "only the exam rings");
@@ -493,10 +483,7 @@ mod tests {
     fn a_whole_day_is_said_as_a_day() {
         let feed = Feed { remind_before: Some(1440), ..Feed::default() };
         let out = feed.render(
-            &[],
-            &[exam()],
-            &[],
-            &[],
+            &Timetable { exams: vec![exam()], ..Default::default() },
             Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
         );
         assert!(out.contains("TRIGGER:-P1D"), "clients read this better than -PT1440M");
@@ -505,10 +492,7 @@ mod tests {
     #[test]
     fn homework_lands_whole_day_on_the_day_it_is_due() {
         let out = Feed::default().render(
-            &[],
-            &[],
-            &[homework()],
-            &[],
+            &Timetable { homework: vec![homework()], ..Default::default() },
             Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
         );
         assert!(out.contains("DTSTART;VALUE=DATE:20260925"));
@@ -525,10 +509,12 @@ mod tests {
         let hide_d = vec!["d".to_owned()];
         let feed = Feed { hide_subjects: &hide_d, ..Feed::default() };
         let out = feed.render(
-            &[lesson(Status::Regular, "D"), lesson(Status::Regular, "M")],
-            &[exam()],
-            &[homework()],
-            &[],
+            &Timetable {
+                lessons: vec![lesson(Status::Regular, "D"), lesson(Status::Regular, "M")],
+                exams: vec![exam()],
+                homework: vec![homework()],
+                ..Default::default()
+            },
             Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
         );
         assert!(!out.contains("SUMMARY:📚"), "the homework in D goes with its subject");
@@ -540,10 +526,12 @@ mod tests {
         let hide_m = vec!["M".to_owned()];
         let feed = Feed { hide_subjects: &hide_m, ..Feed::default() };
         let out = feed.render(
-            &[lesson(Status::Regular, "D"), lesson(Status::Regular, "M")],
-            &[exam()],
-            &[homework()],
-            &[],
+            &Timetable {
+                lessons: vec![lesson(Status::Regular, "D"), lesson(Status::Regular, "M")],
+                exams: vec![exam()],
+                homework: vec![homework()],
+                ..Default::default()
+            },
             Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
         );
         assert!(!out.contains("SUMMARY:📝"), "the exam in M goes with its subject");
@@ -560,10 +548,7 @@ mod tests {
             end: NaiveDate::from_ymd_opt(2026, 10, 30).unwrap(),
         };
         let out = Feed::default().render(
-            &[],
-            &[],
-            &[],
-            &[shut],
+            &Timetable { holidays: vec![shut], ..Default::default() },
             Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
         );
         assert!(out.contains("DTSTART;VALUE=DATE:20261026"));
@@ -580,10 +565,12 @@ mod tests {
     fn leaving_nothing_out_leaves_everything_in() {
         let feed = Feed::default();
         let out = feed.render(
-            &[lesson(Status::Regular, "D")],
-            &[exam()],
-            &[homework()],
-            &[],
+            &Timetable {
+                lessons: vec![lesson(Status::Regular, "D")],
+                exams: vec![exam()],
+                homework: vec![homework()],
+                ..Default::default()
+            },
             Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
         );
         assert_eq!(out.matches("BEGIN:VEVENT").count(), 3);
@@ -593,10 +580,12 @@ mod tests {
     fn a_link_may_refuse_homework_without_refusing_the_rest() {
         let feed = Feed { with_homework: false, ..Feed::default() };
         let out = feed.render(
-            &[lesson(Status::Regular, "MAT")],
-            &[exam()],
-            &[homework()],
-            &[],
+            &Timetable {
+                lessons: vec![lesson(Status::Regular, "MAT")],
+                exams: vec![exam()],
+                homework: vec![homework()],
+                ..Default::default()
+            },
             Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
         );
         assert!(!out.contains("CATEGORIES:HOMEWORK"));
@@ -606,6 +595,7 @@ mod tests {
 
 #[cfg(test)]
 mod round_trip {
+    use crate::Timetable;
     use crate::untis::Lesson;
 
     /// The cache in Postgres holdeth lessons as JSON; what goeth in must come
@@ -625,8 +615,8 @@ mod round_trip {
         let stamp = chrono::Utc::now();
         let feed = super::Feed::default();
         assert_eq!(
-            feed.render(&[before], &[], &[], &[], stamp),
-            feed.render(&[after], &[], &[], &[], stamp)
+            feed.render(&Timetable { lessons: vec![before], ..Default::default() }, stamp),
+            feed.render(&Timetable { lessons: vec![after], ..Default::default() }, stamp)
         );
     }
 }

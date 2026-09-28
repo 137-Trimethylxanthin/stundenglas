@@ -1,7 +1,7 @@
 //! Readeth the personal timetable from the selfsame endpoint the web client useth.
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
 use chrono_tz::{Europe::Vienna, Tz};
 use serde::{Deserialize, Serialize};
 
@@ -295,6 +295,59 @@ impl Homework {
 
     pub fn event_id(&self) -> String {
         format!("hw{}", self.id)
+    }
+}
+
+/// Everything one refresh yields, kept together because it travels together:
+/// into the cache, out to a calendar file, and up to Google.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Timetable {
+    pub lessons: Vec<Lesson>,
+    pub exams: Vec<Exam>,
+    pub homework: Vec<Homework>,
+    pub holidays: Vec<Holiday>,
+}
+
+impl Timetable {
+    pub fn is_empty(&self) -> bool {
+        self.lessons.is_empty()
+            && self.exams.is_empty()
+            && self.homework.is_empty()
+            && self.holidays.is_empty()
+    }
+
+    /// The span everything in here occupies, in the school's own zone. A
+    /// whole-day entry counts from its midnight to the midnight after, which
+    /// is how iCalendar and Google both read one.
+    pub fn span(&self, zone: Tz) -> Option<(Stamp, Stamp)> {
+        let midnight = |day: NaiveDate, plus: i64| {
+            localise((day + Duration::days(plus)).and_hms_opt(0, 0, 0)?, zone).ok()
+        };
+
+        let mut first: Option<Stamp> = None;
+        let mut last: Option<Stamp> = None;
+        let mut widen = |from: Stamp, to: Stamp| {
+            first = Some(first.map_or(from, |had| had.min(from)));
+            last = Some(last.map_or(to, |had| had.max(to)));
+        };
+
+        for lesson in &self.lessons {
+            widen(lesson.start, lesson.end);
+        }
+        for exam in &self.exams {
+            widen(exam.start, exam.end);
+        }
+        for piece in &self.homework {
+            if let (Some(from), Some(to)) = (midnight(piece.due, 0), midnight(piece.due, 1)) {
+                widen(from, to);
+            }
+        }
+        for shut in &self.holidays {
+            if let (Some(from), Some(to)) = (midnight(shut.start, 0), midnight(shut.end, 1)) {
+                widen(from, to);
+            }
+        }
+        Some((first?, last?))
     }
 }
 
@@ -941,6 +994,11 @@ fn stamp(date: i64, time: i64, zone: Tz) -> Result<Stamp> {
         .and_hms_opt((time / 100) as u32, (time % 100) as u32, 0)
         .ok_or_else(|| anyhow!("nonsensical time {time}"))?;
     localise(naive, zone)
+}
+
+/// Midnight at the start of a day, in the school's own zone.
+pub fn midnight_in(day: NaiveDate, zone: Tz) -> Option<Stamp> {
+    localise(day.and_hms_opt(0, 0, 0)?, zone).ok()
 }
 
 /// A wall-clock time in a named zone becometh an instant with a fixed offset.

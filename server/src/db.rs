@@ -6,7 +6,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
-use stundenglas_core::{Credentials, DEFAULT_TZ, Exam, Holiday, Homework, Lesson};
+use stundenglas_core::{Credentials, DEFAULT_TZ, Exam, Holiday, Homework, Lesson, Timetable};
 use uuid::Uuid;
 
 use crate::crypto::{Sealed, Sealer};
@@ -184,10 +184,7 @@ pub struct Feed {
 /// What a request for `/cal/<token>.ics` resolveth to.
 pub struct FeedPayload {
     pub feed: Feed,
-    pub lessons: Vec<Lesson>,
-    pub exams: Vec<Exam>,
-    pub homework: Vec<Homework>,
-    pub holidays: Vec<Holiday>,
+    pub what: Timetable,
     pub etag: Option<String>,
     pub fetched_at: Option<DateTime<Utc>>,
 }
@@ -328,10 +325,7 @@ pub async fn feed_by_token(pool: &PgPool, token: &str) -> Result<Option<FeedPayl
 
     Ok(Some(FeedPayload {
         feed: feed_from(&row, row.try_get("display_name").ok().flatten()),
-        lessons,
-        exams,
-        homework,
-        holidays,
+        what: Timetable { lessons, exams, homework, holidays },
         etag: row.try_get("etag").ok().flatten(),
         fetched_at: row.try_get("last_ok_at").ok().flatten(),
     }))
@@ -350,19 +344,10 @@ pub async fn note_served(pool: &PgPool, token: &str) {
 
 // ------------------------------------------------------------- sync state ---
 
-/// What one refresh yieldeth, kept together because it is stored together.
-#[derive(Default)]
-pub struct Fetched {
-    pub lessons: Vec<Lesson>,
-    pub exams: Vec<Exam>,
-    pub homework: Vec<Homework>,
-    pub holidays: Vec<Holiday>,
-}
-
 pub async fn store_sync(
     pool: &PgPool,
     account: Uuid,
-    got: &Fetched,
+    got: &Timetable,
     etag: String,
     window: (NaiveDate, NaiveDate),
 ) -> Result<()> {

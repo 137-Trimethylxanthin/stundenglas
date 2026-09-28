@@ -1,7 +1,7 @@
 //! Writeth only unto its own secondary calendar, and only unto its own events.
 
 use anyhow::{Context, Result, bail};
-use chrono::SecondsFormat;
+use chrono::{NaiveDate, SecondsFormat};
 use chrono_tz::Tz;
 use futures::stream::{self, StreamExt};
 use serde::Deserialize;
@@ -23,6 +23,9 @@ const ATTEMPTS: u32 = 4;
 const COLOUR_CANCELLED: &str = "11";
 const COLOUR_CHANGED: &str = "6";
 const COLOUR_EVENT: &str = "5";
+const COLOUR_EXAM: &str = "4";
+const COLOUR_HOMEWORK: &str = "7";
+const COLOUR_HOLIDAY: &str = "8";
 
 #[derive(Debug, Clone)]
 pub struct Desired {
@@ -410,12 +413,109 @@ pub fn desired_of(lesson: &Lesson, zone: Tz) -> Desired {
     Desired { id: lesson.event_id(), summary, start: lesson.start, body }
 }
 
-pub fn plan(lessons: &[Lesson], existing: &HashMap<String, Existing>, zone: Tz) -> Plan {
-    let mut plan = Plan::default();
-    let mut wanted: HashMap<String, ()> = HashMap::with_capacity(lessons.len());
+/// An exam, which is a timed event like a lesson but louder.
+pub fn desired_of_exam(exam: &crate::Exam, zone: Tz) -> Desired {
+    let summary = exam.title();
+    let description = exam.description();
+    let location = exam.rooms.join(", ");
+    let start = exam.start.to_rfc3339_opts(SecondsFormat::Secs, false);
+    let end = exam.end.to_rfc3339_opts(SecondsFormat::Secs, false);
 
-    for lesson in lessons {
-        let desired = desired_of(lesson, zone);
+    let mut body = json!({
+        "id": exam.event_id(),
+        "summary": summary,
+        "description": description,
+        "location": location,
+        "start": { "dateTime": start, "timeZone": zone.name() },
+        "end": { "dateTime": end, "timeZone": zone.name() },
+        "transparency": "opaque",
+        "colorId": COLOUR_EXAM,
+        "reminders": { "useDefault": false, "overrides": [] },
+        "extendedProperties": { "private": { "source": MARKER } },
+    });
+    let fingerprint =
+        fingerprint_of(&[&summary, &description, &location, &start, &end, COLOUR_EXAM]);
+    body["extendedProperties"]["private"]["fp"] = json!(fingerprint);
+    Desired { id: exam.event_id(), summary, start: exam.start, body }
+}
+
+/// Homework and holidays occupy days rather than hours. Google wanteth
+/// `date` for those, and refuseth a body that offereth both `date` and
+/// `dateTime`; the end is the day *after* the last, as in iCalendar.
+fn desired_all_day(
+    id: String,
+    summary: String,
+    description: String,
+    from: NaiveDate,
+    until: NaiveDate,
+    colour: &str,
+    zone: Tz,
+) -> Option<Desired> {
+    let first = from.format("%Y-%m-%d").to_string();
+    let after = (until + chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+
+    let mut body = json!({
+        "id": id,
+        "summary": summary,
+        "description": description,
+        "start": { "date": first },
+        "end": { "date": after },
+        // A day marked is not a day occupied: neither should block an hour.
+        "transparency": "transparent",
+        "colorId": colour,
+        "reminders": { "useDefault": false, "overrides": [] },
+        "extendedProperties": { "private": { "source": MARKER } },
+    });
+    let fingerprint = fingerprint_of(&[&summary, &description, &first, &after, colour]);
+    body["extendedProperties"]["private"]["fp"] = json!(fingerprint);
+
+    // Only a sort key; what Google is shown is the date above.
+    let start = crate::untis::midnight_in(from, zone)?;
+    Some(Desired { id, summary, start, body })
+}
+
+pub fn desired_of_homework(piece: &crate::Homework, zone: Tz) -> Option<Desired> {
+    desired_all_day(
+        piece.event_id(),
+        piece.title(),
+        piece.description(),
+        piece.due,
+        piece.due,
+        COLOUR_HOMEWORK,
+        zone,
+    )
+}
+
+pub fn desired_of_holiday(shut: &crate::Holiday, zone: Tz) -> Option<Desired> {
+    desired_all_day(
+        shut.event_id(),
+        shut.title(),
+        String::new(),
+        shut.start,
+        shut.end,
+        COLOUR_HOLIDAY,
+        zone,
+    )
+}
+
+/// What the calendar should hold, against what it holds.
+///
+/// Everything the timetable carrieth goes up, not the lessons alone: whoever
+/// connected Google did so to see the same calendar their link shows, and an
+/// exam missing from it is the worst way to learn of the difference.
+pub fn plan(want: &crate::Timetable, existing: &HashMap<String, Existing>, zone: Tz) -> Plan {
+    let mut plan = Plan::default();
+    let mut wanted: HashMap<String, ()> = HashMap::with_capacity(want.lessons.len());
+
+    let everything = want
+        .lessons
+        .iter()
+        .map(|lesson| desired_of(lesson, zone))
+        .chain(want.exams.iter().map(|exam| desired_of_exam(exam, zone)))
+        .chain(want.homework.iter().filter_map(|piece| desired_of_homework(piece, zone)))
+        .chain(want.holidays.iter().filter_map(|shut| desired_of_holiday(shut, zone)));
+
+    for desired in everything {
         wanted.insert(desired.id.clone(), ());
         match existing.get(&desired.id) {
             None => plan.inserts.push(desired),
@@ -525,6 +625,136 @@ struct Extended {
 
 #[cfg(test)]
 mod tests {
+    use crate::{Exam, Holiday, Homework, Timetable};
+    use chrono::TimeZone;
+
+    fn a_day() -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 25).unwrap()
+    }
+
+    fn an_exam() -> Exam {
+        let at = |h: u32| {
+            crate::DEFAULT_TZ
+                .from_local_datetime(&a_day().and_hms_opt(h, 0, 0).unwrap())
+                .earliest()
+                .unwrap()
+                .fixed_offset()
+        };
+        Exam {
+            id: 42,
+            start: at(8),
+            end: at(10),
+            subject: "M".into(),
+            kind: "Schularbeit".into(),
+            name: String::new(),
+            text: String::new(),
+            teachers: vec![],
+            rooms: vec!["A1".into()],
+        }
+    }
+
+    fn some_homework() -> Homework {
+        Homework {
+            id: 5,
+            due: a_day(),
+            subject: "D".into(),
+            text: "Kapitel 4".into(),
+            remark: String::new(),
+            done: false,
+        }
+    }
+
+    #[test]
+    fn a_whole_day_entry_offers_google_a_date_and_never_a_time() {
+        for desired in [
+            desired_of_homework(&some_homework(), crate::DEFAULT_TZ).unwrap(),
+            desired_of_holiday(
+                &Holiday { id: 3, name: "Herbstferien".into(), start: a_day(), end: a_day() },
+                crate::DEFAULT_TZ,
+            )
+            .unwrap(),
+        ] {
+            let body = serde_json::to_string(&desired.body).unwrap();
+            assert!(body.contains(r#""start":{"date":"2026-09-25"}"#), "{body}");
+            // The end is the day after the last, and a body may not offer both
+            // shapes: Google refuses one that does.
+            assert!(body.contains(r#""end":{"date":"2026-09-26"}"#), "{body}");
+            assert!(!body.contains("dateTime"), "a whole day has no time: {body}");
+            assert_eq!(desired.body["transparency"], "transparent");
+        }
+    }
+
+    #[test]
+    fn the_same_work_on_another_day_is_another_fingerprint() {
+        let monday = desired_of_homework(&some_homework(), crate::DEFAULT_TZ).unwrap();
+        let mut moved = some_homework();
+        moved.due = a_day().succ_opt().unwrap();
+        let tuesday = desired_of_homework(&moved, crate::DEFAULT_TZ).unwrap();
+        assert_ne!(
+            fingerprint_in(&monday),
+            fingerprint_in(&tuesday),
+            "work that moved a day must be updated, not left where it was"
+        );
+    }
+
+    #[test]
+    fn everything_the_timetable_holds_is_pushed_and_nothing_of_it_deleted() {
+        let want = Timetable {
+            lessons: vec![],
+            exams: vec![an_exam()],
+            homework: vec![some_homework()],
+            holidays: vec![Holiday {
+                id: 3,
+                name: "Herbstferien".into(),
+                start: a_day(),
+                end: a_day(),
+            }],
+        };
+        let first_run = plan(&want, &HashMap::new(), crate::DEFAULT_TZ);
+        assert_eq!(first_run.inserts.len(), 3, "the exam, the homework and the holiday");
+        assert!(first_run.deletes.is_empty());
+
+        // And a second run against what the first wrote changes nothing.
+        let existing: HashMap<String, Existing> = first_run
+            .inserts
+            .iter()
+            .map(|d| {
+                (
+                    d.id.clone(),
+                    Existing {
+                        id: d.id.clone(),
+                        summary: d.summary.clone(),
+                        start: String::new(),
+                        fingerprint: fingerprint_in(d),
+                    },
+                )
+            })
+            .collect();
+        let again = plan(&want, &existing, crate::DEFAULT_TZ);
+        assert!(again.is_empty(), "a settled calendar should be left alone");
+        assert_eq!(again.unchanged, 3);
+    }
+
+    #[test]
+    fn the_span_covers_the_whole_day_entries_too() {
+        // A holiday beyond the last lesson must widen the window, or it would
+        // be written once and never reconciled again.
+        let want = Timetable {
+            holidays: vec![Holiday {
+                id: 1,
+                name: "Sommer".into(),
+                start: chrono::NaiveDate::from_ymd_opt(2027, 7, 5).unwrap(),
+                end: chrono::NaiveDate::from_ymd_opt(2027, 9, 1).unwrap(),
+            }],
+            ..Default::default()
+        };
+        let (first, last) = want.span(crate::DEFAULT_TZ).expect("a span");
+        assert_eq!(first.format("%Y-%m-%d").to_string(), "2027-07-05");
+        assert_eq!(last.format("%Y-%m-%d").to_string(), "2027-09-02", "the day after the last");
+
+        assert!(Timetable::default().span(crate::DEFAULT_TZ).is_none(), "nothing spans nothing");
+    }
+
     use super::*;
 
     #[test]

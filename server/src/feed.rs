@@ -73,13 +73,7 @@ pub async fn serve(
         hide_subjects: &payload.feed.hide_subjects,
         remind_before: payload.feed.remind_before_minutes.and_then(|m| u32::try_from(m).ok()),
     };
-    let body = feed.render(
-        &payload.lessons,
-        &payload.exams,
-        &payload.homework,
-        &payload.holidays,
-        payload.fetched_at.unwrap_or_else(chrono::Utc::now),
-    );
+    let body = feed.render(&payload.what, payload.fetched_at.unwrap_or_else(chrono::Utc::now));
 
     crate::db::note_served(&state.pool, token).await;
 
@@ -188,10 +182,7 @@ mod etag_tests {
                 label: None,
                 display_name: None,
             },
-            lessons: vec![],
-            exams: vec![],
-            homework: vec![],
-            holidays: vec![],
+            what: Default::default(),
             etag: Some("abcd1234".into()),
             fetched_at: None,
         }

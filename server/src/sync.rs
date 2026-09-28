@@ -4,7 +4,7 @@
 use anyhow::Result;
 use chrono::{Duration as Days, Local, NaiveDate};
 use sha2::{Digest, Sha256};
-use stundenglas_core::untis;
+use stundenglas_core::{Timetable, untis};
 
 use crate::AppState;
 use crate::db::Failure;
@@ -153,13 +153,13 @@ async fn fetch_one(state: AppState, entry: crate::db::AccountWithSecret) -> Resu
         Vec::new()
     });
 
-    let got = crate::db::Fetched { lessons, exams, homework, holidays };
+    let got = Timetable { lessons, exams, homework, holidays };
     let etag = fingerprint(&got);
     crate::db::store_sync(&state.pool, entry.account.id, &got, etag, (from, to)).await?;
 
     // Those who asked for it get the same timetable written into Google, so
     // they need not wait for Google to look at the subscribed link.
-    match crate::google::push(state.clone(), entry.account.clone(), got.lessons.clone()).await {
+    match crate::google::push(state.clone(), entry.account.clone(), got.clone()).await {
         Ok(Some(tally)) => tracing::info!(
             account = %entry.account.id,
             inserted = tally.inserted, updated = tally.updated,
@@ -183,7 +183,7 @@ fn window(year: (NaiveDate, NaiveDate)) -> (NaiveDate, NaiveDate) {
 
 /// Changeth only when something a subscriber would notice changeth, so an
 /// unchanged timetable answereth 304 and costeth nothing.
-fn fingerprint(got: &crate::db::Fetched) -> String {
+fn fingerprint(got: &Timetable) -> String {
     let mut hasher = Sha256::new();
     for lesson in &got.lessons {
         hasher.update(lesson.event_id().as_bytes());
