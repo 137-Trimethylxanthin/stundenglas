@@ -475,6 +475,10 @@ impl Client {
             // The login answereth 302; we must read its Location ourselves.
             .redirect(reqwest::redirect::Policy::none())
             .gzip(true)
+            // A school server that hangeth must not hold its caller forever.
+            // A whole year taketh a couple of seconds, so this is generous.
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(60))
             .build()
             .context("building the HTTP client")?;
         let base = settings.base_url();
