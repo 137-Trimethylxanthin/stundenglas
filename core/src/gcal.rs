@@ -422,7 +422,7 @@ pub fn desired_of_exam(exam: &crate::Exam, zone: Tz) -> Desired {
     let end = exam.end.to_rfc3339_opts(SecondsFormat::Secs, false);
 
     let mut body = json!({
-        "id": exam.event_id(),
+        "id": exam.gcal_id(),
         "summary": summary,
         "description": description,
         "location": location,
@@ -436,7 +436,7 @@ pub fn desired_of_exam(exam: &crate::Exam, zone: Tz) -> Desired {
     let fingerprint =
         fingerprint_of(&[&summary, &description, &location, &start, &end, COLOUR_EXAM]);
     body["extendedProperties"]["private"]["fp"] = json!(fingerprint);
-    Desired { id: exam.event_id(), summary, start: exam.start, body }
+    Desired { id: exam.gcal_id(), summary, start: exam.start, body }
 }
 
 /// Homework and holidays occupy days rather than hours. Google wanteth
@@ -476,7 +476,7 @@ fn desired_all_day(
 
 pub fn desired_of_homework(piece: &crate::Homework, zone: Tz) -> Option<Desired> {
     desired_all_day(
-        piece.event_id(),
+        piece.gcal_id(),
         piece.title(),
         piece.description(),
         piece.due,
@@ -488,7 +488,7 @@ pub fn desired_of_homework(piece: &crate::Homework, zone: Tz) -> Option<Desired>
 
 pub fn desired_of_holiday(shut: &crate::Holiday, zone: Tz) -> Option<Desired> {
     desired_all_day(
-        shut.event_id(),
+        shut.gcal_id(),
         shut.title(),
         String::new(),
         shut.start,

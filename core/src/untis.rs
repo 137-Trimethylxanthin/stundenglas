@@ -256,6 +256,12 @@ impl Exam {
     pub fn event_id(&self) -> String {
         format!("exam{}", self.id)
     }
+
+    /// The id Google is given. Not `event_id`, which is the feed's UID and
+    /// must not move under existing subscribers: Google refuseth its `x`.
+    pub fn gcal_id(&self) -> String {
+        google_id("pruef", self.id)
+    }
 }
 
 /// A piece of homework, which belongeth to the day it is due rather than the
@@ -295,6 +301,11 @@ impl Homework {
 
     pub fn event_id(&self) -> String {
         format!("hw{}", self.id)
+    }
+
+    /// The id Google is given; Google refuseth the `w` of `event_id`.
+    pub fn gcal_id(&self) -> String {
+        google_id("haus", self.id)
     }
 }
 
@@ -368,6 +379,12 @@ impl Holiday {
 
     pub fn event_id(&self) -> String {
         format!("hol{}", self.id)
+    }
+
+    /// The id Google is given: `event_id` itself wherever that is long
+    /// enough, so holidays already pushed keep their ids.
+    pub fn gcal_id(&self) -> String {
+        google_id("hol", self.id)
     }
 }
 
@@ -800,6 +817,17 @@ impl Client {
             })
             .collect()
     }
+}
+
+/// Google brooketh only `^[a-v0-9]{5,1024}$`, so `x` and `w` are out, and so
+/// is a short id. A negative id becometh `n…`, and one too short is padded with
+/// zeroes after its prefix. Prefixes must differ from one another and from the
+/// lessons' `u`, or two kinds of event would share an id.
+fn google_id(prefix: &str, id: i64) -> String {
+    let digits = id.unsigned_abs().to_string();
+    let sign = if id < 0 { "n" } else { "" };
+    let pad = 5usize.saturating_sub(prefix.len() + sign.len() + digits.len());
+    format!("{prefix}{sign}{}{digits}", "0".repeat(pad))
 }
 
 fn itoa(value: i64) -> String {
@@ -1355,6 +1383,16 @@ mod tests {
             lesson(vec![5_856_529, 5_856_532], Status::Regular, 21, 8, 9).event_id(),
             "u5856529p5856532"
         );
+        for prefix in ["pruef", "haus", "hol"] {
+            for id in [0, 7, 42, 123_456, -3, i64::MIN, i64::MAX] {
+                let made = google_id(prefix, id);
+                assert!(valid(&made), "{made} would be refused");
+                assert!(made.starts_with(prefix));
+            }
+        }
+        assert_eq!(google_id("hol", 12), "hol12", "holidays already pushed must keep their ids");
+        assert_eq!(google_id("hol", 7), "hol07");
+        assert_ne!(google_id("hol", 7), google_id("hol", 70));
     }
 
     #[test]
