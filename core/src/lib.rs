@@ -6,6 +6,6 @@ pub mod ics;
 pub mod untis;
 
 pub use untis::{
-    Absence, Credentials, DEFAULT_TZ, Exam, Holiday, Homework, Lesson, SchoolHit, Stamp, Status,
-    Timetable, find_schools,
+    Absence, Credentials, DEFAULT_TZ, Exam, Holiday, Homework, Lesson, Relogin, SchoolHit, Stamp,
+    Status, Timetable, find_schools,
 };

@@ -108,6 +108,8 @@ pub struct Words {
     pub refused_title: &'static str,
     pub refused_body: &'static str,
     pub try_this_one: &'static str,
+    pub try_stored: &'static str,
+    pub try_stored_hint: &'static str,
     pub untis_password: &'static str,
     pub lessons: &'static str,
     pub exams: &'static str,
@@ -221,6 +223,9 @@ pub static ENGLISH: Words = Words {
     refused_body: " Nothing more will be tried until you enter the password again — repeating a \
                    refused password is how a WebUntis account gets locked.",
     try_this_one: "Try this one",
+    try_stored: "Try the saved password once more",
+    try_stored_hint: "If you have not changed it, the school may only have been briefly refusing \
+                      logins. This tries it a single time.",
     untis_password: "WebUntis password",
     lessons: "lessons",
     exams: "exams",
@@ -344,6 +349,9 @@ pub static GERMAN: Words = Words {
                    abgelehntes Passwort zu wiederholen ist der Weg, ein WebUntis-Konto sperren \
                    zu lassen.",
     try_this_one: "Dieses versuchen",
+    try_stored: "Gespeichertes Passwort noch einmal versuchen",
+    try_stored_hint: "Wenn du es nicht geändert hast, hat die Schule Anmeldungen vielleicht nur \
+                      kurz abgelehnt. Das versucht es genau ein Mal.",
     untis_password: "WebUntis-Passwort",
     lessons: "Stunden",
     exams: "Schularbeiten",

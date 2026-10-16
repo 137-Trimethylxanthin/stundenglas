@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
 use chrono_tz::{Europe::Vienna, Tz};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:155.0) Gecko/20100101 Firefox/155.0";
 
@@ -224,7 +225,17 @@ impl Exam {
     /// `📝 M Schularbeit` — the marker first, so it is plain in a crowded day.
     pub fn title(&self) -> String {
         let mut out = String::from("📝 ");
-        if !self.subject.is_empty() {
+        // Some schools name an exam after its subject, "E1 (Englisch)" for
+        // E1; the name then sayeth more and the subject would only repeat it.
+        // Only where the subject is a word of its own, lest "E" swallow
+        // "Erörterung".
+        let named_for_subject = !self.subject.is_empty()
+            && self.name.strip_prefix(&self.subject).is_some_and(|rest| {
+                rest.is_empty() || rest.starts_with(' ') || rest.starts_with('(')
+            });
+        if named_for_subject {
+            out.push_str(&self.name);
+        } else if !self.subject.is_empty() {
             out.push_str(&self.subject);
         }
         for extra in [&self.kind, &self.name] {
@@ -254,14 +265,59 @@ impl Exam {
 
     /// Stable across refreshes, and acceptable to Google as an event id.
     pub fn event_id(&self) -> String {
-        format!("exam{}", self.id)
+        match self.derived_key() {
+            Some(key) => format!("examh{key}"),
+            None => format!("exam{}", self.id),
+        }
     }
 
     /// The id Google is given. Not `event_id`, which is the feed's UID and
     /// must not move under existing subscribers: Google refuseth its `x`.
     pub fn gcal_id(&self) -> String {
-        google_id("pruef", self.id)
+        match self.derived_key() {
+            Some(key) => format!("pruefh{key}"),
+            None => google_id("pruef", self.id),
+        }
     }
+
+    /// Some schools give every exam the id 0, which would fold them all into
+    /// one event. Those are known instead by what they are and when — never
+    /// by `text`, which a teacher may edit, and which would move the event.
+    ///
+    /// The `h` that precedeth it in either id is not a digit nor `n`, so a
+    /// derived id never meeteth one made from a real number.
+    fn derived_key(&self) -> Option<String> {
+        if self.id != 0 {
+            return None;
+        }
+        let (start, end) = (self.start.to_rfc3339(), self.end.to_rfc3339());
+        let mut hasher = Sha256::new();
+        for part in [&start, &end, &self.subject, &self.kind, &self.name] {
+            hasher.update(part.as_bytes());
+            hasher.update([0]);
+        }
+        Some(base32hex(&hasher.finalize()[..10]))
+    }
+}
+
+/// Lowercase base32hex, whose alphabet `0-9a-v` is exactly what Google
+/// alloweth in an event id.
+fn base32hex(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
+    let mut out = String::with_capacity(bytes.len() * 8 / 5 + 1);
+    let (mut buffer, mut bits) = (0u32, 0u32);
+    for &byte in bytes {
+        buffer = (buffer << 8) | u32::from(byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(ALPHABET[((buffer >> bits) & 31) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(ALPHABET[((buffer << (5 - bits)) & 31) as usize] as char);
+    }
+    out
 }
 
 /// A piece of homework, which belongeth to the day it is due rather than the
@@ -317,6 +373,54 @@ pub struct Timetable {
     pub exams: Vec<Exam>,
     pub homework: Vec<Homework>,
     pub holidays: Vec<Holiday>,
+    /// Set while the school refuseth the stored password. Decided afresh
+    /// whenever the calendar is rendered or pushed, and never cached: it is
+    /// about today, not about what was fetched.
+    #[serde(skip)]
+    pub relogin: Option<Relogin>,
+}
+
+/// A notice put where it will be seen: the school refused the password, so
+/// nothing refresheth until its owner signeth in again. It occupieth the
+/// school day of *today*, and keepeth one id, so a calendar moveth it from
+/// day to day rather than piling one up on each.
+#[derive(Debug, Clone)]
+pub struct Relogin {
+    /// Something unique to the school link, in `0-9a-v` only so that Google
+    /// will take it as it is; a UUID's hex without its dashes will do.
+    pub key: String,
+    pub day: NaiveDate,
+    pub zone: Tz,
+    /// Where to enter the password again.
+    pub link: String,
+}
+
+impl Relogin {
+    pub fn title(&self) -> String {
+        "🔴 WebUntis: neu anmelden".to_owned()
+    }
+
+    pub fn description(&self) -> String {
+        format!(
+            "WebUntis hat das gespeicherte Passwort abgelehnt, darum wird dieser \
+             Stundenplan nicht mehr aktualisiert.\n\nHier neu anmelden:\n{}",
+            self.link
+        )
+    }
+
+    /// From eight until four, the hours a student would be looking.
+    pub fn start(&self) -> Option<Stamp> {
+        localise(self.day.and_hms_opt(8, 0, 0)?, self.zone).ok()
+    }
+
+    pub fn end(&self) -> Option<Stamp> {
+        localise(self.day.and_hms_opt(16, 0, 0)?, self.zone).ok()
+    }
+
+    /// The same in the feed and in Google, since both alphabets allow it.
+    pub fn event_id(&self) -> String {
+        format!("relogin{}", self.key)
+    }
 }
 
 impl Timetable {
@@ -325,6 +429,32 @@ impl Timetable {
             && self.exams.is_empty()
             && self.homework.is_empty()
             && self.holidays.is_empty()
+    }
+
+    /// Only what falleth within these days, from the first to the last
+    /// inclusive. Reconciling a calendar against a window wanteth this: what
+    /// the window doth not cover was not fetched, and must neither be
+    /// deleted for its absence nor written again on every round.
+    pub fn within(&self, first: NaiveDate, last: NaiveDate) -> Timetable {
+        let days = |from: NaiveDate, to: NaiveDate| to >= first && from <= last;
+        let day_of = |at: &Stamp| at.date_naive();
+        Timetable {
+            lessons: self
+                .lessons
+                .iter()
+                .filter(|l| days(day_of(&l.start), day_of(&l.end)))
+                .cloned()
+                .collect(),
+            exams: self
+                .exams
+                .iter()
+                .filter(|e| days(day_of(&e.start), day_of(&e.end)))
+                .cloned()
+                .collect(),
+            homework: self.homework.iter().filter(|h| days(h.due, h.due)).cloned().collect(),
+            holidays: self.holidays.iter().filter(|h| days(h.start, h.end)).cloned().collect(),
+            relogin: self.relogin.clone().filter(|n| days(n.day, n.day)),
+        }
     }
 
     /// The span everything in here occupies, in the school's own zone. A
@@ -357,6 +487,11 @@ impl Timetable {
             if let (Some(from), Some(to)) = (midnight(shut.start, 0), midnight(shut.end, 1)) {
                 widen(from, to);
             }
+        }
+        if let Some(notice) = &self.relogin
+            && let (Some(from), Some(to)) = (notice.start(), notice.end())
+        {
+            widen(from, to);
         }
         Some((first?, last?))
     }
@@ -484,6 +619,35 @@ pub fn was_rejected(err: &anyhow::Error) -> bool {
     err.chain().any(|link| link.is::<Rejected>())
 }
 
+/// A bearer token is a JWT: three dot-separated parts and nothing else. A
+/// login page sent back in its place is long enough to pass for one by
+/// length alone.
+fn looks_like_a_token(raw: &str) -> bool {
+    raw.len() >= 40
+        && raw.split('.').count() == 3
+        && raw.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+}
+
+/// Given a login that did not let us in, whether the school said *no* —
+/// worth stopping for, since repeating it is how an account gets locked —
+/// or something else went wrong that will mend itself.
+///
+/// A lock is temporary and lifted by waiting, so it is not a refusal: the
+/// backoff of a transient failure is exactly what it wants. A second factor
+/// or an expired password cannot be answered by us at all.
+fn refusal(state: Option<&str>, redirect: Option<&str>) -> Option<String> {
+    if let Some(state) = state.filter(|s| *s != "SUCCESS") {
+        let upper = state.to_ascii_uppercase();
+        if upper.contains("LOCK") || upper.contains("TOO_MANY") {
+            return None;
+        }
+        return Some(format!("the school refused the login: {state}"));
+    }
+    let to = redirect?.to_ascii_lowercase();
+    (to.contains("login") || to.contains("error"))
+        .then(|| format!("the school refused the login (it sent us back to {to})"))
+}
+
 impl Client {
     pub fn new(settings: Credentials) -> Result<Self> {
         let http = reqwest::Client::builder()
@@ -539,32 +703,32 @@ impl Client {
             .unwrap_or("")
             .to_owned();
         let body = reply.text().await.unwrap_or_default();
+        let state = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|json| json.get("state").and_then(|s| s.as_str()).map(str::to_owned));
 
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
-            && let Some(state) = json.get("state").and_then(|s| s.as_str())
-            && state != "SUCCESS"
-        {
-            return Err(Rejected(format!("the school refused the login: {state}")).into());
-        }
-        if status.is_redirection() && !location.contains("index.do") {
-            // Sent back to the login page: the username or password is wrong.
-            return Err(Rejected(format!(
-                "the school refused the login (it sent us back to {location})"
-            ))
-            .into());
-        }
-
-        let token = self
+        // Whether we are in is decided by being let in, not by where the
+        // school pointeth us afterwards: that changeth whenever WebUntis
+        // moveth its front page, and reading it as a refusal once stopped a
+        // good password for good.
+        let reply = self
             .http
             .get(format!("{}/WebUntis/api/token/new", self.base))
             .send()
             .await
-            .context("requesting the bearer token")?
-            .text()
-            .await?;
-        let token = token.trim().to_owned();
-        if token.len() < 40 {
-            bail!("no usable bearer token was returned; are the credentials right?");
+            .context("requesting the bearer token")?;
+        let granted = reply.status().is_success();
+        let token = reply.text().await?.trim().to_owned();
+        if !(granted && looks_like_a_token(&token)) {
+            let redirect = status.is_redirection().then_some(location.as_str());
+            return Err(match refusal(state.as_deref(), redirect) {
+                Some(why) => Rejected(why).into(),
+                None => anyhow!(
+                    "no usable bearer token after logging in (HTTP {status}{}{})",
+                    state.as_deref().map(|s| format!(", state {s}")).unwrap_or_default(),
+                    redirect.map(|to| format!(", sent to {to}")).unwrap_or_default(),
+                ),
+            });
         }
         self.bearer = Some(token);
 
@@ -652,6 +816,13 @@ impl Client {
     pub async fn fetch_holidays(&self) -> Result<Vec<Holiday>> {
         let rpc = format!("{}/WebUntis/jsonrpc.do?school={}", self.base, self.settings.school);
 
+        // The web login's session cookie is usually good here too. Asking
+        // with it first spareth the school a second password a round, and a
+        // school counting logins toward a lock is the likelier to lock us.
+        if let Ok(holidays) = self.rpc_holidays(&rpc).await {
+            return Ok(holidays);
+        }
+
         let hello: RpcReply<RpcSession> = self
             .http
             .post(&rpc)
@@ -675,10 +846,16 @@ impl Client {
         if hello.result.as_ref().is_none_or(|session| session.session_id.is_empty()) {
             bail!("the JSON-RPC API would not open a session");
         }
+        self.rpc_holidays(&rpc).await
+    }
 
+    /// `getHolidays` on whatever session the cookie jar holdeth. An answer
+    /// without a result is the API declining, most often for want of a
+    /// session, and is an error so that the caller may open one.
+    async fn rpc_holidays(&self, rpc: &str) -> Result<Vec<Holiday>> {
         let holidays: RpcReply<Vec<HolidayRaw>> = self
             .http
-            .post(&rpc)
+            .post(rpc)
             .json(&serde_json::json!({
                 "id": "stundenglas",
                 "method": "getHolidays",
@@ -694,7 +871,7 @@ impl Client {
 
         Ok(holidays
             .result
-            .unwrap_or_default()
+            .ok_or_else(|| anyhow!("the JSON-RPC API gave no holidays"))?
             .into_iter()
             .filter_map(|raw| {
                 let start = compact_date(raw.start_date)?;
@@ -1230,7 +1407,7 @@ struct AbsenceRaw {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[test]
     fn the_directory_is_read_into_what_the_form_wants() {
         let body = r#"{"result":{"schools":[
@@ -1325,6 +1502,105 @@ mod tests {
         assert_eq!(exams[0].id, 2);
     }
 
+    /// What htl-villach answered for a whole year: twelve exams, every one of
+    /// them numbered 0. Two of them share a subject, a kind and a date's hour.
+    pub(crate) const EXAMS_ALL_ZERO: &str = r#"{"data":{"exams":[
+        {"id":0,"examType":"SA","name":"E1 (Englisch)","examDate":20261021,"startTime":800,"endTime":940,"subject":"E1","teachers":["WEK"],"rooms":["134"],"text":""},
+        {"id":0,"examType":"TE","name":"D (Deutsch)","examDate":20261104,"startTime":940,"endTime":1030,"subject":"D","text":"Theorie Kriminalliteratur"},
+        {"id":0,"examType":"TE","name":"DBI_1 (Datenbanken und Informationssysteme)","examDate":20261109,"startTime":1220,"endTime":1310,"subject":"DBI_1","text":"MAK"},
+        {"id":0,"examType":"TE","name":"BWM_1 (Betriebswirtschaft und Management)","examDate":20261110,"startTime":850,"endTime":940,"subject":"BWM_1","text":""},
+        {"id":0,"examType":"PLF","name":"WMC_1 (Webprogrammierung und Mobile Computing)","examDate":20261112,"startTime":800,"endTime":940,"subject":"WMC_1","text":"PLF"},
+        {"id":0,"examType":"TE","name":"NSCS_1 (Netzwerksysteme und Cyber Security)","examDate":20261116,"startTime":940,"endTime":1000,"subject":"NSCS_1","text":""},
+        {"id":0,"examType":"TE","name":"D (Deutsch)","examDate":20261118,"startTime":940,"endTime":1000,"subject":"D","text":"Inhalt Lektüre"},
+        {"id":0,"examType":"TE","name":"BWM_2 (Betriebswirtschaft und Management)","examDate":20261125,"startTime":1040,"endTime":1130,"subject":"BWM_2","text":""},
+        {"id":0,"examType":"SA","name":"AM (Angewandte Mathematik)","examDate":20261204,"startTime":800,"endTime":940,"subject":"AM","text":""},
+        {"id":0,"examType":"TE","name":"NSCS_1 (Netzwerksysteme und Cyber Security)","examDate":20261214,"startTime":940,"endTime":1000,"subject":"NSCS_1","text":""},
+        {"id":0,"examType":"SA","name":"D (Deutsch)","examDate":20261216,"startTime":940,"endTime":1130,"subject":"D","text":""},
+        {"id":0,"examType":"TE","name":"BWM_1 (Betriebswirtschaft und Management)","examDate":20270112,"startTime":850,"endTime":940,"subject":"BWM_1","text":""}
+    ]}}"#;
+
+    pub(crate) fn exams_all_zero() -> Vec<super::Exam> {
+        let envelope: super::ExamEnvelope = serde_json::from_str(EXAMS_ALL_ZERO).unwrap();
+        envelope.exams().into_iter().filter_map(|raw| raw.into_exam(super::DEFAULT_TZ)).collect()
+    }
+
+    #[test]
+    fn a_window_keeps_what_it_covers_and_no_more() {
+        let day = |m, d| NaiveDate::from_ymd_opt(2026, m, d).unwrap();
+        let want = super::Timetable {
+            exams: exams_all_zero(),
+            holidays: vec![
+                Holiday { id: 1, name: "Herbst".into(), start: day(10, 26), end: day(10, 30) },
+                Holiday { id: 2, name: "Sommer".into(), start: day(7, 1), end: day(9, 6) },
+            ],
+            ..Default::default()
+        };
+        let window = want.within(day(10, 9), day(11, 9));
+        assert_eq!(window.exams.len(), 3, "21 Oct, 4 Nov and 9 Nov: {:?}", window.exams);
+        assert_eq!(window.holidays.len(), 1, "the summer is long gone");
+        assert_eq!(window.holidays[0].id, 1);
+    }
+
+    #[test]
+    fn exams_numbered_zero_are_still_told_apart() {
+        let exams = exams_all_zero();
+        assert_eq!(exams.len(), 12);
+        let feed: std::collections::HashSet<_> = exams.iter().map(|e| e.event_id()).collect();
+        let google: std::collections::HashSet<_> = exams.iter().map(|e| e.gcal_id()).collect();
+        assert_eq!(feed.len(), 12, "one exam each, not one for all: {feed:?}");
+        assert_eq!(google.len(), 12, "{google:?}");
+        for id in &google {
+            assert!(
+                id.len() >= 5 && id.chars().all(|c| c.is_ascii_digit() || ('a'..='v').contains(&c)),
+                "{id} would be refused by Google"
+            );
+        }
+    }
+
+    #[test]
+    fn a_derived_exam_id_holds_still_across_refreshes() {
+        let (first, again) = (exams_all_zero(), exams_all_zero());
+        for (a, b) in first.iter().zip(&again) {
+            assert_eq!(a.event_id(), b.event_id());
+            assert_eq!(a.gcal_id(), b.gcal_id());
+        }
+        // A teacher amending the note must not move the event.
+        let mut amended = first[1].clone();
+        amended.text = "Kapitel 5 dazu".to_owned();
+        assert_eq!(amended.event_id(), first[1].event_id());
+        assert_eq!(amended.gcal_id(), first[1].gcal_id());
+    }
+
+    #[test]
+    fn an_exam_with_a_real_number_keeps_its_old_ids() {
+        let mut exam = exams_all_zero().remove(0);
+        exam.id = 42;
+        assert_eq!(exam.event_id(), "exam42", "subscribers must not see it move");
+        assert_eq!(exam.gcal_id(), super::google_id("pruef", 42));
+    }
+
+    #[test]
+    fn an_exam_named_for_its_subject_does_not_say_it_twice() {
+        let exams = exams_all_zero();
+        assert_eq!(exams[0].title(), "📝 E1 (Englisch) SA");
+        let mut essay = exams[0].clone();
+        essay.subject = "E".into();
+        essay.name = "Erörterung".into();
+        assert_eq!(
+            essay.title(),
+            "📝 E SA Erörterung",
+            "a name merely beginning alike is no match"
+        );
+    }
+
+    #[test]
+    fn base32hex_is_what_the_standard_says() {
+        // RFC 4648 §10, lowercased and unpadded.
+        assert_eq!(super::base32hex(b"f"), "co");
+        assert_eq!(super::base32hex(b"fo"), "cpng");
+        assert_eq!(super::base32hex(b"foobar"), "cpnmuoj1e8");
+    }
+
     use super::{Rejected, was_rejected};
 
     #[test]
@@ -1339,6 +1615,36 @@ mod tests {
     fn an_outage_is_not_mistaken_for_a_refusal() {
         let err = anyhow::anyhow!("connection timed out").context("reaching WebUntis");
         assert!(!was_rejected(&err), "a school that is merely down must be tried again");
+    }
+
+    #[test]
+    fn only_a_plain_no_is_taken_for_a_refusal() {
+        use super::refusal;
+        // Back to the login page, or told so in words: stop.
+        assert!(refusal(None, Some("/WebUntis/login.do?error=nomatch")).is_some());
+        assert!(refusal(Some("LOGIN_FAILED"), None).is_some());
+        assert!(refusal(Some("TWO_FACTOR_AUTHENTICATION_NEEDED"), None).is_some());
+        assert!(refusal(Some("EXPIRED"), None).is_some());
+        // A lock lifteth by itself; waiting is the cure, not a new password.
+        assert!(refusal(Some("LOCKED"), None).is_none());
+        assert!(refusal(Some("LOCKED_ACCESS"), None).is_none());
+        assert!(refusal(Some("TOO_MANY_LOGIN_ATTEMPTS"), None).is_none());
+        // A front page moved, a maintenance notice, or no answer at all.
+        assert!(refusal(None, Some("https://htl-villach.webuntis.com/today")).is_none());
+        assert!(refusal(None, Some("/maintenance.html")).is_none());
+        assert!(refusal(Some("SUCCESS"), None).is_none());
+        assert!(refusal(None, None).is_none());
+    }
+
+    #[test]
+    fn a_login_page_is_not_mistaken_for_a_token() {
+        use super::looks_like_a_token;
+        let page = format!("<!DOCTYPE html><html>{}</html>", "x".repeat(200));
+        assert!(!looks_like_a_token(&page), "long enough, but no token");
+        assert!(!looks_like_a_token("short.a.b"));
+        assert!(looks_like_a_token(
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzdHVkZW50In0.c2lnbmF0dXJlLXNpZ25hdHVyZQ"
+        ));
     }
 
     use super::*;

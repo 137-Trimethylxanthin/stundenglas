@@ -119,6 +119,7 @@ async fn run() -> Result<usize> {
             exams: untis.fetch_exams(from, to).await.unwrap_or_default(),
             homework: untis.fetch_homework(from, to).await.unwrap_or_default(),
             holidays: untis.fetch_holidays().await.unwrap_or_default(),
+            relogin: None,
         };
         let feed = stundenglas_core::ics::Feed {
             name: &format!("Stundenplan {}", untis.person_name),
@@ -170,6 +171,7 @@ async fn run() -> Result<usize> {
         exams: untis.fetch_exams(from, to).await.unwrap_or_default(),
         homework: untis.fetch_homework(from, to).await.unwrap_or_default(),
         holidays: untis.fetch_holidays().await.unwrap_or_default(),
+        relogin: None,
     };
     let plan = gcal::plan(&pushing, &existing, zone);
 

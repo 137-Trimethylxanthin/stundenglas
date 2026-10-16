@@ -30,7 +30,7 @@ pub async fn serve(
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
 
-    let payload = match crate::db::feed_by_token(&state.pool, token).await {
+    let mut payload = match crate::db::feed_by_token(&state.pool, token).await {
         Ok(Some(found)) => found,
         Ok(None) => {
             state.guard.note_miss(who);
@@ -49,6 +49,16 @@ pub async fn serve(
         .display_name
         .clone()
         .map_or_else(|| "Stundenplan".to_owned(), |who| format!("Stundenplan {who}"));
+
+    // A refused password saith so in the calendar, on today's date.
+    if payload.rejected {
+        payload.what.relogin = Some(crate::post::relogin_notice(
+            &state.config.public_url,
+            payload.account,
+            payload.timezone,
+            chrono::Utc::now(),
+        ));
+    }
 
     // The stored etag follows the school's timetable alone, but what we render
     // follows this link's own settings too. Fold them in, or a reminder just
@@ -132,6 +142,12 @@ fn etag_for(payload: &crate::db::FeedPayload, name: &str) -> String {
     }
     hasher.update(payload.feed.refresh_minutes.to_le_bytes());
     hasher.update(payload.feed.remind_before_minutes.unwrap_or(-1).to_le_bytes());
+    // The notice moveth to a new day each morning; an etag that did not would
+    // leave it on yesterday's for ever.
+    if let Some(notice) = &payload.what.relogin {
+        hasher.update(b"relogin");
+        hasher.update(notice.day.to_string().as_bytes());
+    }
     hasher.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
@@ -185,7 +201,34 @@ mod etag_tests {
             what: Default::default(),
             etag: Some("abcd1234".into()),
             fetched_at: None,
+            account: Uuid::nil(),
+            timezone: stundenglas_core::DEFAULT_TZ,
+            rejected: false,
         }
+    }
+
+    #[test]
+    fn the_notice_changes_the_answer_and_so_does_each_new_day() {
+        let quiet = payload(true, None);
+        let notice = |day| {
+            crate::post::relogin_notice(
+                "https://example.test",
+                Uuid::nil(),
+                stundenglas_core::DEFAULT_TZ,
+                chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 10, day, 10, 0, 0).unwrap(),
+            )
+        };
+        let mut today = payload(true, None);
+        today.what.relogin = Some(notice(16));
+        let mut tomorrow = payload(true, None);
+        tomorrow.what.relogin = Some(notice(17));
+        let (a, b, c) = (
+            super::etag_for(&quiet, "S"),
+            super::etag_for(&today, "S"),
+            super::etag_for(&tomorrow, "S"),
+        );
+        assert_ne!(a, b, "a refusal must not be answered 304");
+        assert_ne!(b, c, "nor may the notice stay on yesterday");
     }
 
     #[test]

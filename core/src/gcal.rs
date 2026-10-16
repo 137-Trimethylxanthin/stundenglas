@@ -26,6 +26,8 @@ const COLOUR_EVENT: &str = "5";
 const COLOUR_EXAM: &str = "4";
 const COLOUR_HOMEWORK: &str = "7";
 const COLOUR_HOLIDAY: &str = "8";
+/// Tomato, the reddest Google hath.
+const COLOUR_NOTICE: &str = "11";
 
 #[derive(Debug, Clone)]
 pub struct Desired {
@@ -306,6 +308,11 @@ impl Calendar {
         unreachable!("the loop returneth upon its last turn")
     }
 
+    /// Take down one event of ours by its id; one already gone is no error.
+    pub fn remove<'a>(&'a self, calendar: &'a str, id: &'a str) -> Eventually<'a, ()> {
+        Box::pin(self.delete(calendar, id))
+    }
+
     async fn delete(&self, calendar: &str, id: &str) -> Result<()> {
         let url = format!("{API}/calendars/{}/events/{}", urlencode(calendar), urlencode(id));
         for attempt in 0..ATTEMPTS {
@@ -394,6 +401,8 @@ pub fn desired_of(lesson: &Lesson, zone: Tz) -> Desired {
         "transparency": transparency,
         "reminders": { "useDefault": false, "overrides": [] },
         "extendedProperties": { "private": { "source": MARKER } },
+        // An id Google once deleted cometh back cancelled unless told otherwise.
+        "status": "confirmed",
     });
     if let Some(colour) = colour {
         body["colorId"] = json!(colour);
@@ -432,6 +441,8 @@ pub fn desired_of_exam(exam: &crate::Exam, zone: Tz) -> Desired {
         "colorId": COLOUR_EXAM,
         "reminders": { "useDefault": false, "overrides": [] },
         "extendedProperties": { "private": { "source": MARKER } },
+        // An id Google once deleted cometh back cancelled unless told otherwise.
+        "status": "confirmed",
     });
     let fingerprint =
         fingerprint_of(&[&summary, &description, &location, &start, &end, COLOUR_EXAM]);
@@ -465,6 +476,8 @@ fn desired_all_day(
         "colorId": colour,
         "reminders": { "useDefault": false, "overrides": [] },
         "extendedProperties": { "private": { "source": MARKER } },
+        // An id Google once deleted cometh back cancelled unless told otherwise.
+        "status": "confirmed",
     });
     let fingerprint = fingerprint_of(&[&summary, &description, &first, &after, colour]);
     body["extendedProperties"]["private"]["fp"] = json!(fingerprint);
@@ -498,6 +511,34 @@ pub fn desired_of_holiday(shut: &crate::Holiday, zone: Tz) -> Option<Desired> {
     )
 }
 
+/// The refused-password notice: Google's own red, and the same id every day
+/// so that it is moved, not added to.
+pub fn desired_of_relogin(notice: &crate::Relogin, zone: Tz) -> Option<Desired> {
+    let (from, to) = (notice.start()?, notice.end()?);
+    let summary = notice.title();
+    let description = notice.description();
+    let start = from.to_rfc3339_opts(SecondsFormat::Secs, false);
+    let end = to.to_rfc3339_opts(SecondsFormat::Secs, false);
+
+    let mut body = json!({
+        "id": notice.event_id(),
+        "summary": summary,
+        "description": description,
+        "source": { "title": "stundenglas", "url": notice.link },
+        "start": { "dateTime": start, "timeZone": zone.name() },
+        "end": { "dateTime": end, "timeZone": zone.name() },
+        "transparency": "opaque",
+        "colorId": COLOUR_NOTICE,
+        "reminders": { "useDefault": false, "overrides": [] },
+        "extendedProperties": { "private": { "source": MARKER } },
+        // An id Google once deleted cometh back cancelled unless told otherwise.
+        "status": "confirmed",
+    });
+    let fingerprint = fingerprint_of(&[&summary, &description, &start, &end, COLOUR_NOTICE]);
+    body["extendedProperties"]["private"]["fp"] = json!(fingerprint);
+    Some(Desired { id: notice.event_id(), summary, start: from, body })
+}
+
 /// What the calendar should hold, against what it holds.
 ///
 /// Everything the timetable carrieth goes up, not the lessons alone: whoever
@@ -513,7 +554,8 @@ pub fn plan(want: &crate::Timetable, existing: &HashMap<String, Existing>, zone:
         .map(|lesson| desired_of(lesson, zone))
         .chain(want.exams.iter().map(|exam| desired_of_exam(exam, zone)))
         .chain(want.homework.iter().filter_map(|piece| desired_of_homework(piece, zone)))
-        .chain(want.holidays.iter().filter_map(|shut| desired_of_holiday(shut, zone)));
+        .chain(want.holidays.iter().filter_map(|shut| desired_of_holiday(shut, zone)))
+        .chain(want.relogin.iter().filter_map(|notice| desired_of_relogin(notice, zone)));
 
     for desired in everything {
         wanted.insert(desired.id.clone(), ());
@@ -709,6 +751,7 @@ mod tests {
                 start: a_day(),
                 end: a_day(),
             }],
+            relogin: None,
         };
         let first_run = plan(&want, &HashMap::new(), crate::DEFAULT_TZ);
         assert_eq!(first_run.inserts.len(), 3, "the exam, the homework and the holiday");
@@ -756,6 +799,70 @@ mod tests {
     }
 
     use super::*;
+
+    fn a_notice(day: u32) -> crate::Relogin {
+        crate::Relogin {
+            key: "0b8f5c2e9a1d4e7f8a6b3c2d1e0f9a8b".into(),
+            day: chrono::NaiveDate::from_ymd_opt(2026, 9, day).unwrap(),
+            zone: crate::DEFAULT_TZ,
+            link: "https://stunden.example.test/#pw-0b8f5c2e".into(),
+        }
+    }
+
+    fn as_existing(plan: &Plan) -> HashMap<String, Existing> {
+        plan.inserts
+            .iter()
+            .chain(&plan.updates)
+            .map(|d| {
+                let there = Existing {
+                    id: d.id.clone(),
+                    summary: d.summary.clone(),
+                    start: String::new(),
+                    fingerprint: fingerprint_in(d),
+                };
+                (d.id.clone(), there)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_notice_goes_up_red_beside_the_timetable_and_takes_nothing_with_it() {
+        let cached = Timetable {
+            exams: vec![an_exam()],
+            homework: vec![some_homework()],
+            ..Default::default()
+        };
+        let before = plan(&cached, &HashMap::new(), crate::DEFAULT_TZ);
+        let mut warned = cached.clone();
+        warned.relogin = Some(a_notice(25));
+        let after = plan(&warned, &as_existing(&before), crate::DEFAULT_TZ);
+        assert!(after.deletes.is_empty(), "the cached timetable must survive the notice");
+        assert_eq!(after.inserts.len(), 1);
+        let notice = &after.inserts[0].body;
+        assert_eq!(notice["colorId"], "11");
+        assert_eq!(notice["start"]["dateTime"], "2026-09-25T08:00:00+02:00");
+        assert_eq!(notice["end"]["dateTime"], "2026-09-25T16:00:00+02:00");
+        assert!(notice["description"].as_str().unwrap().contains("/#pw-0b8f5c2e"));
+        let id = notice["id"].as_str().unwrap();
+        assert!(id.chars().all(|c| c.is_ascii_digit() || ('a'..='v').contains(&c)), "{id}");
+    }
+
+    #[test]
+    fn the_next_day_moves_the_notice_and_a_new_password_removes_it() {
+        let mut warned = Timetable { exams: vec![an_exam()], ..Default::default() };
+        warned.relogin = Some(a_notice(25));
+        let first = plan(&warned, &HashMap::new(), crate::DEFAULT_TZ);
+
+        warned.relogin = Some(a_notice(26));
+        let next_day = plan(&warned, &as_existing(&first), crate::DEFAULT_TZ);
+        assert_eq!(next_day.updates.len(), 1, "moved, not added");
+        assert!(next_day.inserts.is_empty() && next_day.deletes.is_empty());
+
+        warned.relogin = None;
+        let mended = plan(&warned, &as_existing(&first), crate::DEFAULT_TZ);
+        assert_eq!(mended.deletes.len(), 1);
+        assert!(mended.deletes[0].id.starts_with("relogin"));
+    }
 
     #[test]
     fn calendar_ids_are_escaped() {

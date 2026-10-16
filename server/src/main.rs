@@ -197,6 +197,7 @@ async fn serve(state: AppState) -> Result<()> {
         .route("/links/{id}/feeds", post(web::new_feed))
         .route("/links/{id}/delete", post(web::drop_link))
         .route("/links/{id}/password", post(web::new_password))
+        .route("/links/{id}/retry", post(web::retry_password))
         .route("/feeds/{id}/settings", post(web::feed_settings))
         .route("/feeds/{id}/rotate", post(web::rotate_feed))
         .route("/feeds/{id}/delete", post(web::drop_feed))

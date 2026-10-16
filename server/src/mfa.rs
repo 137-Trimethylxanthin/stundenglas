@@ -65,8 +65,11 @@ pub async fn factors(state: &AppState, bearer: &str) -> Result<Vec<Factor>> {
 
 /// Only a verified key may stand between a password and a session; an
 /// abandoned half-enrolment must never lock anybody out.
-pub async fn verified_factor(state: &AppState, bearer: &str) -> Option<Factor> {
-    factors(state, bearer).await.ok()?.into_iter().find(|f| f.verified)
+///
+/// A lookup that fails is an error, not "no key": read as none, a slow or
+/// throttled GoTrue would wave a stolen password straight through.
+pub async fn verified_factor(state: &AppState, bearer: &str) -> Result<Option<Factor>> {
+    Ok(factors(state, bearer).await?.into_iter().find(|f| f.verified))
 }
 
 pub async fn enrol(state: &AppState, bearer: &str, name: &str) -> Result<Uuid> {

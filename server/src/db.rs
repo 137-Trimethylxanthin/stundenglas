@@ -6,7 +6,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
-use stundenglas_core::{Credentials, DEFAULT_TZ, Exam, Holiday, Homework, Lesson, Timetable};
+use stundenglas_core::{Credentials, DEFAULT_TZ, Timetable};
 use uuid::Uuid;
 
 use crate::crypto::{Sealed, Sealer};
@@ -81,7 +81,11 @@ pub async fn add_account(pool: &PgPool, sealer: &Sealer, new: &NewAccount) -> Re
                 nonce = excluded.nonce,
                 key_version = excluded.key_version,
                 timezone = excluded.timezone,
-                enabled = true
+                enabled = true,
+                -- Linking the same school again with a password is as good as
+                -- entering it anew: the old refusal must not outlive it.
+                credentials_rejected = false,
+                rejected_at = null
          returning id, server, school, username, display_name, enabled, timezone,
                    credentials_rejected",
     )
@@ -96,7 +100,13 @@ pub async fn add_account(pool: &PgPool, sealer: &Sealer, new: &NewAccount) -> Re
     .fetch_one(pool)
     .await
     .context("storing the account")?;
-    Ok(account_from(&row))
+    let account = account_from(&row);
+    sqlx::query("update sync_state set next_attempt_at = null where untis_account_id = $1")
+        .bind(account.id)
+        .execute(pool)
+        .await
+        .context("clearing the backoff")?;
+    Ok(account)
 }
 
 pub async fn accounts_of(pool: &PgPool, user_id: Uuid) -> Result<Vec<UntisAccount>> {
@@ -187,6 +197,11 @@ pub struct FeedPayload {
     pub what: Timetable,
     pub etag: Option<String>,
     pub fetched_at: Option<DateTime<Utc>>,
+    /// The school link this feed belongeth to, its zone, and whether the
+    /// school is refusing its password — which the feed then saith aloud.
+    pub account: Uuid,
+    pub timezone: Tz,
+    pub rejected: bool,
 }
 
 fn feed_from(row: &PgRow, display_name: Option<String>) -> Feed {
@@ -277,11 +292,74 @@ pub async fn feeds_of(pool: &PgPool, account: Uuid) -> Result<Vec<Feed>> {
     Ok(rows.iter().map(|row| feed_from(row, None)).collect())
 }
 
+/// The cached timetable in a row that selected `lessons`, `exams`,
+/// `homework` and `holidays` from `sync_state`.
+///
+/// A cache written by an older build, or by a hand, must not take the feed
+/// down with it: an unreadable column reads as nothing.
+fn cached_timetable(row: &PgRow) -> Timetable {
+    fn column<T: serde::de::DeserializeOwned + Default>(row: &PgRow, name: &str) -> T {
+        row.try_get::<Option<serde_json::Value>, _>(name)
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default()
+    }
+    Timetable {
+        lessons: column(row, "lessons"),
+        exams: column(row, "exams"),
+        homework: column(row, "homework"),
+        holidays: column(row, "holidays"),
+        relogin: None,
+    }
+}
+
+/// Refused links with Google connected whose notice is not up yet, or was
+/// put up on an earlier day in their own zone's reckoning — so it goeth up in
+/// the round that found the refusal, moveth once each morning, and costeth
+/// Google nothing in between.
+pub async fn refused_to_remind(
+    pool: &PgPool,
+) -> Result<Vec<(UntisAccount, Timetable, (NaiveDate, NaiveDate))>> {
+    let rows = sqlx::query(
+        "select a.id, a.server, a.school, a.username, a.display_name, a.enabled,
+                a.timezone, a.credentials_rejected,
+                s.lessons, s.exams, s.homework, s.holidays, s.window_start, s.window_end
+           from untis_accounts a
+           join google_links g on g.untis_account_id = a.id
+           left join sync_state s on s.untis_account_id = a.id
+          where a.enabled and a.credentials_rejected
+            and (g.last_push_at is null
+                 or not g.notice_shown
+                 or (g.last_push_at at time zone a.timezone)::date
+                    < (now() at time zone a.timezone)::date)",
+    )
+    .fetch_all(pool)
+    .await
+    .context("looking for refused links to remind")?;
+    // The window the cache was fetched for, reaching to today at least so
+    // that the notice falleth inside it.
+    let today = Utc::now().date_naive();
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let start: Option<NaiveDate> = row.try_get("window_start").ok().flatten();
+            let end: Option<NaiveDate> = row.try_get("window_end").ok().flatten();
+            let window = (
+                start.unwrap_or(today).min(today - chrono::Duration::days(1)),
+                end.unwrap_or(today).max(today + chrono::Duration::days(1)),
+            );
+            (account_from(row), cached_timetable(row), window)
+        })
+        .collect())
+}
+
 pub async fn feed_by_token(pool: &PgPool, token: &str) -> Result<Option<FeedPayload>> {
     let Some(row) = sqlx::query(
         "select f.id, f.token, f.untis_account_id, f.keep_cancelled, f.refresh_minutes,
                 f.remind_before_minutes, f.with_homework, f.with_holidays, f.hide_subjects, f.label,
-                a.display_name, s.lessons, s.exams, s.homework, s.holidays, s.etag, s.last_ok_at
+                a.display_name, a.timezone, a.credentials_rejected,
+                s.lessons, s.exams, s.homework, s.holidays, s.etag, s.last_ok_at
            from feeds f
            join untis_accounts a on a.id = f.untis_account_id
            left join sync_state s on s.untis_account_id = f.untis_account_id
@@ -294,40 +372,18 @@ pub async fn feed_by_token(pool: &PgPool, token: &str) -> Result<Option<FeedPayl
         return Ok(None);
     };
 
-    // A cache written by an older build, or by a hand, must not take the feed
-    // down with it: an unreadable column reads as nothing.
-    let lessons: Vec<Lesson> = row
-        .try_get::<Option<serde_json::Value>, _>("lessons")
-        .ok()
-        .flatten()
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default();
-    let exams: Vec<Exam> = row
-        .try_get::<Option<serde_json::Value>, _>("exams")
-        .ok()
-        .flatten()
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default();
-
-    let homework: Vec<Homework> = row
-        .try_get::<Option<serde_json::Value>, _>("homework")
-        .ok()
-        .flatten()
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default();
-
-    let holidays: Vec<Holiday> = row
-        .try_get::<Option<serde_json::Value>, _>("holidays")
-        .ok()
-        .flatten()
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default();
-
     Ok(Some(FeedPayload {
         feed: feed_from(&row, row.try_get("display_name").ok().flatten()),
-        what: Timetable { lessons, exams, homework, holidays },
+        what: cached_timetable(&row),
         etag: row.try_get("etag").ok().flatten(),
         fetched_at: row.try_get("last_ok_at").ok().flatten(),
+        account: row.get("untis_account_id"),
+        timezone: row
+            .try_get::<String, _>("timezone")
+            .ok()
+            .and_then(|name| name.parse().ok())
+            .unwrap_or(DEFAULT_TZ),
+        rejected: row.try_get("credentials_rejected").unwrap_or(false),
     }))
 }
 
@@ -442,6 +498,31 @@ pub async fn store_failure(pool: &PgPool, account: Uuid, why: String, kind: Fail
         .await?;
     }
     Ok(())
+}
+
+/// Try the stored password once more: the refusal lifted, and the backoff
+/// with it so the next round taketh it at once. Only an owner may, and only a
+/// link actually refused — otherwise this would merely skip a backoff.
+pub async fn lift_refusal(pool: &PgPool, user_id: Uuid, account: Uuid) -> Result<bool> {
+    let done = sqlx::query(
+        "update untis_accounts
+            set credentials_rejected = false, rejected_at = null
+          where id = $1 and user_id = $2 and credentials_rejected",
+    )
+    .bind(account)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .context("lifting the refusal")?;
+    if done.rows_affected() == 0 {
+        return Ok(false);
+    }
+    sqlx::query("update sync_state set next_attempt_at = null where untis_account_id = $1")
+        .bind(account)
+        .execute(pool)
+        .await
+        .context("clearing the backoff")?;
+    Ok(true)
 }
 
 /// A new password for a link the school refused. Re-sealing and clearing the

@@ -29,6 +29,39 @@ pub async fn run(state: AppState) {
             tracing::error!("sync round failed: {err:#}");
         }
         tell_the_stalled(&state).await;
+        remind_the_refused(&state).await;
+    }
+}
+
+/// A refused link is never synced, so nothing would otherwise reach its
+/// Google calendar: the notice goeth up there with the timetable last
+/// fetched, and only that — a push of the notice alone would empty the
+/// calendar of everything else.
+async fn remind_the_refused(state: &AppState) {
+    let refused = match crate::db::refused_to_remind(&state.pool).await {
+        Ok(found) => found,
+        Err(err) => {
+            tracing::warn!("could not look for refused links: {err:#}");
+            return;
+        }
+    };
+    for (account, mut cached, window) in refused {
+        // No lessons cached to keep beside it, and a calendar reconciled
+        // against none is a calendar emptied; `push` would refuse it too.
+        if cached.lessons.is_empty() {
+            continue;
+        }
+        cached.relogin = Some(crate::post::relogin_notice(
+            &state.config.public_url,
+            account.id,
+            account.timezone,
+            chrono::Utc::now(),
+        ));
+        let id = account.id;
+        match crate::google::push(state.clone(), account, cached, window).await {
+            Ok(_) => tracing::info!(account = %id, "relogin notice pushed to Google"),
+            Err(err) => tracing::warn!(account = %id, "relogin notice push failed: {err:#}"),
+        }
     }
 }
 
@@ -153,13 +186,13 @@ async fn fetch_one(state: AppState, entry: crate::db::AccountWithSecret) -> Resu
         Vec::new()
     });
 
-    let got = Timetable { lessons, exams, homework, holidays };
+    let got = Timetable { lessons, exams, homework, holidays, relogin: None };
     let etag = fingerprint(&got);
     crate::db::store_sync(&state.pool, entry.account.id, &got, etag, (from, to)).await?;
 
     // Those who asked for it get the same timetable written into Google, so
     // they need not wait for Google to look at the subscribed link.
-    match crate::google::push(state.clone(), entry.account.clone(), got.clone()).await {
+    match crate::google::push(state.clone(), entry.account.clone(), got.clone(), (from, to)).await {
         Ok(Some(tally)) => tracing::info!(
             account = %entry.account.id,
             inserted = tally.inserted, updated = tally.updated,
@@ -202,6 +235,11 @@ fn fingerprint(got: &Timetable) -> String {
         hasher.update([0]);
         hasher.update(exam.title().as_bytes());
         hasher.update([0]);
+        // A room or a note changed is rendered too, and must not answer 304.
+        hasher.update(exam.description().as_bytes());
+        hasher.update([0]);
+        hasher.update(exam.rooms.join(",").as_bytes());
+        hasher.update([0]);
         hasher.update(exam.start.to_rfc3339().as_bytes());
         hasher.update(exam.end.to_rfc3339().as_bytes());
         hasher.update(*b"\n");
@@ -210,6 +248,8 @@ fn fingerprint(got: &Timetable) -> String {
         hasher.update(piece.event_id().as_bytes());
         hasher.update([0]);
         hasher.update(piece.title().as_bytes());
+        hasher.update([0]);
+        hasher.update(piece.description().as_bytes());
         hasher.update(piece.due.to_string().as_bytes());
         hasher.update(*b"\n");
     }
@@ -226,6 +266,24 @@ fn fingerprint(got: &Timetable) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_room_changed_for_an_exam_is_a_changed_feed() {
+        let exam = |room: &str| stundenglas_core::Exam {
+            id: 7,
+            start: chrono::Utc::now().fixed_offset(),
+            end: chrono::Utc::now().fixed_offset(),
+            subject: "M".into(),
+            kind: "SA".into(),
+            name: String::new(),
+            text: String::new(),
+            teachers: vec![],
+            rooms: vec![room.into()],
+        };
+        let before = Timetable { exams: vec![exam("A1")], ..Default::default() };
+        let after = Timetable { exams: vec![exam("B2")], ..Default::default() };
+        assert_ne!(fingerprint(&before), fingerprint(&after));
+    }
 
     #[test]
     fn the_window_never_starts_before_the_school_year() {

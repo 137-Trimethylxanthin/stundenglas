@@ -5,7 +5,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::untis::{Exam, Holiday, Homework, Lesson, Status, Timetable};
+use crate::untis::{Exam, Holiday, Homework, Lesson, Relogin, Status, Timetable};
 
 const PRODID: &str = "-//stundenglas//WebUntis timetable//EN";
 
@@ -88,6 +88,11 @@ impl Feed<'_> {
                 }
                 Self::homework(&mut out, piece, stamp);
             }
+        }
+        // Whatever the link's settings: it is the one thing here that saith
+        // the rest has stopped being true.
+        if let Some(notice) = &what.relogin {
+            Self::relogin(&mut out, notice, stamp);
         }
 
         line(&mut out, "END:VCALENDAR");
@@ -231,6 +236,25 @@ impl Feed<'_> {
         line(out, "TRANSP:TRANSPARENT");
         line(out, "STATUS:CONFIRMED");
         line(out, "CATEGORIES:HOMEWORK");
+        line(out, "END:VEVENT");
+    }
+
+    /// Red where the client honoureth RFC 7986's `COLOR`, and marked red in
+    /// its title where it doth not.
+    fn relogin(out: &mut String, notice: &Relogin, stamp: DateTime<Utc>) {
+        let (Some(start), Some(end)) = (notice.start(), notice.end()) else { return };
+        line(out, "BEGIN:VEVENT");
+        line(out, &format!("UID:{}@stundenglas", notice.event_id()));
+        line(out, &format!("DTSTAMP:{}", utc(stamp)));
+        line(out, &format!("DTSTART:{}", utc(start.with_timezone(&Utc))));
+        line(out, &format!("DTEND:{}", utc(end.with_timezone(&Utc))));
+        line(out, &format!("SUMMARY:{}", escape(&notice.title())));
+        line(out, &format!("DESCRIPTION:{}", escape(&notice.description())));
+        line(out, &format!("URL:{}", notice.link));
+        line(out, "COLOR:red");
+        line(out, "TRANSP:OPAQUE");
+        line(out, "STATUS:CONFIRMED");
+        line(out, "CATEGORIES:NOTICE");
         line(out, "END:VEVENT");
     }
 }
@@ -574,6 +598,61 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
         );
         assert_eq!(out.matches("BEGIN:VEVENT").count(), 3);
+    }
+
+    #[test]
+    fn exams_numbered_zero_each_get_an_entry() {
+        let exams = crate::untis::tests::exams_all_zero();
+        let out = Feed::default().render(
+            &Timetable { exams, ..Default::default() },
+            Utc.with_ymd_and_hms(2026, 10, 16, 12, 0, 0).unwrap(),
+        );
+        let uids: std::collections::HashSet<_> =
+            out.lines().filter(|l| l.starts_with("UID:")).collect();
+        assert_eq!(uids.len(), 12, "a calendar keepeth only one event per UID");
+    }
+
+    fn notice(day: u32) -> Relogin {
+        Relogin {
+            key: "0b8f5c2e9a1d4e7f8a6b3c2d1e0f9a8b".to_owned(),
+            day: NaiveDate::from_ymd_opt(2026, 10, day).unwrap(),
+            zone: DEFAULT_TZ,
+            link: "https://stunden.example.test/#pw-0b8f5c2e".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_refused_password_fills_the_school_day_in_red() {
+        let out = Feed::default().render(
+            &Timetable { relogin: Some(notice(16)), ..Default::default() },
+            Utc.with_ymd_and_hms(2026, 10, 16, 5, 0, 0).unwrap(),
+        );
+        assert_eq!(out.matches("BEGIN:VEVENT").count(), 1);
+        // 08:00 and 16:00 in Vienna, still on summer time in mid-October.
+        assert!(out.contains("DTSTART:20261016T060000Z"), "{out}");
+        assert!(out.contains("DTEND:20261016T140000Z"));
+        assert!(out.contains("COLOR:red"));
+        assert!(out.contains("URL:https://stunden.example.test/#pw-0b8f5c2e"));
+        assert!(out.contains("UID:relogin0b8f5c2e9a1d4e7f8a6b3c2d1e0f9a8b@stundenglas"));
+    }
+
+    #[test]
+    fn the_notice_moves_rather_than_multiplies() {
+        let render = |day| {
+            Feed::default().render(
+                &Timetable { relogin: Some(notice(day)), ..Default::default() },
+                Utc.with_ymd_and_hms(2026, 10, 16, 5, 0, 0).unwrap(),
+            )
+        };
+        let uid = |out: String| out.lines().find(|l| l.starts_with("UID:")).unwrap().to_owned();
+        assert_eq!(uid(render(16)), uid(render(17)), "one UID, so a client moveth it");
+    }
+
+    #[test]
+    fn no_refusal_no_notice() {
+        let out = render(&[lesson(Status::Regular, "MAT")]);
+        assert!(!out.contains("CATEGORIES:NOTICE"));
+        assert!(!out.contains("COLOR:"));
     }
 
     #[test]

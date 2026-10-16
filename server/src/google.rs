@@ -111,6 +111,17 @@ pub async fn callback(
         );
     };
 
+    // The state proveth which link asked, not who is now at the keyboard.
+    // Without this, a consent URL begun by one person and approved by another
+    // would hand the second person's calendar to the first person's link.
+    if crate::web::signed_in(&app, &jar).await.map(|who| who.id) != Some(user) {
+        return crate::web::say(
+            lang,
+            "That link is not yours",
+            "Sign in as the person who began the connection, and start it again.",
+        );
+    }
+
     match finish(&app, &code, account).await {
         Ok(()) => {
             let app2 = app.clone();
@@ -119,7 +130,6 @@ pub async fn callback(
                     tracing::warn!("first push failed: {err:#}");
                 }
             });
-            let _ = user;
             Redirect::to("/").into_response()
         }
         Err(err) => {
@@ -232,11 +242,13 @@ pub struct Link {
     pub refresh: String,
     pub calendar_id: Option<String>,
     pub calendar_name: String,
+    /// The red notice of a refused password is up in this calendar.
+    pub notice_shown: bool,
 }
 
 pub async fn link_of(state: &AppState, account: Uuid) -> Result<Option<Link>> {
     let Some(row) = sqlx::query(
-        "select refresh_secret, refresh_nonce, calendar_id, calendar_name
+        "select refresh_secret, refresh_nonce, calendar_id, calendar_name, notice_shown
            from google_links where untis_account_id = $1",
     )
     .bind(account)
@@ -250,6 +262,7 @@ pub async fn link_of(state: &AppState, account: Uuid) -> Result<Option<Link>> {
         refresh: state.config.sealer.unseal(&sealed)?,
         calendar_id: row.try_get("calendar_id").ok().flatten(),
         calendar_name: row.get("calendar_name"),
+        notice_shown: row.try_get("notice_shown").unwrap_or(false),
     }))
 }
 
@@ -320,6 +333,7 @@ pub fn push(
     state: AppState,
     account: db::UntisAccount,
     want: stundenglas_core::Timetable,
+    window: (chrono::NaiveDate, chrono::NaiveDate),
 ) -> Pin<Box<dyn Future<Output = Result<Option<gcal::Tally>>> + Send>> {
     Box::pin(async move {
         let Some(link) = link_of(&state, account.id).await? else {
@@ -341,25 +355,56 @@ pub fn push(
             }
         };
 
-        // Reconcile only within the span we actually hold, so nothing outside
-        // it is touched -- the same rule the command-line tool follows. The
-        // span must cover the whole-day entries too, or a holiday in July
-        // would be written once and then never looked at again.
-        //
-        // A timetable with nothing in it means a refresh that found nothing;
-        // better to leave the calendar as it stands than to empty it.
-        let Some((first, last)) = want.span(account.timezone) else {
+        // The password worketh again: down cometh the notice, by its id, on
+        // whatever day it was last put — which need not lie in this window,
+        // and must come down even on a round that pusheth nothing else.
+        if want.relogin.is_none() && link.notice_shown {
+            let notice = crate::post::relogin_notice(
+                &state.config.public_url,
+                account.id,
+                account.timezone,
+                chrono::Utc::now(),
+            );
+            calendar.remove(&id, &notice.event_id()).await?;
+            sqlx::query("update google_links set notice_shown = false where untis_account_id = $1")
+                .bind(account.id)
+                .execute(&state.pool)
+                .await?;
+        }
+
+        // No lessons at all, in a window reaching to the end of the year, is
+        // far likelier a school answering emptily for a moment than a year of
+        // free days; reconciled against it, every lesson would be deleted.
+        if want.lessons.is_empty() {
+            tracing::warn!(account = %account.id, "no lessons; Google left as it was");
+            return Ok(None);
+        }
+
+        // Reconcile only within the window that was fetched, so nothing
+        // outside it is touched -- the same rule the command-line tool
+        // follows. The lessons reach back a week, but the holidays reach back
+        // the whole year: a span widened by them once deleted every lesson
+        // older than a week. Whatever lieth outside is left as it is.
+        let want = want.within(window.0, window.1);
+        let midnight =
+            |day: chrono::NaiveDate| stundenglas_core::untis::midnight_in(day, account.timezone);
+        let (Some(first), Some(last)) =
+            (midnight(window.0), midnight(window.1 + chrono::Duration::days(1)))
+        else {
             return Ok(None);
         };
-
         let existing = calendar.existing(&id, first, last).await?;
         let plan = gcal::plan(&want, &existing, account.timezone);
         let tally = calendar.apply(&id, &plan, 6).await?;
 
-        sqlx::query("update google_links set last_push_at = now() where untis_account_id = $1")
-            .bind(account.id)
-            .execute(&state.pool)
-            .await?;
+        sqlx::query(
+            "update google_links set last_push_at = now(), notice_shown = $2
+              where untis_account_id = $1",
+        )
+        .bind(account.id)
+        .bind(want.relogin.is_some())
+        .execute(&state.pool)
+        .await?;
         Ok(Some(tally))
     })
 }

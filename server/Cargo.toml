@@ -27,6 +27,8 @@ rand = "0.9"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Already in the tree under axum; named here to read a repeated form field.
+serde_urlencoded = "0.7"
 sqlx = { version = "0.8", default-features = false, features = [
     "chrono",
     "json",

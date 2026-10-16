@@ -558,6 +558,10 @@ async fn dashboard_with(
                                       required autocomplete="off";
                                 p {} button type="submit" { (w.try_this_one) }
                             }
+                            form.stack method="post" action={ "/links/" (account.id) "/retry" } {
+                                button type="submit" { (w.try_stored) }
+                                p.meta { (w.try_stored_hint) }
+                            }
                         }
                     }
                     p.meta {
@@ -775,8 +779,11 @@ pub async fn feed_settings(
     jar: CookieJar,
     Path(feed): Path<Uuid>,
     headers: HeaderMap,
-    Form(form): Form<FeedForm>,
+    body: axum::body::Bytes,
 ) -> Response {
+    let Ok(form) = serde_urlencoded::from_bytes::<FeedForm>(&body) else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "that form could not be read").into_response();
+    };
     let lang = Lang::of(&jar, &headers);
     let Some(user) = current(&state, &jar).await else {
         return Redirect::to("/").into_response();
@@ -791,7 +798,7 @@ pub async fn feed_settings(
         with_holidays: form.with_holidays.is_some(),
         // Each unticked box sends nothing, so what arrives is exactly the set
         // to leave out.
-        hide_subjects: form.hide.unwrap_or_default(),
+        hide_subjects: hidden_subjects(&body),
         label: form.label.map(|l| l.trim().chars().take(60).collect()),
     };
 
@@ -1213,9 +1220,19 @@ pub struct FeedForm {
     keep_cancelled: Option<String>,
     with_homework: Option<String>,
     with_holidays: Option<String>,
-    /// One entry per ticked subject; axum gathers repeated fields into a Vec.
-    #[serde(default)]
-    hide: Option<Vec<String>>,
+    // The ticked subjects arrive as `hide=M&hide=D`, which no struct field
+    // can take: the plain form reader refuseth a repeated key, and with it
+    // the whole form. They are gathered by `hidden_subjects` instead.
+}
+
+/// Every `hide` in a submitted form, in the order ticked.
+fn hidden_subjects(body: &[u8]) -> Vec<String> {
+    serde_urlencoded::from_bytes::<Vec<(String, String)>>(body)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(key, _)| key == "hide")
+        .map(|(_, subject)| subject)
+        .collect()
 }
 
 /// A select whose "never" option hath an empty value sendeth `""`, which is
@@ -1258,22 +1275,46 @@ pub async fn new_password(
         // Owned by someone else, or gone: say nothing either way.
         Ok(false) => (StatusCode::NOT_FOUND, "no such school").into_response(),
         Ok(true) => {
-            // Said once already; should it be refused again, it is worth
-            // saying again.
-            crate::post::forget(
-                &state.pool,
-                user.id,
-                crate::post::Notice::PasswordRefused,
-                account,
-            )
-            .await;
-            // Try it at once, so they learn straight away whether it took.
-            let soon = state.clone();
-            tokio::spawn(async move {
-                if let Err(err) = crate::sync::once(soon).await {
-                    tracing::warn!("refresh after a new password failed: {err:#}");
-                }
-            });
+            try_again_now(&state, user.id, account).await;
+            Redirect::to("/").into_response()
+        }
+        Err(err) => dashboard(state, user, Some(format!("{err}")), lang).await,
+    }
+}
+
+/// A refusal just lifted. Said once already, it is worth saying again should
+/// the school refuse once more; and it is tried at once, so the owner learneth
+/// straight away whether it took.
+async fn try_again_now(state: &AppState, user: Uuid, account: Uuid) {
+    crate::post::forget(&state.pool, user, crate::post::Notice::PasswordRefused, account).await;
+    let soon = state.clone();
+    tokio::spawn(async move {
+        if let Err(err) = crate::sync::once(soon).await {
+            tracing::warn!("refresh after a lifted refusal failed: {err:#}");
+        }
+    });
+}
+
+/// `POST /links/{id}/retry`
+///
+/// The stored password, tried once more without retyping it. Lifting the
+/// refusal and refreshing at once is a single login, the same one a new
+/// password would cost; refused again, the link is stopped again by the very
+/// same path, so no loop of guesses can come of it.
+pub async fn retry_password(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(account): Path<Uuid>,
+    headers: HeaderMap,
+) -> Response {
+    let lang = Lang::of(&jar, &headers);
+    let Some(user) = current(&state, &jar).await else {
+        return Redirect::to("/").into_response();
+    };
+    match db::lift_refusal(&state.pool, user.id, account).await {
+        Ok(false) => (StatusCode::NOT_FOUND, "no such school").into_response(),
+        Ok(true) => {
+            try_again_now(&state, user.id, account).await;
             Redirect::to("/").into_response()
         }
         Err(err) => dashboard(state, user, Some(format!("{err}")), lang).await,
@@ -1322,7 +1363,19 @@ pub async fn sign_in(
             let _ =
                 people::on_signup(&state.pool, who.user, &email, &state.config.admin_emails).await;
             // A security key, if one is enrolled, before any session is opened.
-            if let Some(factor) = crate::mfa::verified_factor(&state, &who.gotrue).await {
+            let factor = match crate::mfa::verified_factor(&state, &who.gotrue).await {
+                Ok(factor) => factor,
+                Err(err) => {
+                    tracing::warn!("could not ask for security keys: {err:#}");
+                    return refuse(
+                        &state,
+                        "could not sign you in just now; try again shortly",
+                        lang,
+                    )
+                    .await;
+                }
+            };
+            if let Some(factor) = factor {
                 return match crate::mfa::park(&state, who.user, factor.id, &who.gotrue).await {
                     Ok(token) => {
                         let jar = jar.add(auth::pending_cookie(
@@ -2143,5 +2196,25 @@ mod preview {
             }
         }
         println!("\\npreview written to {}\\n", out.canonicalize().unwrap_or(out).display());
+    }
+}
+
+#[cfg(test)]
+mod feed_form_tests {
+    #[test]
+    fn ticking_subjects_does_not_lose_the_whole_form() {
+        let body = b"label=Mine&refresh_minutes=30&keep_cancelled=on&hide=M&hide=RK";
+        let form: super::FeedForm = serde_urlencoded::from_bytes(body).unwrap();
+        assert!(form.keep_cancelled.is_some());
+        assert_eq!(form.refresh_minutes, Some(30));
+        assert_eq!(super::hidden_subjects(body), ["M", "RK"]);
+    }
+
+    #[test]
+    fn nothing_ticked_hides_nothing() {
+        let body = b"refresh_minutes=60&remind_before_minutes=";
+        let form: super::FeedForm = serde_urlencoded::from_bytes(body).unwrap();
+        assert_eq!(form.remind_before_minutes, None);
+        assert!(super::hidden_subjects(body).is_empty());
     }
 }
