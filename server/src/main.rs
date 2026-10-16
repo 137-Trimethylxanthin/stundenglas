@@ -12,6 +12,7 @@ mod guard;
 mod mfa;
 mod people;
 mod post;
+mod relogin;
 mod schools;
 mod sync;
 mod web;

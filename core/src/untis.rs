@@ -1,7 +1,7 @@
 //! Readeth the personal timetable from the selfsame endpoint the web client useth.
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
 use chrono_tz::{Europe::Vienna, Tz};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -402,8 +402,10 @@ impl Relogin {
 
     pub fn description(&self) -> String {
         format!(
-            "WebUntis hat das gespeicherte Passwort abgelehnt, darum wird dieser \
-             Stundenplan nicht mehr aktualisiert.\n\nHier neu anmelden:\n{}",
+            "WebUntis hat die gespeicherte Anmeldung abgelehnt, darum wird dieser \
+             Stundenplan nicht mehr aktualisiert. Meist ist das Passwort ein anderes \
+             geworden; verlangt die Schule einen zweiten Faktor, kann dieser Dienst \
+             sich gar nicht anmelden.\n\nHier neu anmelden:\n{}",
             self.link
         )
     }
@@ -455,45 +457,6 @@ impl Timetable {
             holidays: self.holidays.iter().filter(|h| days(h.start, h.end)).cloned().collect(),
             relogin: self.relogin.clone().filter(|n| days(n.day, n.day)),
         }
-    }
-
-    /// The span everything in here occupies, in the school's own zone. A
-    /// whole-day entry counts from its midnight to the midnight after, which
-    /// is how iCalendar and Google both read one.
-    pub fn span(&self, zone: Tz) -> Option<(Stamp, Stamp)> {
-        let midnight = |day: NaiveDate, plus: i64| {
-            localise((day + Duration::days(plus)).and_hms_opt(0, 0, 0)?, zone).ok()
-        };
-
-        let mut first: Option<Stamp> = None;
-        let mut last: Option<Stamp> = None;
-        let mut widen = |from: Stamp, to: Stamp| {
-            first = Some(first.map_or(from, |had| had.min(from)));
-            last = Some(last.map_or(to, |had| had.max(to)));
-        };
-
-        for lesson in &self.lessons {
-            widen(lesson.start, lesson.end);
-        }
-        for exam in &self.exams {
-            widen(exam.start, exam.end);
-        }
-        for piece in &self.homework {
-            if let (Some(from), Some(to)) = (midnight(piece.due, 0), midnight(piece.due, 1)) {
-                widen(from, to);
-            }
-        }
-        for shut in &self.holidays {
-            if let (Some(from), Some(to)) = (midnight(shut.start, 0), midnight(shut.end, 1)) {
-                widen(from, to);
-            }
-        }
-        if let Some(notice) = &self.relogin
-            && let (Some(from), Some(to)) = (notice.start(), notice.end())
-        {
-            widen(from, to);
-        }
-        Some((first?, last?))
     }
 }
 
@@ -619,6 +582,26 @@ pub fn was_rejected(err: &anyhow::Error) -> bool {
     err.chain().any(|link| link.is::<Rejected>())
 }
 
+/// The school neither let us in nor plainly said no: no token came back, and
+/// its answer read as no refusal we know. Once, that is a hiccup; again and
+/// again, it is most likely a wrong password in a shape not yet seen, and the
+/// caller should treat it as one before the school locketh the account.
+#[derive(Debug)]
+pub struct NoToken(pub String);
+
+impl std::fmt::Display for NoToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for NoToken {}
+
+/// Whether anywhere in this failure's chain a login yielded no token.
+pub fn got_no_token(err: &anyhow::Error) -> bool {
+    err.chain().any(|link| link.is::<NoToken>())
+}
+
 /// A bearer token is a JWT: three dot-separated parts and nothing else. A
 /// login page sent back in its place is long enough to pass for one by
 /// length alone.
@@ -637,8 +620,7 @@ fn looks_like_a_token(raw: &str) -> bool {
 /// or an expired password cannot be answered by us at all.
 fn refusal(state: Option<&str>, redirect: Option<&str>) -> Option<String> {
     if let Some(state) = state.filter(|s| *s != "SUCCESS") {
-        let upper = state.to_ascii_uppercase();
-        if upper.contains("LOCK") || upper.contains("TOO_MANY") {
+        if is_lock(state) {
             return None;
         }
         return Some(format!("the school refused the login: {state}"));
@@ -646,6 +628,37 @@ fn refusal(state: Option<&str>, redirect: Option<&str>) -> Option<String> {
     let to = redirect?.to_ascii_lowercase();
     (to.contains("login") || to.contains("error"))
         .then(|| format!("the school refused the login (it sent us back to {to})"))
+}
+
+/// Whether the school said the account is locked for a while. `LOCKED` and
+/// `LOCKED_ACCESS` lift by themselves; `BLOCKED` doth not, and only looketh
+/// alike.
+fn is_lock(state: &str) -> bool {
+    let upper = state.to_ascii_uppercase();
+    upper.starts_with("LOCKED") || upper.contains("TOO_MANY")
+}
+
+/// What a login that brought back no token amounteth to: a refusal, a lock
+/// to wait out, or — neither said plainly — a `NoToken` the caller counteth.
+fn login_failure(
+    status: reqwest::StatusCode,
+    state: Option<&str>,
+    redirect: Option<&str>,
+) -> anyhow::Error {
+    if let Some(why) = refusal(state, redirect) {
+        return Rejected(why).into();
+    }
+    // A lock said plainly is neither a refusal nor a mystery: it is waited
+    // out, and counteth toward nothing.
+    if let Some(state) = state.filter(|s| is_lock(s)) {
+        return anyhow!("the school has locked the account for a while (state {state})");
+    }
+    NoToken(format!(
+        "no usable bearer token after logging in (HTTP {status}{}{})",
+        state.map(|s| format!(", state {s}")).unwrap_or_default(),
+        redirect.map(|to| format!(", sent to {to}")).unwrap_or_default(),
+    ))
+    .into()
 }
 
 impl Client {
@@ -721,14 +734,7 @@ impl Client {
         let token = reply.text().await?.trim().to_owned();
         if !(granted && looks_like_a_token(&token)) {
             let redirect = status.is_redirection().then_some(location.as_str());
-            return Err(match refusal(state.as_deref(), redirect) {
-                Some(why) => Rejected(why).into(),
-                None => anyhow!(
-                    "no usable bearer token after logging in (HTTP {status}{}{})",
-                    state.as_deref().map(|s| format!(", state {s}")).unwrap_or_default(),
-                    redirect.map(|to| format!(", sent to {to}")).unwrap_or_default(),
-                ),
-            });
+            return Err(login_failure(status, state.as_deref(), redirect));
         }
         self.bearer = Some(token);
 
@@ -1406,8 +1412,34 @@ struct AbsenceRaw {
     text: Option<String>,
 }
 
+/// Answers captured from real tenants, for the tests of more than one module.
 #[cfg(test)]
-pub(crate) mod tests {
+pub(crate) mod fixtures {
+    /// What htl-villach answered for a whole year: twelve exams, every one of
+    /// them numbered 0. Two of them share a subject, a kind and a date's hour.
+    pub const EXAMS_ALL_ZERO: &str = r#"{"data":{"exams":[
+        {"id":0,"examType":"SA","name":"E1 (Englisch)","examDate":20261021,"startTime":800,"endTime":940,"subject":"E1","teachers":["WEK"],"rooms":["134"],"text":""},
+        {"id":0,"examType":"TE","name":"D (Deutsch)","examDate":20261104,"startTime":940,"endTime":1030,"subject":"D","text":"Theorie Kriminalliteratur"},
+        {"id":0,"examType":"TE","name":"DBI_1 (Datenbanken und Informationssysteme)","examDate":20261109,"startTime":1220,"endTime":1310,"subject":"DBI_1","text":"MAK"},
+        {"id":0,"examType":"TE","name":"BWM_1 (Betriebswirtschaft und Management)","examDate":20261110,"startTime":850,"endTime":940,"subject":"BWM_1","text":""},
+        {"id":0,"examType":"PLF","name":"WMC_1 (Webprogrammierung und Mobile Computing)","examDate":20261112,"startTime":800,"endTime":940,"subject":"WMC_1","text":"PLF"},
+        {"id":0,"examType":"TE","name":"NSCS_1 (Netzwerksysteme und Cyber Security)","examDate":20261116,"startTime":940,"endTime":1000,"subject":"NSCS_1","text":""},
+        {"id":0,"examType":"TE","name":"D (Deutsch)","examDate":20261118,"startTime":940,"endTime":1000,"subject":"D","text":"Inhalt Lektüre"},
+        {"id":0,"examType":"TE","name":"BWM_2 (Betriebswirtschaft und Management)","examDate":20261125,"startTime":1040,"endTime":1130,"subject":"BWM_2","text":""},
+        {"id":0,"examType":"SA","name":"AM (Angewandte Mathematik)","examDate":20261204,"startTime":800,"endTime":940,"subject":"AM","text":""},
+        {"id":0,"examType":"TE","name":"NSCS_1 (Netzwerksysteme und Cyber Security)","examDate":20261214,"startTime":940,"endTime":1000,"subject":"NSCS_1","text":""},
+        {"id":0,"examType":"SA","name":"D (Deutsch)","examDate":20261216,"startTime":940,"endTime":1130,"subject":"D","text":""},
+        {"id":0,"examType":"TE","name":"BWM_1 (Betriebswirtschaft und Management)","examDate":20270112,"startTime":850,"endTime":940,"subject":"BWM_1","text":""}
+    ]}}"#;
+
+    pub fn exams_all_zero() -> Vec<super::Exam> {
+        let envelope: super::ExamEnvelope = serde_json::from_str(EXAMS_ALL_ZERO).unwrap();
+        envelope.exams().into_iter().filter_map(|raw| raw.into_exam(super::DEFAULT_TZ)).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
     #[test]
     fn the_directory_is_read_into_what_the_form_wants() {
         let body = r#"{"result":{"schools":[
@@ -1502,27 +1534,7 @@ pub(crate) mod tests {
         assert_eq!(exams[0].id, 2);
     }
 
-    /// What htl-villach answered for a whole year: twelve exams, every one of
-    /// them numbered 0. Two of them share a subject, a kind and a date's hour.
-    pub(crate) const EXAMS_ALL_ZERO: &str = r#"{"data":{"exams":[
-        {"id":0,"examType":"SA","name":"E1 (Englisch)","examDate":20261021,"startTime":800,"endTime":940,"subject":"E1","teachers":["WEK"],"rooms":["134"],"text":""},
-        {"id":0,"examType":"TE","name":"D (Deutsch)","examDate":20261104,"startTime":940,"endTime":1030,"subject":"D","text":"Theorie Kriminalliteratur"},
-        {"id":0,"examType":"TE","name":"DBI_1 (Datenbanken und Informationssysteme)","examDate":20261109,"startTime":1220,"endTime":1310,"subject":"DBI_1","text":"MAK"},
-        {"id":0,"examType":"TE","name":"BWM_1 (Betriebswirtschaft und Management)","examDate":20261110,"startTime":850,"endTime":940,"subject":"BWM_1","text":""},
-        {"id":0,"examType":"PLF","name":"WMC_1 (Webprogrammierung und Mobile Computing)","examDate":20261112,"startTime":800,"endTime":940,"subject":"WMC_1","text":"PLF"},
-        {"id":0,"examType":"TE","name":"NSCS_1 (Netzwerksysteme und Cyber Security)","examDate":20261116,"startTime":940,"endTime":1000,"subject":"NSCS_1","text":""},
-        {"id":0,"examType":"TE","name":"D (Deutsch)","examDate":20261118,"startTime":940,"endTime":1000,"subject":"D","text":"Inhalt Lektüre"},
-        {"id":0,"examType":"TE","name":"BWM_2 (Betriebswirtschaft und Management)","examDate":20261125,"startTime":1040,"endTime":1130,"subject":"BWM_2","text":""},
-        {"id":0,"examType":"SA","name":"AM (Angewandte Mathematik)","examDate":20261204,"startTime":800,"endTime":940,"subject":"AM","text":""},
-        {"id":0,"examType":"TE","name":"NSCS_1 (Netzwerksysteme und Cyber Security)","examDate":20261214,"startTime":940,"endTime":1000,"subject":"NSCS_1","text":""},
-        {"id":0,"examType":"SA","name":"D (Deutsch)","examDate":20261216,"startTime":940,"endTime":1130,"subject":"D","text":""},
-        {"id":0,"examType":"TE","name":"BWM_1 (Betriebswirtschaft und Management)","examDate":20270112,"startTime":850,"endTime":940,"subject":"BWM_1","text":""}
-    ]}}"#;
-
-    pub(crate) fn exams_all_zero() -> Vec<super::Exam> {
-        let envelope: super::ExamEnvelope = serde_json::from_str(EXAMS_ALL_ZERO).unwrap();
-        envelope.exams().into_iter().filter_map(|raw| raw.into_exam(super::DEFAULT_TZ)).collect()
-    }
+    use super::fixtures::exams_all_zero;
 
     #[test]
     fn a_window_keeps_what_it_covers_and_no_more() {
@@ -1629,11 +1641,31 @@ pub(crate) mod tests {
         assert!(refusal(Some("LOCKED"), None).is_none());
         assert!(refusal(Some("LOCKED_ACCESS"), None).is_none());
         assert!(refusal(Some("TOO_MANY_LOGIN_ATTEMPTS"), None).is_none());
+        // Blocked for good is not locked for a while.
+        assert!(refusal(Some("BLOCKED"), None).is_some());
+        assert!(refusal(Some("USER_BLOCKED"), None).is_some());
         // A front page moved, a maintenance notice, or no answer at all.
         assert!(refusal(None, Some("https://htl-villach.webuntis.com/today")).is_none());
         assert!(refusal(None, Some("/maintenance.html")).is_none());
         assert!(refusal(Some("SUCCESS"), None).is_none());
         assert!(refusal(None, None).is_none());
+    }
+
+    #[test]
+    fn a_tokenless_login_is_told_for_what_it_is() {
+        use super::{NoToken, Rejected, login_failure};
+        let found = reqwest::StatusCode::FOUND;
+        let refused = login_failure(found, None, Some("/WebUntis/login.do?error=nomatch"));
+        assert!(refused.chain().any(|e| e.is::<Rejected>()));
+        for lock in ["LOCKED", "LOCKED_ACCESS", "TOO_MANY_LOGIN_ATTEMPTS"] {
+            let locked = login_failure(reqwest::StatusCode::OK, Some(lock), None);
+            assert!(
+                !locked.chain().any(|e| e.is::<Rejected>() || e.is::<NoToken>()),
+                "{lock} is waited out, and must not count toward a refusal"
+            );
+        }
+        let unclear = login_failure(found, None, Some("/WebUntis/"));
+        assert!(unclear.chain().any(|e| e.is::<NoToken>()), "a bare redirect is counted");
     }
 
     #[test]

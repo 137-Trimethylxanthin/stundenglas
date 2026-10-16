@@ -110,6 +110,9 @@ pub struct Words {
     pub try_this_one: &'static str,
     pub try_stored: &'static str,
     pub try_stored_hint: &'static str,
+    pub retry_refused: &'static str,
+    pub retry_unreachable: &'static str,
+    pub form_unreadable: &'static str,
     pub untis_password: &'static str,
     pub lessons: &'static str,
     pub exams: &'static str,
@@ -226,6 +229,10 @@ pub static ENGLISH: Words = Words {
     try_stored: "Try the saved password once more",
     try_stored_hint: "If you have not changed it, the school may only have been briefly refusing \
                       logins. This tries it a single time.",
+    retry_refused: "The school refused the saved password again. Enter the current one below.",
+    retry_unreachable: "The school could not be reached just now, so nothing was changed. Try again \
+                        in a while.",
+    form_unreadable: "That form could not be read; reload the page and try again.",
     untis_password: "WebUntis password",
     lessons: "lessons",
     exams: "exams",
@@ -352,6 +359,11 @@ pub static GERMAN: Words = Words {
     try_stored: "Gespeichertes Passwort noch einmal versuchen",
     try_stored_hint: "Wenn du es nicht geändert hast, hat die Schule Anmeldungen vielleicht nur \
                       kurz abgelehnt. Das versucht es genau ein Mal.",
+    retry_refused: "Die Schule hat das gespeicherte Passwort wieder abgelehnt. Gib unten das \
+                    aktuelle ein.",
+    retry_unreachable: "Die Schule war gerade nicht erreichbar, darum wurde nichts geändert. \
+                        Versuch es später noch einmal.",
+    form_unreadable: "Das Formular war nicht lesbar; lade die Seite neu und versuch es noch einmal.",
     untis_password: "WebUntis-Passwort",
     lessons: "Stunden",
     exams: "Schularbeiten",

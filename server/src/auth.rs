@@ -214,22 +214,40 @@ pub fn cookie_for(token: String, secure: bool) -> Cookie<'static> {
 /// Carries a sign-in that has passed the password but not yet the key. Short
 /// lived, and replaced by the real session the moment the key answers.
 pub fn pending_cookie(token: String, secure: bool) -> Cookie<'static> {
-    let mut cookie = Cookie::new(PENDING, token);
-    cookie.set_http_only(true);
-    cookie.set_same_site(SameSite::Lax);
-    cookie.set_path("/");
-    cookie.set_secure(secure);
-    cookie.set_max_age(time::Duration::minutes(10));
-    cookie
+    brief(PENDING, token, time::Duration::minutes(10), secure)
+}
+
+/// Where to go once signed in: the refused link a calendar's red notice
+/// pointed at. Only its id is kept, so it can never send anyone elsewhere.
+pub const RETURN_TO: &str = "sg_return";
+
+pub fn return_cookie(account: uuid::Uuid, secure: bool) -> Cookie<'static> {
+    brief(RETURN_TO, account.to_string(), time::Duration::minutes(15), secure)
+}
+
+pub fn return_gone(secure: bool) -> Cookie<'static> {
+    brief(RETURN_TO, String::new(), time::Duration::ZERO, secure)
 }
 
 pub fn pending_gone(secure: bool) -> Cookie<'static> {
-    let mut cookie = Cookie::new(PENDING, "");
+    brief(PENDING, String::new(), time::Duration::ZERO, secure)
+}
+
+/// A cookie that only carrieth a step from one page to the next: unreadable
+/// by script, sent only to this site, and gone in minutes — or at once, with
+/// a lifetime of nought.
+fn brief(
+    name: &'static str,
+    value: String,
+    lasts: time::Duration,
+    secure: bool,
+) -> Cookie<'static> {
+    let mut cookie = Cookie::new(name, value);
     cookie.set_http_only(true);
     cookie.set_same_site(SameSite::Lax);
     cookie.set_path("/");
     cookie.set_secure(secure);
-    cookie.set_max_age(time::Duration::seconds(0));
+    cookie.set_max_age(lasts);
     cookie
 }
 

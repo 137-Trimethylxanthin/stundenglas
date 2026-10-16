@@ -359,7 +359,7 @@ pub fn push(
         // whatever day it was last put — which need not lie in this window,
         // and must come down even on a round that pusheth nothing else.
         if want.relogin.is_none() && link.notice_shown {
-            let notice = crate::post::relogin_notice(
+            let notice = crate::relogin::notice(
                 &state.config.public_url,
                 account.id,
                 account.timezone,
@@ -376,6 +376,16 @@ pub fn push(
         // far likelier a school answering emptily for a moment than a year of
         // free days; reconciled against it, every lesson would be deleted.
         if want.lessons.is_empty() {
+            // Nothing safe to reconcile against — but a notice wanteth no
+            // reconciling: it alone goeth up, and nothing is taken down.
+            if let Some(notice) =
+                want.relogin.as_ref().and_then(|n| gcal::desired_of_relogin(n, account.timezone))
+            {
+                let plan = gcal::Plan { inserts: vec![notice], ..Default::default() };
+                let tally = calendar.apply(&id, &plan, 1).await?;
+                mark_pushed(&state, account.id, true).await?;
+                return Ok(Some(tally));
+            }
             tracing::warn!(account = %account.id, "no lessons; Google left as it was");
             return Ok(None);
         }
@@ -397,16 +407,22 @@ pub fn push(
         let plan = gcal::plan(&want, &existing, account.timezone);
         let tally = calendar.apply(&id, &plan, 6).await?;
 
-        sqlx::query(
-            "update google_links set last_push_at = now(), notice_shown = $2
-              where untis_account_id = $1",
-        )
-        .bind(account.id)
-        .bind(want.relogin.is_some())
-        .execute(&state.pool)
-        .await?;
+        mark_pushed(&state, account.id, want.relogin.is_some()).await?;
         Ok(Some(tally))
     })
+}
+
+/// A push that went through, and whether the red notice is now up.
+async fn mark_pushed(state: &AppState, account: Uuid, notice_shown: bool) -> Result<()> {
+    sqlx::query(
+        "update google_links set last_push_at = now(), notice_shown = $2
+          where untis_account_id = $1",
+    )
+    .bind(account)
+    .bind(notice_shown)
+    .execute(&state.pool)
+    .await?;
+    Ok(())
 }
 
 fn urlencoding(raw: &str) -> String {

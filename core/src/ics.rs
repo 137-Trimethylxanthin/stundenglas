@@ -602,7 +602,7 @@ mod tests {
 
     #[test]
     fn exams_numbered_zero_each_get_an_entry() {
-        let exams = crate::untis::tests::exams_all_zero();
+        let exams = crate::untis::fixtures::exams_all_zero();
         let out = Feed::default().render(
             &Timetable { exams, ..Default::default() },
             Utc.with_ymd_and_hms(2026, 10, 16, 12, 0, 0).unwrap(),

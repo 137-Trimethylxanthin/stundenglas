@@ -46,12 +46,7 @@ async fn remind_the_refused(state: &AppState) {
         }
     };
     for (account, mut cached, window) in refused {
-        // No lessons cached to keep beside it, and a calendar reconciled
-        // against none is a calendar emptied; `push` would refuse it too.
-        if cached.lessons.is_empty() {
-            continue;
-        }
-        cached.relogin = Some(crate::post::relogin_notice(
+        cached.relogin = Some(crate::relogin::notice(
             &state.config.public_url,
             account.id,
             account.timezone,
@@ -84,6 +79,7 @@ pub async fn once(state: AppState) -> Result<usize> {
         tasks.spawn(async move {
             let _permit = permits.acquire_owned().await;
             let id = entry.account.id;
+            let streak = entry.no_token_streak;
             match fetch_one(state.clone(), entry).await {
                 Ok(count) => {
                     tracing::info!(account = %id, lessons = count, "refreshed");
@@ -93,7 +89,15 @@ pub async fn once(state: AppState) -> Result<usize> {
                     // A refused password and an unreachable school want
                     // opposite answers: one must stop before the school locks
                     // the account, the other should be tried again shortly.
-                    let kind = if untis::was_rejected(&err) {
+                    let kind = judge(&err, streak);
+                    let why = match kind {
+                        Failure::Rejected if !untis::was_rejected(&err) => format!(
+                            "{err:#} — {NO_TOKEN_LIMIT} times in a row, so taken for a refused \
+                             password"
+                        ),
+                        _ => format!("{err:#}"),
+                    };
+                    if matches!(kind, Failure::Rejected) {
                         tracing::warn!(account = %id, "login refused; waiting for a new password");
                         // Nobody is looking at the page when this happens, and
                         // nothing refreshes until they do something about it.
@@ -106,13 +110,10 @@ pub async fn once(state: AppState) -> Result<usize> {
                             )
                             .await;
                         }
-                        Failure::Rejected
                     } else {
                         tracing::warn!(account = %id, "refresh failed: {err:#}");
-                        Failure::Transient
-                    };
-                    let _ =
-                        crate::db::store_failure(&state.pool, id, format!("{err:#}"), kind).await;
+                    }
+                    let _ = crate::db::store_failure(&state.pool, id, why, kind).await;
                     false
                 }
             }
@@ -126,6 +127,28 @@ pub async fn once(state: AppState) -> Result<usize> {
         }
     }
     Ok(done)
+}
+
+/// How many logins in a row may yield no token before it is taken for a
+/// refused password. With the backoff that is about an hour and a quarter:
+/// long enough to outlast a school's hiccup, short enough to stop well before
+/// WebUntis would lock the account.
+const NO_TOKEN_LIMIT: i32 = 4;
+
+/// What a failed refresh is, given how many tokenless logins came before it.
+///
+/// A refused password and an unreachable school want opposite answers: one
+/// must stop before the school locks the account, the other should be tried
+/// again shortly. A login that yieldeth nothing, again and again, is the
+/// former in disguise.
+fn judge(err: &anyhow::Error, streak_before: i32) -> Failure {
+    if untis::was_rejected(err) {
+        Failure::Rejected
+    } else if untis::got_no_token(err) {
+        if streak_before + 1 >= NO_TOKEN_LIMIT { Failure::Rejected } else { Failure::Tokenless }
+    } else {
+        Failure::Transient
+    }
 }
 
 /// A link that has been failing for a day is worth a word. A refused password
@@ -266,6 +289,24 @@ fn fingerprint(got: &Timetable) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_login_that_keeps_yielding_nothing_is_in_the_end_a_refusal() {
+        let tokenless = || anyhow::Error::new(untis::NoToken("no usable bearer token".into()));
+        assert!(matches!(judge(&tokenless(), 0), Failure::Tokenless), "once is a hiccup");
+        assert!(matches!(judge(&tokenless(), NO_TOKEN_LIMIT - 2), Failure::Tokenless));
+        assert!(
+            matches!(judge(&tokenless(), NO_TOKEN_LIMIT - 1), Failure::Rejected),
+            "the last allowed is taken for a refusal"
+        );
+        let outage = anyhow::anyhow!("connection timed out").context("reaching WebUntis");
+        assert!(
+            matches!(judge(&outage, NO_TOKEN_LIMIT + 5), Failure::Transient),
+            "an unreachable school is never a refused password"
+        );
+        let refused = anyhow::Error::new(untis::Rejected("sent back to the login page".into()));
+        assert!(matches!(judge(&refused, 0), Failure::Rejected));
+    }
 
     #[test]
     fn a_room_changed_for_an_exam_is_a_changed_feed() {

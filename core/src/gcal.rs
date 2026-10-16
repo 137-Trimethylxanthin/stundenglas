@@ -399,11 +399,8 @@ pub fn desired_of(lesson: &Lesson, zone: Tz) -> Desired {
         "start": { "dateTime": start, "timeZone": zone.name() },
         "end": { "dateTime": end, "timeZone": zone.name() },
         "transparency": transparency,
-        "reminders": { "useDefault": false, "overrides": [] },
-        "extendedProperties": { "private": { "source": MARKER } },
-        // An id Google once deleted cometh back cancelled unless told otherwise.
-        "status": "confirmed",
     });
+    ours(&mut body);
     if let Some(colour) = colour {
         body["colorId"] = json!(colour);
     }
@@ -420,6 +417,15 @@ pub fn desired_of(lesson: &Lesson, zone: Tz) -> Desired {
     body["extendedProperties"]["private"]["fp"] = json!(fingerprint);
 
     Desired { id: lesson.event_id(), summary, start: lesson.start, body }
+}
+
+/// What every event of ours carrieth, whatever it is: no reminders of
+/// Google's own, the mark that maketh it ours to touch, and `confirmed` — an
+/// id Google once deleted cometh back cancelled unless told otherwise.
+fn ours(body: &mut Value) {
+    body["reminders"] = json!({ "useDefault": false, "overrides": [] });
+    body["extendedProperties"] = json!({ "private": { "source": MARKER } });
+    body["status"] = json!("confirmed");
 }
 
 /// An exam, which is a timed event like a lesson but louder.
@@ -439,11 +445,8 @@ pub fn desired_of_exam(exam: &crate::Exam, zone: Tz) -> Desired {
         "end": { "dateTime": end, "timeZone": zone.name() },
         "transparency": "opaque",
         "colorId": COLOUR_EXAM,
-        "reminders": { "useDefault": false, "overrides": [] },
-        "extendedProperties": { "private": { "source": MARKER } },
-        // An id Google once deleted cometh back cancelled unless told otherwise.
-        "status": "confirmed",
     });
+    ours(&mut body);
     let fingerprint =
         fingerprint_of(&[&summary, &description, &location, &start, &end, COLOUR_EXAM]);
     body["extendedProperties"]["private"]["fp"] = json!(fingerprint);
@@ -474,11 +477,8 @@ fn desired_all_day(
         // A day marked is not a day occupied: neither should block an hour.
         "transparency": "transparent",
         "colorId": colour,
-        "reminders": { "useDefault": false, "overrides": [] },
-        "extendedProperties": { "private": { "source": MARKER } },
-        // An id Google once deleted cometh back cancelled unless told otherwise.
-        "status": "confirmed",
     });
+    ours(&mut body);
     let fingerprint = fingerprint_of(&[&summary, &description, &first, &after, colour]);
     body["extendedProperties"]["private"]["fp"] = json!(fingerprint);
 
@@ -529,11 +529,8 @@ pub fn desired_of_relogin(notice: &crate::Relogin, zone: Tz) -> Option<Desired> 
         "end": { "dateTime": end, "timeZone": zone.name() },
         "transparency": "opaque",
         "colorId": COLOUR_NOTICE,
-        "reminders": { "useDefault": false, "overrides": [] },
-        "extendedProperties": { "private": { "source": MARKER } },
-        // An id Google once deleted cometh back cancelled unless told otherwise.
-        "status": "confirmed",
     });
+    ours(&mut body);
     let fingerprint = fingerprint_of(&[&summary, &description, &start, &end, COLOUR_NOTICE]);
     body["extendedProperties"]["private"]["fp"] = json!(fingerprint);
     Some(Desired { id: notice.event_id(), summary, start: from, body })
@@ -776,26 +773,6 @@ mod tests {
         let again = plan(&want, &existing, crate::DEFAULT_TZ);
         assert!(again.is_empty(), "a settled calendar should be left alone");
         assert_eq!(again.unchanged, 3);
-    }
-
-    #[test]
-    fn the_span_covers_the_whole_day_entries_too() {
-        // A holiday beyond the last lesson must widen the window, or it would
-        // be written once and never reconciled again.
-        let want = Timetable {
-            holidays: vec![Holiday {
-                id: 1,
-                name: "Sommer".into(),
-                start: chrono::NaiveDate::from_ymd_opt(2027, 7, 5).unwrap(),
-                end: chrono::NaiveDate::from_ymd_opt(2027, 9, 1).unwrap(),
-            }],
-            ..Default::default()
-        };
-        let (first, last) = want.span(crate::DEFAULT_TZ).expect("a span");
-        assert_eq!(first.format("%Y-%m-%d").to_string(), "2027-07-05");
-        assert_eq!(last.format("%Y-%m-%d").to_string(), "2027-09-02", "the day after the last");
-
-        assert!(Timetable::default().span(crate::DEFAULT_TZ).is_none(), "nothing spans nothing");
     }
 
     use super::*;

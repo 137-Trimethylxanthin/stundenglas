@@ -21,12 +21,33 @@ OIDC provider alongside):
 POST /WebUntis/j_spring_security_check
      school=<school>&j_username=…&j_password=…&token=
 
-  → 302 Location: /WebUntis/index.do      success
+  → 302 Location: /WebUntis/index.do      success (2027.2.1)
   → 302 back to the login page            bad credentials
   → JSON {"state":"TOKEN_REQUIRED"}       TOTP is enabled on the account
 ```
 
 This sets `JSESSIONID`, which idles out after 1800 s.
+
+**Do not judge the login by where it redirects.** By 2027.3.1 a successful
+login is sent to `/WebUntis/` or to the new front page `/today`, not
+`index.do`. Reading "anything but `index.do`" as bad credentials once stopped a
+working password in production (`it sent us back to /WebUntis/`, thirty minutes
+after a good sync with the same password). The reliable test is the next step:
+`GET /WebUntis/api/token/new` answers a JWT only to a session that is logged in.
+Only when no token comes back is the login's own answer weighed:
+
+| Answer, with no token                         | Read as                    | Seen? |
+|-----------------------------------------------|----------------------------|-------|
+| 302 to a page whose path has `login`/`error`  | refused                    | 2027.2.1 |
+| `state: TOKEN_REQUIRED`                       | refused (a code we cannot give) | 2027.2.1 |
+| `state: LOCKED…`, `…TOO_MANY…`                | locked for a while: wait   | names from the 2027.3.1 bundle, not seen live |
+| `state: TWO_FACTOR_AUTHENTICATION_*`, `EXPIRED`, any other | refused        | names from the bundle, not seen live |
+| a redirect anywhere else, or nothing          | unclear: try again later   | — |
+
+What a wrong password looks like on 2027.3.1 has **not** been captured. If it
+is a bare redirect to `/WebUntis/`, it is indistinguishable from the success
+case above until `token/new` refuses; so an unclear answer is retried on the
+backoff and taken for a refusal after four in a row, well before a lock.
 
 ### The bearer token, and a misleading 404
 

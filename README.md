@@ -36,7 +36,15 @@ It is deliberately more careful than the export WebUntis itself would give you:
 | **Holidays** | so an empty week reads as a holiday rather than as a week nobody fetched |
 | **Several schools** | one account may link many, each with its own timezone |
 
-Markers: ❌ cancelled · ⚠️ changed · 📌 event · 📝 exam · 📚 homework · 🌴 holiday.
+Markers: ❌ cancelled · ⚠️ changed · 📌 event · 📝 exam · 📚 homework · 🌴 holiday ·
+🔴 sign in again.
+
+While the school refuses the stored login, the calendar says so where it will
+be seen: one red block from eight until four on *today*, linking to the place
+to sign in again. It keeps one id, so it moves each morning instead of piling
+up, and it goes as soon as the login works. It is shown whatever the link's
+settings are. Red is `COLOR:red` where a client honours it; the 🔴 carries it
+where one does not.
 
 Every link carries its own settings — what to call it, how often calendars are
 asked to look again, whether cancelled hours stay, whether exams ring, and
@@ -55,8 +63,8 @@ Google refreshes a subscribed URL on its own schedule — often many hours, and
 not adjustable. iOS lets you pick fifteen minutes. If you want minute-fresh
 updates in Google itself, connect your account and events are written through
 the API the moment we see a change, into a secondary calendar of its own. It
-carries what the link carries — lessons, exams, homework and holidays — and
-touches only events it made.
+carries what the link carries — lessons, exams, homework, holidays and the red
+sign-in notice — and touches only events it made.
 
 That is optional, and the server offers it only when a Google OAuth **web**
 client is configured (`GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`, with
@@ -200,11 +208,17 @@ Three details do most of the work:
 - **An ETag per feed.** It covers the timetable *and* the link's own settings,
   so an unchanged feed answers `304` and costs nothing — and a setting you just
   changed is not hidden behind a `304` until the school next moves a lesson.
-- **Backoff.** A password the school refuses is not offered again: WebUntis
-  locks an account that is tried too often, and a locked school account is not
-  something this can give back. The link is disabled until its owner enters a
-  new one. A school that is merely unreachable waits five minutes, then ten,
-  then twenty, to a ceiling of six hours.
+- **Backoff.** A password the school refuses is not offered again on its own:
+  WebUntis locks an account that is tried too often, and a locked school
+  account is not something this can give back. The link stops until its owner
+  acts — by entering a new password, by linking the same school again, or by
+  pressing *try the saved password once more*, which is a single login tried
+  on the spot and lifts the refusal only if it works. A school that is merely
+  unreachable, or that says the account is locked for a while, waits five
+  minutes, then ten, then twenty, to a ceiling of six hours. A login that
+  yields no token and no plain answer is retried the same way, but four of
+  those in a row are taken for a refused password: a wrong password in a shape
+  not yet seen must not be replayed until the school locks the account.
 - **Retention.** A timetable nobody has refreshed in `KEEP_DAYS` is forgotten,
   being stale and still somebody's whereabouts.
 

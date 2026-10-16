@@ -374,6 +374,15 @@ pub struct Prefill {
     server: String,
     #[serde(default)]
     school: String,
+    /// Set by a calendar's red notice: the refused link it is about.
+    #[serde(default)]
+    relogin: String,
+}
+
+/// The link a notice or a remembered return pointeth at, if it is one: a
+/// UUID and nothing else, so no value of it can lead off this site.
+fn return_target(raw: &str) -> Option<Uuid> {
+    raw.trim().parse().ok()
 }
 
 pub async fn index(
@@ -384,9 +393,27 @@ pub async fn index(
 ) -> Response {
     let lang = Lang::of(&jar, &headers);
     let w = lang.words();
+    let secure = state.config.public_url.starts_with("https");
     match current(&state, &jar).await {
-        Some(user) => dashboard_with(state, user, None, chosen, lang).await,
-        None => page(lang, w.sign_in, None, front(w)).into_response(),
+        Some(user) => {
+            // Signed in on the way from a notice: the fragment that would
+            // have found the password field was lost to the sign-in form, so
+            // it is given back here, once.
+            if let Some(account) = jar.get(auth::RETURN_TO).and_then(|c| return_target(c.value())) {
+                let jar = jar.add(auth::return_gone(secure));
+                return (jar, Redirect::to(&format!("/#pw-{account}"))).into_response();
+            }
+            dashboard_with(state, user, None, chosen, lang).await
+        }
+        None => {
+            let shown = page(lang, w.sign_in, None, front(w));
+            match return_target(&chosen.relogin) {
+                Some(account) => {
+                    (jar.add(auth::return_cookie(account, secure)), shown).into_response()
+                }
+                None => shown.into_response(),
+            }
+        }
     }
 }
 
@@ -781,10 +808,10 @@ pub async fn feed_settings(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let Ok(form) = serde_urlencoded::from_bytes::<FeedForm>(&body) else {
-        return (StatusCode::UNPROCESSABLE_ENTITY, "that form could not be read").into_response();
-    };
     let lang = Lang::of(&jar, &headers);
+    let Ok(form) = serde_urlencoded::from_bytes::<FeedForm>(&body) else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, lang.words().form_unreadable).into_response();
+    };
     let Some(user) = current(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
@@ -1297,10 +1324,11 @@ async fn try_again_now(state: &AppState, user: Uuid, account: Uuid) {
 
 /// `POST /links/{id}/retry`
 ///
-/// The stored password, tried once more without retyping it. Lifting the
-/// refusal and refreshing at once is a single login, the same one a new
-/// password would cost; refused again, the link is stopped again by the very
-/// same path, so no loop of guesses can come of it.
+/// The stored password, tried once more without retyping it — tried here and
+/// now, before anything is changed. Only a login that worketh lifteth the
+/// refusal; one refused again, or one that could not be made at all, leaveth
+/// the link exactly as it was and saith which. One click, one login: no loop
+/// of guesses can come of it.
 pub async fn retry_password(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1308,16 +1336,43 @@ pub async fn retry_password(
     headers: HeaderMap,
 ) -> Response {
     let lang = Lang::of(&jar, &headers);
+    let w = lang.words();
     let Some(user) = current(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
-    match db::lift_refusal(&state.pool, user.id, account).await {
-        Ok(false) => (StatusCode::NOT_FOUND, "no such school").into_response(),
-        Ok(true) => {
-            try_again_now(&state, user.id, account).await;
-            Redirect::to("/").into_response()
+    let entry = match db::refused_account(&state.pool, &state.config.sealer, user.id, account).await
+    {
+        Ok(Some(entry)) => entry,
+        // Not theirs, not refused, or gone: say nothing either way.
+        Ok(None) => return (StatusCode::NOT_FOUND, "no such school").into_response(),
+        Err(err) => return dashboard(state, user, Some(format!("{err}")), lang).await,
+    };
+
+    let tried = async {
+        let mut client = stundenglas_core::untis::Client::new(entry.credentials)?;
+        client.login().await
+    }
+    .await;
+    match tried {
+        Ok(()) => match db::lift_refusal(&state.pool, user.id, account).await {
+            Ok(_) => {
+                try_again_now(&state, user.id, account).await;
+                Redirect::to("/").into_response()
+            }
+            Err(err) => dashboard(state, user, Some(format!("{err}")), lang).await,
+        },
+        // No token, once, after a refusal already on record, is that refusal
+        // again far likelier than a hiccup.
+        Err(err)
+            if stundenglas_core::untis::was_rejected(&err)
+                || stundenglas_core::untis::got_no_token(&err) =>
+        {
+            dashboard(state, user, Some(w.retry_refused.to_owned()), lang).await
         }
-        Err(err) => dashboard(state, user, Some(format!("{err}")), lang).await,
+        Err(err) => {
+            tracing::warn!(account = %account, "retrying the saved password failed: {err:#}");
+            dashboard(state, user, Some(w.retry_unreachable.to_owned()), lang).await
+        }
     }
 }
 
@@ -2216,5 +2271,17 @@ mod feed_form_tests {
         let form: super::FeedForm = serde_urlencoded::from_bytes(body).unwrap();
         assert_eq!(form.remind_before_minutes, None);
         assert!(super::hidden_subjects(body).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod return_tests {
+    #[test]
+    fn only_a_link_id_is_a_place_to_return_to() {
+        let id = "0b8f5c2e-9a1d-4e7f-8a6b-3c2d1e0f9a8b";
+        assert_eq!(super::return_target(id).unwrap().to_string(), id);
+        for elsewhere in ["https://evil.example/", "//evil.example", "/admin", "", "x#pw-1"] {
+            assert!(super::return_target(elsewhere).is_none(), "{elsewhere} must lead nowhere");
+        }
     }
 }

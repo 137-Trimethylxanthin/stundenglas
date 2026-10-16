@@ -38,6 +38,27 @@ pub struct UntisAccount {
 pub struct AccountWithSecret {
     pub account: UntisAccount,
     pub credentials: Credentials,
+    /// Logins in a row that yielded no token, nought after any other outcome.
+    pub no_token_streak: i32,
+}
+
+/// The account in a row that selected it with `secret` and `nonce`, its
+/// password unsealed.
+fn with_secret(row: &PgRow, sealer: &Sealer) -> Result<AccountWithSecret> {
+    let account = account_from(row);
+    let sealed = Sealed { ciphertext: row.get("secret"), nonce: row.get("nonce") };
+    let password = sealer.unseal(&sealed)?;
+    Ok(AccountWithSecret {
+        credentials: Credentials {
+            server: account.server.clone(),
+            school: account.school.clone(),
+            user: account.username.clone(),
+            password,
+            timezone: account.timezone,
+        },
+        no_token_streak: row.try_get("no_token_streak").unwrap_or(0),
+        account,
+    })
 }
 
 fn account_from(row: &PgRow) -> UntisAccount {
@@ -101,11 +122,7 @@ pub async fn add_account(pool: &PgPool, sealer: &Sealer, new: &NewAccount) -> Re
     .await
     .context("storing the account")?;
     let account = account_from(&row);
-    sqlx::query("update sync_state set next_attempt_at = null where untis_account_id = $1")
-        .bind(account.id)
-        .execute(pool)
-        .await
-        .context("clearing the backoff")?;
+    clear_backoff(pool, account.id).await?;
     Ok(account)
 }
 
@@ -125,7 +142,8 @@ pub async fn accounts_of(pool: &PgPool, user_id: Uuid) -> Result<Vec<UntisAccoun
 pub async fn accounts_to_sync(pool: &PgPool, sealer: &Sealer) -> Result<Vec<AccountWithSecret>> {
     let rows = sqlx::query(
         "select a.id, a.server, a.school, a.username, a.display_name, a.enabled,
-                a.timezone, a.credentials_rejected, a.secret, a.nonce
+                a.timezone, a.credentials_rejected, a.secret, a.nonce,
+                coalesce(s.no_token_streak, 0) as no_token_streak
            from untis_accounts a
            left join sync_state s on s.untis_account_id = a.id
           where a.enabled
@@ -138,25 +156,39 @@ pub async fn accounts_to_sync(pool: &PgPool, sealer: &Sealer) -> Result<Vec<Acco
 
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
-        let account = account_from(row);
-        let sealed = Sealed { ciphertext: row.get("secret"), nonce: row.get("nonce") };
-        match sealer.unseal(&sealed) {
-            Ok(password) => out.push(AccountWithSecret {
-                credentials: Credentials {
-                    server: account.server.clone(),
-                    school: account.school.clone(),
-                    user: account.username.clone(),
-                    password,
-                    timezone: account.timezone,
-                },
-                account,
-            }),
+        match with_secret(row, sealer) {
+            Ok(entry) => out.push(entry),
             // A row sealed under a key we no longer hold. Say so once and
             // leave it be; better than failing the whole run.
-            Err(err) => tracing::error!(account = %account.id, "cannot unseal: {err:#}"),
+            Err(err) => {
+                let id: Uuid = row.get("id");
+                tracing::error!(account = %id, "cannot unseal: {err:#}");
+            }
         }
     }
     Ok(out)
+}
+
+/// One of this user's links that the school refused, ready to be tried
+/// again. None if it is not theirs, not refused, or not there.
+pub async fn refused_account(
+    pool: &PgPool,
+    sealer: &Sealer,
+    user_id: Uuid,
+    account: Uuid,
+) -> Result<Option<AccountWithSecret>> {
+    let row = sqlx::query(
+        "select id, server, school, username, display_name, enabled, timezone,
+                credentials_rejected, secret, nonce
+           from untis_accounts
+          where id = $1 and user_id = $2 and enabled and credentials_rejected",
+    )
+    .bind(account)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .context("looking up the refused link")?;
+    row.map(|row| with_secret(&row, sealer)).transpose()
 }
 
 pub async fn set_identity(
@@ -434,6 +466,7 @@ pub async fn store_sync(
                 last_error = null,
                 last_error_at = null,
                 consecutive_fails = 0,
+                no_token_streak = 0,
                 next_attempt_at = null",
     )
     .bind(account)
@@ -462,6 +495,9 @@ pub enum Failure {
     /// The school was unreachable, or answered something we could not read.
     /// Worth another go, but not immediately.
     Transient,
+    /// A login that yielded no token and no plain refusal: tried again like a
+    /// transient failure, but counted, since a run of them is a refusal.
+    Tokenless,
 }
 
 pub async fn store_failure(pool: &PgPool, account: Uuid, why: String, kind: Failure) -> Result<()> {
@@ -472,18 +508,22 @@ pub async fn store_failure(pool: &PgPool, account: Uuid, why: String, kind: Fail
     // ninety.
     sqlx::query(
         "insert into sync_state
-            (untis_account_id, last_error, last_error_at, consecutive_fails, next_attempt_at)
-         values ($1, $2, now(), 1, now() + interval '5 minutes')
+            (untis_account_id, last_error, last_error_at, consecutive_fails, next_attempt_at,
+             no_token_streak)
+         values ($1, $2, now(), 1, now() + interval '5 minutes', case when $3 then 1 else 0 end)
          on conflict (untis_account_id) do update
             set last_error = excluded.last_error,
                 last_error_at = now(),
                 consecutive_fails = sync_state.consecutive_fails + 1,
+                no_token_streak =
+                    case when $3 then sync_state.no_token_streak + 1 else 0 end,
                 next_attempt_at = now() + least(
                     interval '6 hours',
                     interval '5 minutes' * power(2, least(sync_state.consecutive_fails, 7)))",
     )
     .bind(account)
     .bind(&why)
+    .bind(matches!(kind, Failure::Tokenless))
     .execute(pool)
     .await?;
 
@@ -517,12 +557,19 @@ pub async fn lift_refusal(pool: &PgPool, user_id: Uuid, account: Uuid) -> Result
     if done.rows_affected() == 0 {
         return Ok(false);
     }
+    clear_backoff(pool, account).await?;
+    Ok(true)
+}
+
+/// Let a link be tried at the next round rather than after the backoff it
+/// earned: whoever lifted its trouble wanteth to know at once if it held.
+async fn clear_backoff(pool: &PgPool, account: Uuid) -> Result<()> {
     sqlx::query("update sync_state set next_attempt_at = null where untis_account_id = $1")
         .bind(account)
         .execute(pool)
         .await
         .context("clearing the backoff")?;
-    Ok(true)
+    Ok(())
 }
 
 /// A new password for a link the school refused. Re-sealing and clearing the
@@ -552,10 +599,7 @@ pub async fn replace_password(
 
     if done.rows_affected() > 0 {
         // Let it be tried at once rather than after the backoff it earned.
-        sqlx::query("update sync_state set next_attempt_at = null where untis_account_id = $1")
-            .bind(account)
-            .execute(pool)
-            .await?;
+        clear_backoff(pool, account).await?;
     }
     Ok(done.rows_affected() > 0)
 }

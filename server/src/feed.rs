@@ -52,7 +52,7 @@ pub async fn serve(
 
     // A refused password saith so in the calendar, on today's date.
     if payload.rejected {
-        payload.what.relogin = Some(crate::post::relogin_notice(
+        payload.what.relogin = Some(crate::relogin::notice(
             &state.config.public_url,
             payload.account,
             payload.timezone,
@@ -211,7 +211,7 @@ mod etag_tests {
     fn the_notice_changes_the_answer_and_so_does_each_new_day() {
         let quiet = payload(true, None);
         let notice = |day| {
-            crate::post::relogin_notice(
+            crate::relogin::notice(
                 "https://example.test",
                 Uuid::nil(),
                 stundenglas_core::DEFAULT_TZ,
