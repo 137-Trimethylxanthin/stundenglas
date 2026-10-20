@@ -244,6 +244,44 @@ pub fn within_limits(c: &Counts) -> bool {
     c.address_minute < 1 && c.address_day < 5 && c.ip_hour < 10 && c.all_day < 150
 }
 
+/// Whether a new account may be made: the same network and service-wide
+/// limits as the mail it will be sent, for an account no mail can follow is
+/// one that only the sweep will ever see. The address hath no count yet.
+pub fn room_for_account(c: &Counts) -> bool {
+    c.ip_hour < 10 && c.all_day < 150
+}
+
+/// May one more account be made for this caller? Read only: the mail that
+/// followeth taketh its own place, under the lock, as any other.
+pub async fn may_create_account(pool: &PgPool, ip: Option<IpAddr>) -> Result<bool> {
+    let seen = counts(pool, "", ip.map(|ip| bucket(ip).to_string())).await?;
+    Ok(room_for_account(&seen))
+}
+
+/// What hath been sent in the last day, to this address and this network.
+async fn counts<'e, E: sqlx::PgExecutor<'e>>(
+    ex: E,
+    email: &str,
+    ip: Option<String>,
+) -> Result<Counts> {
+    let (address_minute, address_day, ip_hour, all_day): (i64, i64, i64, i64) = sqlx::query_as(
+        "select
+            count(*) filter (where address = $1 and sent_at > now() - interval '1 minute'),
+            count(*) filter (where address = $1),
+            count(*) filter (where $2::inet is not null and ip = $2::inet
+                               and sent_at > now() - interval '1 hour'),
+            count(*)
+           from mail_sends
+          where sent_at > now() - interval '1 day'",
+    )
+    .bind(email)
+    .bind(&ip)
+    .fetch_one(ex)
+    .await
+    .context("counting recent mail")?;
+    Ok(Counts { address_minute, address_day, ip_hour, all_day })
+}
+
 fn mail_kind(kind: Token) -> &'static str {
     match kind {
         Token::Confirm => "confirm",
@@ -279,22 +317,7 @@ async fn reserve(
         .execute(&mut *tx)
         .await
         .context("taking the mail lock")?;
-    let (address_minute, address_day, ip_hour, all_day): (i64, i64, i64, i64) = sqlx::query_as(
-        "select
-            count(*) filter (where address = $1 and sent_at > now() - interval '1 minute'),
-            count(*) filter (where address = $1),
-            count(*) filter (where $2::inet is not null and ip = $2::inet
-                               and sent_at > now() - interval '1 hour'),
-            count(*)
-           from mail_sends
-          where sent_at > now() - interval '1 day'",
-    )
-    .bind(email)
-    .bind(&ip)
-    .fetch_one(&mut *tx)
-    .await
-    .context("counting recent mail")?;
-    let seen = Counts { address_minute, address_day, ip_hour, all_day };
+    let seen = counts(&mut *tx, email, ip.clone()).await?;
     if !within_limits(&seen) {
         if seen.all_day >= 150 {
             tracing::warn!(sent_today = seen.all_day, "the daily mail limit is reached");
@@ -378,7 +401,7 @@ async fn mint_and_send(
 
 #[cfg(test)]
 mod tests {
-    use super::{Counts, Notice, body, bucket, link_for, subject, within_limits};
+    use super::{Counts, Notice, body, bucket, link_for, room_for_account, subject, within_limits};
     use crate::auth::Token;
     use crate::words::Lang;
 
@@ -451,6 +474,20 @@ mod tests {
         assert!(!within_limits(&c(0, 0, 10, 0)));
         assert!(!within_limits(&c(0, 0, 0, 150)));
         assert!(within_limits(&c(0, 4, 9, 149)));
+    }
+
+    #[test]
+    fn a_new_account_heeds_the_network_and_the_service_but_not_the_address() {
+        let c = |address_minute, address_day, ip_hour, all_day| Counts {
+            address_minute,
+            address_day,
+            ip_hour,
+            all_day,
+        };
+        assert!(room_for_account(&c(0, 0, 9, 149)));
+        assert!(!room_for_account(&c(0, 0, 10, 0)), "a network over its hour maketh none");
+        assert!(!room_for_account(&c(0, 0, 0, 150)), "nor doth a service over its day");
+        assert!(room_for_account(&c(1, 5, 0, 0)), "a new address hath no count of its own");
     }
 
     #[test]

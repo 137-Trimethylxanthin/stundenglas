@@ -117,6 +117,7 @@ pub struct Words {
     pub set_new_password: &'static str,
     pub password_again: &'static str,
     pub password_too_short: &'static str,
+    pub password_too_long: &'static str,
     pub passwords_differ: &'static str,
     pub stale_title: &'static str,
     pub stale_confirm_body: &'static str,
@@ -270,6 +271,8 @@ pub static ENGLISH: Words = Words {
     set_new_password: "Set the new password",
     password_again: "The same password again",
     password_too_short: "That password is shorter than ten characters.",
+    password_too_long: "That password is too long to be kept: 72 bytes at most, which is fewer \
+                        letters if some are not plain ASCII.",
     passwords_differ: "The two passwords are not the same.",
     stale_title: "That link has run out",
     stale_confirm_body: "A link works once, for an hour. If you have confirmed already, simply \
@@ -278,8 +281,8 @@ pub static ENGLISH: Words = Words {
     ask_for_new: "Ask for a new link",
     password_changed: "Password changed. Sign in with the new one.",
     trouble_title: "That did not work",
-    trouble_body: "The account service could not be reached just now, and nothing was changed. \
-                   Try again shortly.",
+    trouble_body: "The account service did not answer as it should just now. Try again \
+                   shortly; if the link no longer works, ask for a new one from the front page.",
     unfinished_body: "Your address is confirmed, but the password could not be saved. Use \
                       \"Forgot your password?\" on the front page to choose one.",
 
@@ -438,6 +441,8 @@ pub static GERMAN: Words = Words {
     set_new_password: "Neues Passwort setzen",
     password_again: "Dasselbe Passwort noch einmal",
     password_too_short: "Das Passwort ist kürzer als zehn Zeichen.",
+    password_too_long: "Das Passwort ist zu lang, um gespeichert zu werden: höchstens 72 Bytes, \
+                        also weniger Zeichen, wenn Umlaute oder Sonderzeichen darin sind.",
     passwords_differ: "Die beiden Passwörter stimmen nicht überein.",
     stale_title: "Dieser Link ist abgelaufen",
     stale_confirm_body: "Ein Link gilt einmal, eine Stunde lang. Hast du schon bestätigt, melde \
@@ -446,8 +451,9 @@ pub static GERMAN: Words = Words {
     ask_for_new: "Neuen Link anfordern",
     password_changed: "Passwort geändert. Melde dich mit dem neuen an.",
     trouble_title: "Das hat nicht geklappt",
-    trouble_body: "Der Kontodienst war gerade nicht erreichbar, und es wurde nichts geändert. \
-                   Versuch es gleich noch einmal.",
+    trouble_body: "Der Kontodienst hat gerade nicht wie erwartet geantwortet. Versuch es gleich \
+                   noch einmal; funktioniert der Link nicht mehr, fordere auf der Startseite einen \
+                   neuen an.",
     unfinished_body: "Deine Adresse ist bestätigt, aber das Passwort konnte nicht gespeichert \
                       werden. Wähle über „Passwort vergessen?“ auf der Startseite eines.",
 

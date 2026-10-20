@@ -522,11 +522,16 @@ fn send_again_form(w: &'static Words) -> Markup {
     }
 }
 
-/// Two passwords that must be one, and long enough to be worth having.
-/// Counted in letters, not bytes, as sign-up counteth them.
+/// Two passwords that must be one, long enough to be worth having and short
+/// enough to be kept. The floor is counted in letters, as sign-up counteth
+/// it; the ceiling in bytes, for the account service hasheth bytes and
+/// refuseth past 72 — after the link is spent, were it not caught here.
 fn password_pair(a: &str, b: &str) -> Result<(), &'static str> {
     if a.chars().count() < 10 {
         return Err(TOO_SHORT);
+    }
+    if a.len() > 72 {
+        return Err(TOO_LONG);
     }
     if a != b {
         return Err(NOT_THE_SAME);
@@ -535,11 +540,16 @@ fn password_pair(a: &str, b: &str) -> Result<(), &'static str> {
 }
 
 const TOO_SHORT: &str = "too short";
+const TOO_LONG: &str = "too long";
 const NOT_THE_SAME: &str = "not the same";
 
 /// What `password_pair` refused, in the visitor's own tongue.
 fn pair_trouble(w: &'static Words, why: &str) -> &'static str {
-    if why == TOO_SHORT { w.password_too_short } else { w.passwords_differ }
+    match why {
+        TOO_SHORT => w.password_too_short,
+        TOO_LONG => w.password_too_long,
+        _ => w.passwords_differ,
+    }
 }
 
 /// How a link is faring, in the one word a badge has room for.
@@ -1503,7 +1513,15 @@ async fn enrol_by_mail(state: &AppState, raw: &str, ip: IpAddr, lang: Lang) -> a
     let user = match db::auth_user_by_email(&state.pool, &email).await? {
         Some((_, true)) => return Ok(()),
         Some((user, false)) => user,
-        None => auth::create_unconfirmed(state, &email).await?,
+        None => {
+            // An account no mail may follow is litter for the sweep; so the
+            // making heedeth the same network and daily limits as the mail.
+            if !crate::post::may_create_account(&state.pool, Some(ip)).await? {
+                tracing::info!("a new account was not made (a limit, most likely)");
+                return Ok(());
+            }
+            auth::create_unconfirmed(state, &email).await?
+        }
     };
     // Recorded again for one already waiting, in case the first time failed.
     people::on_signup(&state.pool, user, &email, &state.config.admin_emails).await?;
@@ -1849,7 +1867,17 @@ pub async fn reset(
     };
     if let Err(err) = auth::set_password(&state, who.user, &form.password).await {
         tracing::error!(user = %who.user, "a reset password was refused: {err:#}");
-        return say(lang, w.trouble_title, w.stale_reset_body);
+        return page(
+            lang,
+            w.trouble_title,
+            None,
+            html! {
+                h1 { (w.trouble_title) }
+                p.lede { (w.stale_reset_body) }
+                p { a href="/forgot" { (w.ask_for_new) } }
+            },
+        )
+        .into_response();
     }
     auth::close_all_sessions(&state.pool, who.user).await;
     tracing::info!(user = %who.user, "password reset by mail; every session closed");
@@ -2586,6 +2614,23 @@ mod page_tests {
         // Ten letters, not ten bytes: an umlaut is one character.
         assert!(super::password_pair("ääääääääää", "ääääääääää").is_ok());
         assert!(super::password_pair("äääää", "äääää").is_err());
+        // Past 72 bytes the account service refuseth it, after the link is spent.
+        let long = "a".repeat(73);
+        assert!(super::password_pair(&long, &long).is_err(), "73 bytes is past the limit");
+        let at_limit = "a".repeat(72);
+        assert!(super::password_pair(&at_limit, &at_limit).is_ok());
+        let umlauts = "ä".repeat(30);
+        assert!(super::password_pair(&umlauts, &umlauts).is_ok(), "30 letters, 60 bytes");
+        let many_umlauts = "ä".repeat(37);
+        assert!(
+            super::password_pair(&many_umlauts, &many_umlauts).is_err(),
+            "37 letters, 74 bytes"
+        );
+        assert_ne!(
+            super::password_pair(&long, &long),
+            super::password_pair("short", "short"),
+            "too long is not too short"
+        );
     }
 }
 
