@@ -132,6 +132,163 @@ pub async fn delete_user(state: &AppState, who: uuid::Uuid) -> Result<()> {
     Ok(())
 }
 
+// ----------------------------------------------------------------- tokens ---
+
+/// An address as we keep and compare it: trimmed, and in lower case.
+#[allow(dead_code)] // the sign-up and reset paths shall take it up
+pub fn normalise_address(raw: &str) -> String {
+    raw.trim().to_lowercase()
+}
+
+/// The two errands a one-time token may serve, named as GoTrue nameth them.
+#[allow(dead_code)] // the sign-up and reset paths shall take it up
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Token {
+    Confirm,
+    Reset,
+}
+
+impl Token {
+    #[allow(dead_code)] // the sign-up and reset paths shall take it up
+    fn gotrue_type(self) -> &'static str {
+        match self {
+            Token::Confirm => "magiclink",
+            Token::Reset => "recovery",
+        }
+    }
+}
+
+/// What came of spending a token.
+#[allow(dead_code)] // the sign-up and reset paths shall take it up
+pub enum Spent {
+    Good(Admitted),
+    Expired,
+}
+
+#[derive(Deserialize)]
+struct GoTrueCode {
+    #[serde(default)]
+    error_code: Option<String>,
+    #[serde(default)]
+    msg: Option<String>,
+}
+
+/// Doth this refusal from `/verify` mean the token is spent or stale, rather
+/// than the service being broken? Anything unreadable is taken as broken.
+#[allow(dead_code)] // used by `spend`
+fn verify_error_is_expired(body: &str) -> bool {
+    serde_json::from_str::<GoTrueCode>(body).is_ok_and(|e| {
+        e.error_code.as_deref() == Some("otp_expired")
+            || e.msg.is_some_and(|m| m.contains("invalid or has expired"))
+    })
+}
+
+/// Make an account that is not yet confirmed and hath no password, for the
+/// service key alone may do so. An address already taken is an error: the
+/// callers look first.
+#[allow(dead_code)] // the sign-up path shall take it up
+pub async fn create_unconfirmed(state: &AppState, email: &str) -> Result<Uuid> {
+    let reply = state
+        .http
+        .post(format!("{}/auth/v1/admin/users", state.config.supabase_url))
+        .header("apikey", &state.config.supabase_service_key)
+        .bearer_auth(&state.config.supabase_service_key)
+        .json(&serde_json::json!({ "email": email, "email_confirm": false }))
+        .send()
+        .await
+        .context("reaching the account service")?;
+    let status = reply.status();
+    let body = reply.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("{}", complain(&body, &format!("the account service refused to create ({status})")));
+    }
+    let user: GoTrueUser = serde_json::from_str(&body).context("reading the new account")?;
+    Ok(user.id)
+}
+
+/// Ask for a one-time token for an existing address. `None` when no such
+/// account is known.
+#[allow(dead_code)] // the sign-up and reset paths shall take it up
+pub async fn mint(state: &AppState, kind: Token, email: &str) -> Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Link {
+        hashed_token: String,
+    }
+    let reply = state
+        .http
+        .post(format!("{}/auth/v1/admin/generate_link", state.config.supabase_url))
+        .header("apikey", &state.config.supabase_service_key)
+        .bearer_auth(&state.config.supabase_service_key)
+        .json(&serde_json::json!({ "type": kind.gotrue_type(), "email": email }))
+        .send()
+        .await
+        .context("reaching the account service")?;
+    let status = reply.status();
+    let body = reply.text().await.unwrap_or_default();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        let unknown = serde_json::from_str::<GoTrueCode>(&body)
+            .is_ok_and(|e| e.error_code.as_deref() == Some("user_not_found"));
+        if unknown {
+            return Ok(None);
+        }
+    }
+    if !status.is_success() {
+        bail!("{}", complain(&body, &format!("the account service refused a token ({status})")));
+    }
+    let link: Link = serde_json::from_str(&body).context("reading the token")?;
+    Ok(Some(link.hashed_token))
+}
+
+/// Spend a token. It confirmeth the address and yieldeth a session; a second
+/// spending, or a stale token, is `Expired`.
+#[allow(dead_code)] // the confirm and reset pages shall take it up
+pub async fn spend(state: &AppState, kind: Token, token_hash: &str) -> Result<Spent> {
+    let reply = state
+        .http
+        .post(format!("{}/auth/v1/verify", state.config.supabase_url))
+        .header("apikey", &state.config.supabase_anon_key)
+        .json(&serde_json::json!({ "type": kind.gotrue_type(), "token_hash": token_hash }))
+        .send()
+        .await
+        .context("reaching the account service")?;
+    let status = reply.status();
+    let body = reply.text().await.unwrap_or_default();
+    if status.is_client_error() && verify_error_is_expired(&body) {
+        return Ok(Spent::Expired);
+    }
+    if !status.is_success() {
+        bail!("{}", complain(&body, &format!("the account service refused the token ({status})")));
+    }
+    let session: GoTrueSession = serde_json::from_str(&body).context("reading the session")?;
+    match (session.user, session.access_token) {
+        (Some(user), Some(token)) => Ok(Spent::Good(Admitted { user: user.id, gotrue: token })),
+        _ => bail!("no session came back"),
+    }
+}
+
+/// Set a person's password as the administrator, there being no old one.
+#[allow(dead_code)] // the confirm and reset pages shall take it up
+pub async fn set_password(state: &AppState, user: Uuid, password: &str) -> Result<()> {
+    let reply = state
+        .http
+        .put(format!("{}/auth/v1/admin/users/{user}", state.config.supabase_url))
+        .header("apikey", &state.config.supabase_service_key)
+        .bearer_auth(&state.config.supabase_service_key)
+        .json(&serde_json::json!({ "password": password }))
+        .send()
+        .await
+        .context("reaching the account service")?;
+    let status = reply.status();
+    if !status.is_success() {
+        let body = reply.text().await.unwrap_or_default();
+        bail!(
+            "{}",
+            complain(&body, &format!("the account service refused the password ({status})"))
+        );
+    }
+    Ok(())
+}
+
 // --------------------------------------------------------------- sessions ---
 
 fn hash(token: &str) -> Vec<u8> {
@@ -311,5 +468,24 @@ mod tests {
         assert_eq!(complain(r#"{"error_description":"nope"}"#, "x"), "nope");
         assert_eq!(complain("not json at all", "fallback"), "fallback");
         assert_eq!(complain("{}", "fallback"), "fallback");
+    }
+
+    #[test]
+    fn an_address_is_trimmed_and_lowercased() {
+        assert_eq!(normalise_address(" Max@Maxi.CO.at "), "max@maxi.co.at");
+    }
+
+    #[test]
+    fn an_expired_token_is_told_from_a_broken_service() {
+        assert!(verify_error_is_expired(
+            r#"{"code":403,"error_code":"otp_expired","msg":"Email link is invalid or has expired"}"#
+        ));
+        assert!(!verify_error_is_expired(r#"{"code":500,"msg":"boom"}"#));
+    }
+
+    #[test]
+    fn token_types() {
+        assert_eq!(Token::Confirm.gotrue_type(), "magiclink");
+        assert_eq!(Token::Reset.gotrue_type(), "recovery");
     }
 }
