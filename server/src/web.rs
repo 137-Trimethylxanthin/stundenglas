@@ -518,7 +518,7 @@ async fn dashboard_with(
     let w = lang.words();
     let me = people::profile(&state.pool, user.id).await;
     let admin = me.as_ref().is_some_and(|p| p.is_admin);
-    if !me.as_ref().is_some_and(|p| p.approved) {
+    if !me.as_ref().is_some_and(people::is_in) {
         return waiting_room(admin, lang);
     }
     let accounts = db::accounts_of(&state.pool, user.id).await.unwrap_or_default();
@@ -1517,7 +1517,7 @@ pub async fn add_link(
         return Redirect::to("/").into_response();
     };
 
-    if !people::profile(&state.pool, user.id).await.is_some_and(|p| p.approved) {
+    if !people::profile(&state.pool, user.id).await.is_some_and(|p| people::is_in(&p)) {
         return Redirect::to("/").into_response();
     }
     let Ok(timezone) = form.timezone.parse::<Tz>() else {
@@ -1561,7 +1561,7 @@ pub async fn new_feed(
     let Some(user) = current(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
-    if !people::profile(&state.pool, user.id).await.is_some_and(|p| p.approved)
+    if !people::profile(&state.pool, user.id).await.is_some_and(|p| people::is_in(&p))
         || !db::owns(&state.pool, user.id, account).await.unwrap_or(false)
     {
         return (StatusCode::NOT_FOUND, "no such school").into_response();

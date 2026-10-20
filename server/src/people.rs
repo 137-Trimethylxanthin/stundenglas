@@ -11,7 +11,17 @@ pub struct Profile {
     pub email: String,
     pub approved: bool,
     pub is_admin: bool,
+    pub banned_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+}
+
+/// The test of whether one is in, for a query that joins profiles as `p`.
+#[allow(dead_code)] // the admin and sign-up paths shall take it up
+pub const ADMITTED_SQL: &str = "p.approved and p.banned_at is null";
+
+/// One is in when approved and not banned; a ban outweigheth an approval.
+pub fn is_in(p: &Profile) -> bool {
+    p.approved && p.banned_at.is_none()
 }
 
 fn profile_from(row: &sqlx::postgres::PgRow) -> Profile {
@@ -20,6 +30,7 @@ fn profile_from(row: &sqlx::postgres::PgRow) -> Profile {
         email: row.try_get::<Option<String>, _>("email").ok().flatten().unwrap_or_default(),
         approved: row.get("approved"),
         is_admin: row.get("is_admin"),
+        banned_at: row.get("banned_at"),
         created_at: row.get("created_at"),
     }
 }
@@ -40,7 +51,7 @@ pub async fn on_signup(
             set email = excluded.email,
                 is_admin = profiles.is_admin or excluded.is_admin,
                 approved = profiles.approved or excluded.approved
-         returning user_id, email, approved, is_admin, created_at",
+         returning user_id, email, approved, is_admin, banned_at, created_at",
     )
     .bind(user)
     .bind(email)
@@ -53,7 +64,7 @@ pub async fn on_signup(
 
 pub async fn profile(pool: &PgPool, user: Uuid) -> Option<Profile> {
     let row = sqlx::query(
-        "select user_id, email, approved, is_admin, created_at from profiles where user_id = $1",
+        "select user_id, email, approved, is_admin, banned_at, created_at from profiles where user_id = $1",
     )
     .bind(user)
     .fetch_optional(pool)
@@ -65,7 +76,7 @@ pub async fn profile(pool: &PgPool, user: Uuid) -> Option<Profile> {
 /// Those waiting first, then the rest by when they arrived.
 pub async fn everyone(pool: &PgPool) -> Result<Vec<Profile>> {
     let rows = sqlx::query(
-        "select user_id, email, approved, is_admin, created_at from profiles
+        "select user_id, email, approved, is_admin, banned_at, created_at from profiles
           order by approved, created_at",
     )
     .fetch_all(pool)
@@ -89,4 +100,56 @@ pub async fn set_approved(pool: &PgPool, who: Uuid, by: Uuid, approved: bool) ->
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Let one in, and leave any ban as it lay.
+#[allow(dead_code)] // the admin and sign-up paths shall take it up
+pub async fn admit(pool: &PgPool, who: Uuid) -> Result<()> {
+    sqlx::query("update profiles set approved = true, approved_at = now() where user_id = $1")
+        .bind(who)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Bar one, or lift the bar. A ban also shutteth every open session. An admin
+/// may not be barred, and this doth nothing to one.
+#[allow(dead_code)] // the admin and sign-up paths shall take it up
+pub async fn set_banned(pool: &PgPool, who: Uuid, banned: bool) -> Result<()> {
+    let done = sqlx::query(
+        "update profiles
+            set banned_at = case when $2 then now() else null end
+          where user_id = $1 and not is_admin",
+    )
+    .bind(who)
+    .bind(banned)
+    .execute(pool)
+    .await?;
+    if banned && done.rows_affected() > 0 {
+        crate::auth::close_all_sessions(pool, who).await;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile(approved: bool, banned: bool) -> Profile {
+        Profile {
+            user_id: Uuid::nil(),
+            email: String::new(),
+            approved,
+            is_admin: false,
+            banned_at: banned.then(Utc::now),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn is_in_needs_approval_and_no_ban() {
+        assert!(is_in(&profile(true, false)));
+        assert!(!is_in(&profile(true, true)));
+        assert!(!is_in(&profile(false, false)));
+    }
 }

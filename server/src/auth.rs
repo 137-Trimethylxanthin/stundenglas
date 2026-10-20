@@ -196,6 +196,12 @@ pub async fn close_session(pool: &PgPool, token: &str) {
         .await;
 }
 
+/// Shut every session a person hath, as when they are banned.
+#[allow(dead_code)] // the admin and sign-up paths shall take it up
+pub async fn close_all_sessions(pool: &PgPool, user: Uuid) {
+    let _ = sqlx::query("delete from sessions where user_id = $1").bind(user).execute(pool).await;
+}
+
 /// Sweep away what hath expired, so the table doth not grow for ever.
 pub async fn sweep(pool: &PgPool) {
     let _ = sqlx::query("delete from sessions where expires_at < now()").execute(pool).await;
