@@ -16,7 +16,6 @@ pub struct Profile {
 }
 
 /// The test of whether one is in, for a query that joins profiles as `p`.
-#[allow(dead_code)] // the admin and sign-up paths shall take it up
 pub const ADMITTED_SQL: &str = "p.approved and p.banned_at is null";
 
 /// One is in when approved and not banned; a ban outweigheth an approval.

@@ -9,7 +9,10 @@ use sqlx::{PgPool, Row};
 use stundenglas_core::{Credentials, DEFAULT_TZ, Timetable};
 use uuid::Uuid;
 
+use std::sync::LazyLock;
+
 use crate::crypto::{Sealed, Sealer};
+use crate::people;
 
 pub async fn connect(url: &str) -> Result<PgPool> {
     PgPoolOptions::new()
@@ -138,21 +141,63 @@ pub async fn accounts_of(pool: &PgPool, user_id: Uuid) -> Result<Vec<UntisAccoun
     Ok(rows.iter().map(account_from).collect())
 }
 
-/// Every account the scheduler should refresh, with its password unsealed.
-pub async fn accounts_to_sync(pool: &PgPool, sealer: &Sealer) -> Result<Vec<AccountWithSecret>> {
-    let rows = sqlx::query(
+/// The queries that hand an account, or its calendar, to the world. Each
+/// joineth profiles and asketh whether the owner is in, that a ban may reach
+/// them all; they are built once, that the test may read what is really sent.
+static ACCOUNTS_TO_SYNC_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
         "select a.id, a.server, a.school, a.username, a.display_name, a.enabled,
                 a.timezone, a.credentials_rejected, a.secret, a.nonce,
                 coalesce(s.no_token_streak, 0) as no_token_streak
            from untis_accounts a
+           join profiles p on p.user_id = a.user_id
            left join sync_state s on s.untis_account_id = a.id
           where a.enabled
             and not a.credentials_rejected
+            and {}
             and (s.next_attempt_at is null or s.next_attempt_at <= now())
           order by a.created_at",
+        people::ADMITTED_SQL
     )
-    .fetch_all(pool)
-    .await?;
+});
+
+static REFUSED_TO_REMIND_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "select a.id, a.server, a.school, a.username, a.display_name, a.enabled,
+                a.timezone, a.credentials_rejected,
+                s.lessons, s.exams, s.homework, s.holidays, s.window_start, s.window_end
+           from untis_accounts a
+           join profiles p on p.user_id = a.user_id
+           join google_links g on g.untis_account_id = a.id
+           left join sync_state s on s.untis_account_id = a.id
+          where a.enabled and a.credentials_rejected
+            and {}
+            and (g.last_push_at is null
+                 or not g.notice_shown
+                 or (g.last_push_at at time zone a.timezone)::date
+                    < (now() at time zone a.timezone)::date)",
+        people::ADMITTED_SQL
+    )
+});
+
+static FEED_BY_TOKEN_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "select f.id, f.token, f.untis_account_id, f.keep_cancelled, f.refresh_minutes,
+                f.remind_before_minutes, f.with_homework, f.with_holidays, f.hide_subjects, f.label,
+                a.display_name, a.timezone, a.credentials_rejected,
+                s.lessons, s.exams, s.homework, s.holidays, s.etag, s.last_ok_at
+           from feeds f
+           join untis_accounts a on a.id = f.untis_account_id
+           join profiles p on p.user_id = a.user_id
+           left join sync_state s on s.untis_account_id = f.untis_account_id
+          where f.token = $1 and a.enabled and {}",
+        people::ADMITTED_SQL
+    )
+});
+
+/// Every account the scheduler should refresh, with its password unsealed.
+pub async fn accounts_to_sync(pool: &PgPool, sealer: &Sealer) -> Result<Vec<AccountWithSecret>> {
+    let rows = sqlx::query(ACCOUNTS_TO_SYNC_SQL.as_str()).fetch_all(pool).await?;
 
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -353,22 +398,10 @@ fn cached_timetable(row: &PgRow) -> Timetable {
 pub async fn refused_to_remind(
     pool: &PgPool,
 ) -> Result<Vec<(UntisAccount, Timetable, (NaiveDate, NaiveDate))>> {
-    let rows = sqlx::query(
-        "select a.id, a.server, a.school, a.username, a.display_name, a.enabled,
-                a.timezone, a.credentials_rejected,
-                s.lessons, s.exams, s.homework, s.holidays, s.window_start, s.window_end
-           from untis_accounts a
-           join google_links g on g.untis_account_id = a.id
-           left join sync_state s on s.untis_account_id = a.id
-          where a.enabled and a.credentials_rejected
-            and (g.last_push_at is null
-                 or not g.notice_shown
-                 or (g.last_push_at at time zone a.timezone)::date
-                    < (now() at time zone a.timezone)::date)",
-    )
-    .fetch_all(pool)
-    .await
-    .context("looking for refused links to remind")?;
+    let rows = sqlx::query(REFUSED_TO_REMIND_SQL.as_str())
+        .fetch_all(pool)
+        .await
+        .context("looking for refused links to remind")?;
     // The window the cache was fetched for, reaching to today at least so
     // that the notice falleth inside it.
     let today = Utc::now().date_naive();
@@ -387,19 +420,8 @@ pub async fn refused_to_remind(
 }
 
 pub async fn feed_by_token(pool: &PgPool, token: &str) -> Result<Option<FeedPayload>> {
-    let Some(row) = sqlx::query(
-        "select f.id, f.token, f.untis_account_id, f.keep_cancelled, f.refresh_minutes,
-                f.remind_before_minutes, f.with_homework, f.with_holidays, f.hide_subjects, f.label,
-                a.display_name, a.timezone, a.credentials_rejected,
-                s.lessons, s.exams, s.homework, s.holidays, s.etag, s.last_ok_at
-           from feeds f
-           join untis_accounts a on a.id = f.untis_account_id
-           left join sync_state s on s.untis_account_id = f.untis_account_id
-          where f.token = $1 and a.enabled",
-    )
-    .bind(token)
-    .fetch_optional(pool)
-    .await?
+    let Some(row) =
+        sqlx::query(FEED_BY_TOKEN_SQL.as_str()).bind(token).fetch_optional(pool).await?
     else {
         return Ok(None);
     };
@@ -968,4 +990,24 @@ pub async fn name_of(pool: &PgPool, account: Uuid) -> Result<Option<String>> {
         let username: String = r.get("username");
         format!("{school} ({username})")
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ban_gate_is_in_every_outward_query() {
+        for (name, sql) in [
+            ("accounts_to_sync", ACCOUNTS_TO_SYNC_SQL.as_str()),
+            ("refused_to_remind", REFUSED_TO_REMIND_SQL.as_str()),
+            ("feed_by_token", FEED_BY_TOKEN_SQL.as_str()),
+        ] {
+            assert!(sql.contains(people::ADMITTED_SQL), "{name} lacketh the gate");
+            assert!(
+                sql.contains("join profiles p on p.user_id = a.user_id"),
+                "{name} joineth not profiles"
+            );
+        }
+    }
 }
