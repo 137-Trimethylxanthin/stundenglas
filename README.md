@@ -128,7 +128,10 @@ links, WebUntis and Google. "Forgot your password?" sends a link by mail too.
 Mail is rationed: one a minute and five a day per address, ten an hour per
 network, and 150 a day in all. A sign-up never confirmed is forgotten after a
 week. Supabase must have `ENABLE_EMAIL_AUTOCONFIRM=false` when `SMTP_URL` is
-set, or it will confirm everyone itself.
+set, or it will confirm everyone itself. The per-network limit reads the
+caller's address from `cf-connecting-ip` or `x-real-ip`, so it only holds
+behind a proxy that sets them, as cloudflared does. A ban is kept against the
+address as well, so deleting the account and signing up again does not lift it.
 
 Name the administrators by address:
 
@@ -144,7 +147,8 @@ fetched.
 Without `SMTP_URL`, the old way holds: the password is chosen at sign-up, and a
 new account waits until an administrator lets it in, able to do nothing at all
 until then, not even add a school. Addresses in `ADMIN_EMAILS` are let in at
-once.
+once. Supabase's `ENABLE_EMAIL_AUTOCONFIRM` must then stay `true`, since
+nothing will ever send the link that would confirm an address.
 
 ### Security keys
 
