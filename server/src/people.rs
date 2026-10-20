@@ -102,7 +102,6 @@ pub async fn set_approved(pool: &PgPool, who: Uuid, by: Uuid, approved: bool) ->
 }
 
 /// Let one in, and leave any ban as it lay.
-#[allow(dead_code)] // the admin and sign-up paths shall take it up
 pub async fn admit(pool: &PgPool, who: Uuid) -> Result<()> {
     sqlx::query("update profiles set approved = true, approved_at = now() where user_id = $1")
         .bind(who)

@@ -326,7 +326,6 @@ async fn release(pool: &PgPool, id: i64) {
 /// Mint a token for this address and mail the link. False when nothing went:
 /// no mailer, a limit reached, or no such account (which the caller must not
 /// let the visitor tell apart from success).
-#[allow(dead_code)] // the sign-up and reset pages shall call it
 pub async fn send_token_mail(
     state: &AppState,
     kind: Token,

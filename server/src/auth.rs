@@ -135,13 +135,11 @@ pub async fn delete_user(state: &AppState, who: uuid::Uuid) -> Result<()> {
 // ----------------------------------------------------------------- tokens ---
 
 /// An address as we keep and compare it: trimmed, and in lower case.
-#[allow(dead_code)] // the sign-up and reset paths shall take it up
 pub fn normalise_address(raw: &str) -> String {
     raw.trim().to_lowercase()
 }
 
 /// The two errands a one-time token may serve, named as GoTrue nameth them.
-#[allow(dead_code)] // the sign-up and reset paths shall take it up
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Token {
     Confirm,
@@ -149,7 +147,6 @@ pub enum Token {
 }
 
 impl Token {
-    #[allow(dead_code)] // the sign-up and reset paths shall take it up
     fn gotrue_type(self) -> &'static str {
         match self {
             Token::Confirm => "magiclink",
@@ -159,7 +156,6 @@ impl Token {
 }
 
 /// What came of spending a token.
-#[allow(dead_code)] // the sign-up and reset paths shall take it up
 pub enum Spent {
     Good(Admitted),
     Expired,
@@ -175,7 +171,6 @@ struct GoTrueCode {
 
 /// Doth this refusal from `/verify` mean the token is spent or stale, rather
 /// than the service being broken? Anything unreadable is taken as broken.
-#[allow(dead_code)] // used by `spend`
 fn verify_error_is_expired(body: &str) -> bool {
     serde_json::from_str::<GoTrueCode>(body).is_ok_and(|e| {
         e.error_code.as_deref() == Some("otp_expired")
@@ -186,7 +181,6 @@ fn verify_error_is_expired(body: &str) -> bool {
 /// Make an account that is not yet confirmed and hath no password, for the
 /// service key alone may do so. An address already taken is an error: the
 /// callers look first.
-#[allow(dead_code)] // the sign-up path shall take it up
 pub async fn create_unconfirmed(state: &AppState, email: &str) -> Result<Uuid> {
     let reply = state
         .http
@@ -208,7 +202,6 @@ pub async fn create_unconfirmed(state: &AppState, email: &str) -> Result<Uuid> {
 
 /// Ask for a one-time token for an existing address. `None` when no such
 /// account is known.
-#[allow(dead_code)] // the sign-up and reset paths shall take it up
 pub async fn mint(state: &AppState, kind: Token, email: &str) -> Result<Option<String>> {
     #[derive(Deserialize)]
     struct Link {
@@ -241,7 +234,6 @@ pub async fn mint(state: &AppState, kind: Token, email: &str) -> Result<Option<S
 
 /// Spend a token. It confirmeth the address and yieldeth a session; a second
 /// spending, or a stale token, is `Expired`.
-#[allow(dead_code)] // the confirm and reset pages shall take it up
 pub async fn spend(state: &AppState, kind: Token, token_hash: &str) -> Result<Spent> {
     let reply = state
         .http
@@ -267,7 +259,6 @@ pub async fn spend(state: &AppState, kind: Token, token_hash: &str) -> Result<Sp
 }
 
 /// Set a person's password as the administrator, there being no old one.
-#[allow(dead_code)] // the confirm and reset pages shall take it up
 pub async fn set_password(state: &AppState, user: Uuid, password: &str) -> Result<()> {
     let reply = state
         .http
@@ -354,7 +345,6 @@ pub async fn close_session(pool: &PgPool, token: &str) {
 }
 
 /// Shut every session a person hath, as when they are banned.
-#[allow(dead_code)] // the admin and sign-up paths shall take it up
 pub async fn close_all_sessions(pool: &PgPool, user: Uuid) {
     let _ = sqlx::query("delete from sessions where user_id = $1").bind(user).execute(pool).await;
 }

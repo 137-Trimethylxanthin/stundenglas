@@ -2,13 +2,14 @@
 //! needeth none of it.
 
 use axum::Form;
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::CookieJar;
 use chrono_tz::Tz;
 use maud::{DOCTYPE, Markup, html};
 use serde::Deserialize;
+use std::net::{IpAddr, SocketAddr};
 use uuid::Uuid;
 
 use crate::auth::{self, CurrentUser};
@@ -377,6 +378,9 @@ pub struct Prefill {
     /// Set by a calendar's red notice: the refused link it is about.
     #[serde(default)]
     relogin: String,
+    /// Set on the way back from a new password, so the front page may say so.
+    #[serde(default)]
+    changed: String,
 }
 
 /// The link a notice or a remembered return pointeth at, if it is one: a
@@ -406,7 +410,16 @@ pub async fn index(
             dashboard_with(state, user, None, chosen, lang).await
         }
         None => {
-            let shown = page(lang, w.sign_in, None, front(w));
+            let mail = state.mail.is_some();
+            let shown = page(
+                lang,
+                w.sign_in,
+                None,
+                html! {
+                    @if chosen.changed == "1" { p.note { (w.password_changed) } }
+                    (front(w, mail))
+                },
+            );
             match return_target(&chosen.relogin) {
                 Some(account) => {
                     (jar.add(auth::return_cookie(account, secure)), shown).into_response()
@@ -445,7 +458,11 @@ fn qr_svg(url: &str) -> Option<maud::PreEscaped<String>> {
 
 /// The page a stranger sees. Apart so that it may be looked at without a
 /// database behind it, which is how it came to be looked at at all.
-fn front(w: &'static Words) -> Markup {
+///
+/// With mail, signing up asketh only for the address: the password is chosen
+/// on the link, which proveth the address is theirs. Without it, the password
+/// is chosen here, as it ever was, and no lost mail can be asked for again.
+fn front(w: &'static Words, mail: bool) -> Markup {
     html! {
                 .hero {
                     h1 { (w.welcome) }
@@ -461,9 +478,13 @@ fn front(w: &'static Words) -> Markup {
                         h2 { (w.create_account) }
                         label for="su-email" { (w.email) }
                         input #su-email type="email" name="email" required autocomplete="email";
-                        label for="su-pw" { (w.password_ten) }
-                        input #su-pw type="password" name="password" required
-                              autocomplete="new-password" minlength="10";
+                        @if mail {
+                            p.meta { (w.signup_mail_hint) }
+                        } @else {
+                            label for="su-pw" { (w.password_ten) }
+                            input #su-pw type="password" name="password" required
+                                  autocomplete="new-password" minlength="10";
+                        }
                         p {} button type="submit" { (w.sign_up) }
                     }
                     form.stack.card method="post" action="/login" {
@@ -474,10 +495,51 @@ fn front(w: &'static Words) -> Markup {
                         input #li-pw type="password" name="password" required
                               autocomplete="current-password";
                         p {} button type="submit" { (w.sign_in) }
+                        @if mail {
+                            p.meta { a href="/forgot" { (w.forgot_password) } }
+                        }
+                    }
+                }
+                // Apart from the sign-up form, for a form may not hold another.
+                @if mail {
+                    details {
+                        summary { (w.no_mail_came) }
+                        (send_again_form(w))
                     }
                 }
                 p.note { (w.front_warning) " " a href="/privacy" { (w.privacy_link) } "." }
     }
+}
+
+/// The address once more, for a confirming mail that never came.
+fn send_again_form(w: &'static Words) -> Markup {
+    html! {
+        form.stack method="post" action="/confirm/again" {
+            label for="ag-email" { (w.email) }
+            input #ag-email type="email" name="email" required autocomplete="email";
+            p {} button type="submit" { (w.send_again) }
+        }
+    }
+}
+
+/// Two passwords that must be one, and long enough to be worth having.
+/// Counted in letters, not bytes, as sign-up counteth them.
+fn password_pair(a: &str, b: &str) -> Result<(), &'static str> {
+    if a.chars().count() < 10 {
+        return Err(TOO_SHORT);
+    }
+    if a != b {
+        return Err(NOT_THE_SAME);
+    }
+    Ok(())
+}
+
+const TOO_SHORT: &str = "too short";
+const NOT_THE_SAME: &str = "not the same";
+
+/// What `password_pair` refused, in the visitor's own tongue.
+fn pair_trouble(w: &'static Words, why: &str) -> &'static str {
+    if why == TOO_SHORT { w.password_too_short } else { w.passwords_differ }
 }
 
 /// How a link is faring, in the one word a badge has room for.
@@ -519,7 +581,8 @@ async fn dashboard_with(
     let me = people::profile(&state.pool, user.id).await;
     let admin = me.as_ref().is_some_and(|p| p.is_admin);
     if !me.as_ref().is_some_and(people::is_in) {
-        return waiting_room(admin, lang);
+        let banned = me.as_ref().is_some_and(|p| p.banned_at.is_some());
+        return waiting_room(admin, banned, lang);
     }
     let accounts = db::accounts_of(&state.pool, user.id).await.unwrap_or_default();
 
@@ -812,7 +875,7 @@ pub async fn feed_settings(
     let Ok(form) = serde_urlencoded::from_bytes::<FeedForm>(&body) else {
         return (StatusCode::UNPROCESSABLE_ENTITY, lang.words().form_unreadable).into_response();
     };
-    let Some(user) = current(&state, &jar).await else {
+    let Some(user) = member(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
 
@@ -883,7 +946,7 @@ pub async fn schools_page(
 ) -> Response {
     let lang = Lang::of(&jar, &headers);
     let w = lang.words();
-    let Some(user) = current(&state, &jar).await else {
+    let Some(user) = member(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
     let query = search.q.trim().to_owned();
@@ -959,7 +1022,7 @@ pub async fn rotate_feed(
     Path(feed): Path<Uuid>,
 ) -> Response {
     let lang = Lang::of(&jar, &headers);
-    let Some(user) = current(&state, &jar).await else {
+    let Some(user) = member(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
     let Ok(token) = crate::admin::mint_token() else {
@@ -978,7 +1041,7 @@ pub async fn drop_feed(
     jar: CookieJar,
     Path(feed): Path<Uuid>,
 ) -> Response {
-    let Some(user) = current(&state, &jar).await else {
+    let Some(user) = member(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
     let _ = db::delete_feed(&state.pool, user.id, feed).await;
@@ -1192,7 +1255,7 @@ fn privacy_text(lang: Lang, admins: &str, keep_days: i64) -> Markup {
 
 /// `GET /account/export.json`
 pub async fn export(State(state): State<AppState>, jar: CookieJar) -> Response {
-    let Some(user) = current(&state, &jar).await else {
+    let Some(user) = member(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
     match db::export_for(&state.pool, user.id).await {
@@ -1289,7 +1352,7 @@ pub async fn new_password(
     Form(form): Form<NewPassword>,
 ) -> Response {
     let lang = Lang::of(&jar, &headers);
-    let Some(user) = current(&state, &jar).await else {
+    let Some(user) = member(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
     if form.password.is_empty() {
@@ -1337,7 +1400,7 @@ pub async fn retry_password(
 ) -> Response {
     let lang = Lang::of(&jar, &headers);
     let w = lang.words();
-    let Some(user) = current(&state, &jar).await else {
+    let Some(user) = member(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
     let entry = match db::refused_account(&state.pool, &state.config.sealer, user.id, account).await
@@ -1384,24 +1447,70 @@ pub struct Login {
     password: String,
 }
 
+/// The sign-up form. Without mail it carrieth the password; with mail it
+/// carrieth none, the password being chosen on the link.
+#[derive(Deserialize)]
+pub struct SignUp {
+    email: String,
+    #[serde(default)]
+    password: String,
+}
+
 pub async fn sign_up(
     State(state): State<AppState>,
     jar: CookieJar,
     headers: HeaderMap,
-    Form(form): Form<Login>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Form(form): Form<SignUp>,
 ) -> Response {
-    let email = form.email.trim().to_ascii_lowercase();
-    match auth::sign_up(&state, &email, &form.password).await {
-        Ok(who) => {
-            if let Err(err) =
-                people::on_signup(&state.pool, who.user, &email, &state.config.admin_emails).await
-            {
-                tracing::error!("could not record the account: {err:#}");
+    let lang = Lang::of(&jar, &headers);
+    if state.mail.is_none() {
+        // No mail, so nothing to confirm by: the password is taken here and
+        // the account waiteth for an administrator, as it always did.
+        let email = auth::normalise_address(&form.email);
+        return match auth::sign_up(&state, &email, &form.password).await {
+            Ok(who) => {
+                if let Err(err) =
+                    people::on_signup(&state.pool, who.user, &email, &state.config.admin_emails)
+                        .await
+                {
+                    tracing::error!("could not record the account: {err:#}");
+                }
+                begin(&state, jar, &headers, who).await
             }
-            begin(&state, jar, &headers, who).await
-        }
-        Err(err) => refuse(&state, &format!("{err}"), Lang::of(&jar, &headers)).await,
+            Err(err) => refuse(&state, &format!("{err}"), lang).await,
+        };
     }
+
+    // The answer is the same whatever the address is, and it is given before
+    // the work is done, so that not even the time it took can tell an
+    // address that is known from one that is not.
+    let ip = crate::feed::caller(&headers, peer);
+    let later = state.clone();
+    tokio::spawn(async move {
+        if let Err(err) = enrol_by_mail(&later, &form.email, ip, lang).await {
+            tracing::warn!("a sign-up by mail did not go through: {err:#}");
+        }
+    });
+    let w = lang.words();
+    say(lang, w.inbox_title, w.inbox_body)
+}
+
+/// Make sure an unconfirmed account standeth for the address, and mail it the
+/// link. An address already confirmed is sent nothing: its owner can sign in.
+async fn enrol_by_mail(state: &AppState, raw: &str, ip: IpAddr, lang: Lang) -> anyhow::Result<()> {
+    let email = auth::normalise_address(raw);
+    let user = match db::auth_user_by_email(&state.pool, &email).await? {
+        Some((_, true)) => return Ok(()),
+        Some((user, false)) => user,
+        None => auth::create_unconfirmed(state, &email).await?,
+    };
+    // Recorded again for one already waiting, in case the first time failed.
+    people::on_signup(&state.pool, user, &email, &state.config.admin_emails).await?;
+    if !crate::post::send_token_mail(state, auth::Token::Confirm, &email, Some(ip), lang).await? {
+        tracing::info!("no confirming mail went out (a limit, most likely)");
+    }
+    Ok(())
 }
 
 pub async fn sign_in(
@@ -1411,44 +1520,340 @@ pub async fn sign_in(
     Form(form): Form<Login>,
 ) -> Response {
     let lang = Lang::of(&jar, &headers);
-    let email = form.email.trim().to_ascii_lowercase();
+    let email = auth::normalise_address(&form.email);
     match auth::sign_in(&state, &email, &form.password).await {
         Ok(who) => {
             // An account made before profiles existed still needs a row.
-            let _ =
+            let me =
                 people::on_signup(&state.pool, who.user, &email, &state.config.admin_emails).await;
-            // A security key, if one is enrolled, before any session is opened.
-            let factor = match crate::mfa::verified_factor(&state, &who.gotrue).await {
-                Ok(factor) => factor,
-                Err(err) => {
-                    tracing::warn!("could not ask for security keys: {err:#}");
-                    return refuse(
-                        &state,
-                        "could not sign you in just now; try again shortly",
-                        lang,
-                    )
-                    .await;
-                }
-            };
-            if let Some(factor) = factor {
-                return match crate::mfa::park(&state, who.user, factor.id, &who.gotrue).await {
-                    Ok(token) => {
-                        let jar = jar.add(auth::pending_cookie(
-                            token,
-                            state.config.public_url.starts_with("https"),
-                        ));
-                        (jar, key_prompt(&factor.friendly_name, lang)).into_response()
-                    }
-                    Err(err) => {
-                        tracing::error!("could not park the sign-in: {err:#}");
-                        refuse(&state, "could not sign you in just now", lang).await
-                    }
-                };
+            // With mail, a confirmed address is all the admission there is.
+            // One confirmed but never let in — from before mail, or revoked
+            // under the old rules — is let in now. A ban is left as it lay.
+            if state.mail.is_some()
+                && let Ok(me) = &me
+                && !me.approved
+                && me.banned_at.is_none()
+                && matches!(db::auth_user_by_email(&state.pool, &email).await, Ok(Some((_, true))))
+                && let Err(err) = people::admit(&state.pool, who.user).await
+            {
+                tracing::warn!(user = %who.user, "could not let a confirmed account in: {err:#}");
             }
-            begin(&state, jar, &headers, who).await
+            admit(&state, jar, &headers, who).await
         }
-        Err(err) => refuse(&state, &format!("{err}"), Lang::of(&jar, &headers)).await,
+        Err(err) => refuse(&state, &format!("{err}"), lang).await,
     }
+}
+
+/// The way in for one whose password, or whose link, was good: the security
+/// key if one is enrolled, and then a session.
+async fn admit(
+    state: &AppState,
+    jar: CookieJar,
+    headers: &HeaderMap,
+    who: auth::Admitted,
+) -> Response {
+    let lang = Lang::of(&jar, headers);
+    // A security key, if one is enrolled, before any session is opened.
+    let factor = match crate::mfa::verified_factor(state, &who.gotrue).await {
+        Ok(factor) => factor,
+        Err(err) => {
+            tracing::warn!("could not ask for security keys: {err:#}");
+            return refuse(state, "could not sign you in just now; try again shortly", lang).await;
+        }
+    };
+    if let Some(factor) = factor {
+        return match crate::mfa::park(state, who.user, factor.id, &who.gotrue).await {
+            Ok(token) => {
+                let jar = jar
+                    .add(auth::pending_cookie(token, state.config.public_url.starts_with("https")));
+                (jar, key_prompt(&factor.friendly_name, lang)).into_response()
+            }
+            Err(err) => {
+                tracing::error!("could not park the sign-in: {err:#}");
+                refuse(state, "could not sign you in just now", lang).await
+            }
+        };
+    }
+    begin(state, jar, headers, who).await
+}
+
+// --------------------------------------------------- confirming and reset ---
+
+/// A token from a mailed link, carried in the query and then in the form.
+#[derive(Deserialize)]
+pub struct Carried {
+    #[serde(default)]
+    t: String,
+}
+
+/// The password, twice, with the token it came by.
+#[derive(Deserialize)]
+pub struct Chosen {
+    #[serde(default)]
+    t: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    again: String,
+}
+
+/// An address alone, for the forms that send a link.
+#[derive(Deserialize)]
+pub struct Address {
+    #[serde(default)]
+    email: String,
+}
+
+/// The form a mailed link openeth: a password, twice. The token is carried
+/// along and not spent, for a mail scanner that followeth every link would
+/// otherwise use it up before its owner ever saw it.
+fn password_form(lang: Lang, kind: auth::Token, token: &str, trouble: Option<&str>) -> Response {
+    let w = lang.words();
+    let (title, lede, action, button) = match kind {
+        auth::Token::Confirm => (w.choose_title, w.choose_lede, "/confirm", w.finish_signing_up),
+        auth::Token::Reset => (w.reset_title, w.reset_lede, "/reset", w.set_new_password),
+    };
+    page(
+        lang,
+        title,
+        None,
+        html! {
+            h1 { (title) }
+            p.lede { (lede) }
+            @if let Some(why) = trouble { p.bad { (why) } }
+            form.stack method="post" action=(action) {
+                input type="hidden" name="t" value=(token);
+                label for="pw-new" { (w.password_ten) }
+                input #pw-new type="password" name="password" required
+                      autocomplete="new-password" minlength="10";
+                label for="pw-again" { (w.password_again) }
+                input #pw-again type="password" name="again" required
+                      autocomplete="new-password" minlength="10";
+                p {} button type="submit" { (button) }
+            }
+        },
+    )
+    .into_response()
+}
+
+/// A link that hath run out, and the way to another.
+fn stale(lang: Lang, kind: auth::Token) -> Response {
+    let w = lang.words();
+    page(
+        lang,
+        w.stale_title,
+        None,
+        html! {
+            h1 { (w.stale_title) }
+            @match kind {
+                auth::Token::Confirm => {
+                    p.lede { (w.stale_confirm_body) }
+                    (send_again_form(w))
+                    p { a href="/" { (w.sign_in) } }
+                }
+                auth::Token::Reset => {
+                    p.lede { (w.stale_reset_body) }
+                    p { a href="/forgot" { (w.ask_for_new) } }
+                }
+            }
+        },
+    )
+    .into_response()
+}
+
+/// `GET /confirm?t=`
+pub async fn confirm_page(
+    jar: CookieJar,
+    headers: HeaderMap,
+    Query(link): Query<Carried>,
+) -> Response {
+    let lang = Lang::of(&jar, &headers);
+    if link.t.trim().is_empty() {
+        return stale(lang, auth::Token::Confirm);
+    }
+    password_form(lang, auth::Token::Confirm, link.t.trim(), None)
+}
+
+/// `POST /confirm`
+///
+/// The token is spent only once the passwords agree, so a slip of the finger
+/// costeth nothing. Spent, it confirmeth the address; the password is set,
+/// the account let in (a ban, should there be one, still standeth), and the
+/// way in is the same as a password's.
+pub async fn confirm(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Form(form): Form<Chosen>,
+) -> Response {
+    let lang = Lang::of(&jar, &headers);
+    let w = lang.words();
+    let token = form.t.trim();
+    if token.is_empty() {
+        return stale(lang, auth::Token::Confirm);
+    }
+    if let Err(why) = password_pair(&form.password, &form.again) {
+        return password_form(lang, auth::Token::Confirm, token, Some(pair_trouble(w, why)));
+    }
+    let who = match auth::spend(&state, auth::Token::Confirm, token).await {
+        Ok(auth::Spent::Good(who)) => who,
+        Ok(auth::Spent::Expired) => return stale(lang, auth::Token::Confirm),
+        Err(err) => {
+            tracing::warn!("could not spend a confirming token: {err:#}");
+            return say(lang, w.trouble_title, w.trouble_body);
+        }
+    };
+    if let Err(err) = auth::set_password(&state, who.user, &form.password).await {
+        // The address is confirmed and the token gone; the way on is a reset.
+        tracing::error!(user = %who.user, "confirmed, but the password was refused: {err:#}");
+        return say(lang, w.trouble_title, w.unfinished_body);
+    }
+    if let Err(err) = people::admit(&state.pool, who.user).await {
+        tracing::error!(user = %who.user, "confirmed, but could not be let in: {err:#}");
+    }
+    admit(&state, jar, &headers, who).await
+}
+
+/// `POST /confirm/again`
+///
+/// Only an account still unconfirmed is sent anything; every address hath
+/// the same answer, given before the work is done.
+pub async fn confirm_again(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Form(form): Form<Address>,
+) -> Response {
+    let lang = Lang::of(&jar, &headers);
+    if state.mail.is_none() {
+        return Redirect::to("/").into_response();
+    }
+    let ip = crate::feed::caller(&headers, peer);
+    let later = state.clone();
+    tokio::spawn(async move {
+        let email = auth::normalise_address(&form.email);
+        let sent = match db::auth_user_by_email(&later.pool, &email).await {
+            Ok(Some((_, false))) => {
+                crate::post::send_token_mail(&later, auth::Token::Confirm, &email, Some(ip), lang)
+                    .await
+            }
+            Ok(_) => Ok(false),
+            Err(err) => Err(err),
+        };
+        if let Err(err) = sent {
+            tracing::warn!("a confirming mail could not be sent again: {err:#}");
+        }
+    });
+    let w = lang.words();
+    say(lang, w.inbox_title, w.inbox_body)
+}
+
+/// `GET /forgot`
+pub async fn forgot_page(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Response {
+    let lang = Lang::of(&jar, &headers);
+    if state.mail.is_none() {
+        return Redirect::to("/").into_response();
+    }
+    let w = lang.words();
+    page(
+        lang,
+        w.forgot_title,
+        None,
+        html! {
+            h1 { (w.forgot_title) }
+            p.lede { (w.forgot_lede) }
+            form.stack method="post" action="/forgot" {
+                label for="fg-email" { (w.email) }
+                input #fg-email type="email" name="email" required autocomplete="email";
+                p {} button type="submit" { (w.send_link) }
+            }
+            p { a href="/" { "←" } }
+        },
+    )
+    .into_response()
+}
+
+/// `POST /forgot`
+///
+/// Any account may reset, confirmed or not, banned or not: the link proveth
+/// the address, and a ban is kept apart from the password.
+pub async fn forgot(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Form(form): Form<Address>,
+) -> Response {
+    let lang = Lang::of(&jar, &headers);
+    if state.mail.is_none() {
+        return Redirect::to("/").into_response();
+    }
+    let ip = crate::feed::caller(&headers, peer);
+    let later = state.clone();
+    tokio::spawn(async move {
+        if let Err(err) =
+            crate::post::send_token_mail(&later, auth::Token::Reset, &form.email, Some(ip), lang)
+                .await
+        {
+            tracing::warn!("a reset mail could not be sent: {err:#}");
+        }
+    });
+    let w = lang.words();
+    say(lang, w.forgot_title, w.forgot_body)
+}
+
+/// `GET /reset?t=`
+pub async fn reset_page(
+    jar: CookieJar,
+    headers: HeaderMap,
+    Query(link): Query<Carried>,
+) -> Response {
+    let lang = Lang::of(&jar, &headers);
+    if link.t.trim().is_empty() {
+        return stale(lang, auth::Token::Reset);
+    }
+    password_form(lang, auth::Token::Reset, link.t.trim(), None)
+}
+
+/// `POST /reset`
+///
+/// A new password, and every session of the account closed. No session is
+/// opened here: the way back in is the front door, security key and all.
+pub async fn reset(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Form(form): Form<Chosen>,
+) -> Response {
+    let lang = Lang::of(&jar, &headers);
+    let w = lang.words();
+    let token = form.t.trim();
+    if token.is_empty() {
+        return stale(lang, auth::Token::Reset);
+    }
+    if let Err(why) = password_pair(&form.password, &form.again) {
+        return password_form(lang, auth::Token::Reset, token, Some(pair_trouble(w, why)));
+    }
+    let who = match auth::spend(&state, auth::Token::Reset, token).await {
+        Ok(auth::Spent::Good(who)) => who,
+        Ok(auth::Spent::Expired) => return stale(lang, auth::Token::Reset),
+        Err(err) => {
+            tracing::warn!("could not spend a reset token: {err:#}");
+            return say(lang, w.trouble_title, w.trouble_body);
+        }
+    };
+    if let Err(err) = auth::set_password(&state, who.user, &form.password).await {
+        tracing::error!(user = %who.user, "a reset password was refused: {err:#}");
+        return say(lang, w.trouble_title, w.stale_reset_body);
+    }
+    auth::close_all_sessions(&state.pool, who.user).await;
+    tracing::info!(user = %who.user, "password reset by mail; every session closed");
+    Redirect::to("/?changed=1").into_response()
 }
 
 async fn begin(
@@ -1513,13 +1918,9 @@ pub async fn add_link(
     Form(form): Form<LinkForm>,
 ) -> Response {
     let lang = Lang::of(&jar, &headers);
-    let Some(user) = current(&state, &jar).await else {
+    let Some(user) = member(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
-
-    if !people::profile(&state.pool, user.id).await.is_some_and(|p| people::is_in(&p)) {
-        return Redirect::to("/").into_response();
-    }
     let Ok(timezone) = form.timezone.parse::<Tz>() else {
         return dashboard(state, user, Some("that is not a timezone I know".into()), lang).await;
     };
@@ -1580,7 +1981,7 @@ pub async fn drop_link(
     jar: CookieJar,
     Path(account): Path<Uuid>,
 ) -> Response {
-    let Some(user) = current(&state, &jar).await else {
+    let Some(user) = member(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
     // Deleting by (id, owner) means another user's id simply matches nothing.
@@ -1593,6 +1994,15 @@ pub async fn signed_in(state: &AppState, jar: &CookieJar) -> Option<CurrentUser>
     current(state, jar).await
 }
 
+/// Who is asking, if they are signed in and let in: the gate for anything
+/// that acteth on their data. One waiting, or barred, is sent to the front
+/// page, which saith which.
+pub async fn member(state: &AppState, jar: &CookieJar) -> Option<CurrentUser> {
+    let user = current(state, jar).await?;
+    people::profile(&state.pool, user.id).await.filter(people::is_in)?;
+    Some(user)
+}
+
 async fn current(state: &AppState, jar: &CookieJar) -> Option<CurrentUser> {
     let cookie = jar.get(auth::COOKIE)?;
     auth::user_of(&state.pool, cookie.value()).await
@@ -1600,15 +2010,22 @@ async fn current(state: &AppState, jar: &CookieJar) -> Option<CurrentUser> {
 
 // ------------------------------------------------------------ the gateway ---
 
-fn waiting_room(admin: bool, lang: Lang) -> Response {
+/// Where one signed in but not let in standeth: waiting, or barred. A ban is
+/// told plainly and with nothing more, for there is nothing more to do.
+fn waiting_room(admin: bool, banned: bool, lang: Lang) -> Response {
     let w = lang.words();
+    let (title, body) = if banned {
+        (w.no_access_title, w.no_access_body)
+    } else {
+        (w.waiting_title, w.waiting_body)
+    };
     page(
         lang,
-        w.waiting_title,
+        title,
         Some(CurrentUser { id: Uuid::nil() }),
         html! {
-            h1 { (w.waiting_title) }
-            p.lede { (w.waiting_body) }
+            h1 { (title) }
+            p.lede { (body) }
             @if admin {
                 p { a href="/admin" { "You are an administrator — review the list" } }
             }
@@ -1888,7 +2305,7 @@ pub async fn security_page(
 ) -> Response {
     let lang = Lang::of(&jar, &headers);
     let w = lang.words();
-    let Some(user) = current(&state, &jar).await else {
+    let Some(user) = member(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
     let Some(token) = session_token(&jar) else { return Redirect::to("/").into_response() };
@@ -1939,7 +2356,7 @@ pub async fn enrol_start(
     jar: CookieJar,
     axum::Json(body): axum::Json<EnrolStart>,
 ) -> Response {
-    let Some(_user) = current(&state, &jar).await else {
+    let Some(_user) = member(&state, &jar).await else {
         return (StatusCode::UNAUTHORIZED, "sign in first").into_response();
     };
     let Some(token) = session_token(&jar) else {
@@ -1969,6 +2386,9 @@ pub async fn enrol_finish(
     jar: CookieJar,
     axum::Json(body): axum::Json<Finish>,
 ) -> Response {
+    if member(&state, &jar).await.is_none() {
+        return (StatusCode::UNAUTHORIZED, "sign in first").into_response();
+    }
     let Some(token) = session_token(&jar) else {
         return (StatusCode::UNAUTHORIZED, "sign in first").into_response();
     };
@@ -1993,6 +2413,9 @@ pub async fn forget_key(
     jar: CookieJar,
     Path(factor): Path<Uuid>,
 ) -> Response {
+    if member(&state, &jar).await.is_none() {
+        return Redirect::to("/").into_response();
+    }
     if let Some(token) = session_token(&jar) {
         let bearer = auth::gotrue_of(&state, &token).await.unwrap_or_default();
         if let Err(err) = crate::mfa::forget(&state, &bearer, factor).await {
@@ -2120,6 +2543,50 @@ mod page_tests {
             assert!(text.contains("you@example.test"), "and who to ask");
         }
     }
+
+    /// The sign-up form, from its opening to its close.
+    fn signup_form(page: &str) -> &str {
+        let from = page.find("action=\"/signup\"").expect("a sign-up form");
+        let to = page[from..].find("</form>").expect("that closeth");
+        &page[from..from + to]
+    }
+
+    #[test]
+    fn front_without_mail_is_todays_front() {
+        for lang in [Lang::En, Lang::De] {
+            let front = super::front(lang.words(), false).into_string();
+            assert!(
+                signup_form(&front).contains("name=\"password\""),
+                "without mail the password is chosen at sign-up, as it always was"
+            );
+            assert!(!front.contains("/forgot"), "no mail, so no mail to reset by");
+            assert!(!front.contains("/confirm/again"), "and none to send again");
+        }
+    }
+
+    #[test]
+    fn front_with_mail_asks_only_for_the_address() {
+        for lang in [Lang::En, Lang::De] {
+            let front = super::front(lang.words(), true).into_string();
+            assert!(!front.contains("su-pw"), "the password is chosen on the link");
+            assert!(!signup_form(&front).contains("name=\"password\""));
+            assert!(front.contains("href=\"/forgot\""), "a way back from a lost password");
+            assert!(front.contains("/confirm/again"), "and from a lost mail");
+        }
+    }
+
+    #[test]
+    fn password_pair_checks() {
+        assert!(super::password_pair("short", "short").is_err(), "under ten is too short");
+        assert!(
+            super::password_pair("long-enough-1", "long-enough-2").is_err(),
+            "two that differ are a slip of the finger"
+        );
+        assert!(super::password_pair("long-enough-1", "long-enough-1").is_ok());
+        // Ten letters, not ten bytes: an umlaut is one character.
+        assert!(super::password_pair("ääääääääää", "ääääääääää").is_ok());
+        assert!(super::password_pair("äääää", "äääää").is_err());
+    }
 }
 
 /// Renders the pages to `target/preview/` so a person may look at them.
@@ -2238,13 +2705,15 @@ mod preview {
         for lang in [Lang::En, Lang::De] {
             let w = lang.words();
             let code = lang.code();
-            let pages: [(&str, Markup); 3] = [
-                ("front", front(w)),
+            let pages: [(&str, Markup); 4] = [
+                ("front", front(w, false)),
+                ("front-mail", front(w, true)),
                 ("dashboard", dashboard_demo(w)),
                 ("privacy", privacy_text(lang, "you@example.test", 180)),
             ];
             for (name, body) in pages {
-                let who = (name != "front").then_some(CurrentUser { id: uuid::Uuid::nil() });
+                let who =
+                    (!name.starts_with("front")).then_some(CurrentUser { id: uuid::Uuid::nil() });
                 let html = page(lang, name, who, body).into_string();
                 assert!(html.contains("<html lang="), "a page should be a page");
                 std::fs::write(out.join(format!("{name}.{code}.html")), html).expect("writing");

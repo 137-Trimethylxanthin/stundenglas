@@ -98,6 +98,35 @@ pub struct Words {
     pub point_nothing: &'static str,
     pub front_warning: &'static str,
 
+    // Confirming by mail, and resetting
+    pub signup_mail_hint: &'static str,
+    pub forgot_password: &'static str,
+    pub no_mail_came: &'static str,
+    pub send_again: &'static str,
+    pub inbox_title: &'static str,
+    pub inbox_body: &'static str,
+    pub forgot_title: &'static str,
+    pub forgot_lede: &'static str,
+    pub forgot_body: &'static str,
+    pub send_link: &'static str,
+    pub choose_title: &'static str,
+    pub choose_lede: &'static str,
+    pub finish_signing_up: &'static str,
+    pub reset_title: &'static str,
+    pub reset_lede: &'static str,
+    pub set_new_password: &'static str,
+    pub password_again: &'static str,
+    pub password_too_short: &'static str,
+    pub passwords_differ: &'static str,
+    pub stale_title: &'static str,
+    pub stale_confirm_body: &'static str,
+    pub stale_reset_body: &'static str,
+    pub ask_for_new: &'static str,
+    pub password_changed: &'static str,
+    pub trouble_title: &'static str,
+    pub trouble_body: &'static str,
+    pub unfinished_body: &'static str,
+
     // The dashboard
     pub your_timetables: &'static str,
     pub one_link_each: &'static str,
@@ -176,6 +205,8 @@ pub struct Words {
     // Waiting to be let in
     pub waiting_title: &'static str,
     pub waiting_body: &'static str,
+    pub no_access_title: &'static str,
+    pub no_access_body: &'static str,
 
     // Security keys
     pub key_lede: &'static str,
@@ -214,6 +245,43 @@ pub static ENGLISH: Words = Words {
                     service has to store your school password to read your timetable. It is \
                     encrypted and the key is kept apart from the database — but know that \
                     before you hand it over, and check what your school's rules say:",
+
+    signup_mail_hint: "A link goes to this address. You choose your password when you open it.",
+    forgot_password: "Forgot your password?",
+    no_mail_came: "No mail came? Send it again",
+    send_again: "Send it again",
+    inbox_title: "Look in your inbox",
+    inbox_body: "A link is on its way to that address, unless it already has an account here — \
+                 then simply sign in. The link works once, for an hour. If nothing comes, look \
+                 in the spam folder before asking again.",
+    forgot_title: "A new password",
+    forgot_lede: "Give the address you signed up with, and a link to choose a new password \
+                  goes to it.",
+    forgot_body: "If that address has an account here, a mail is on its way. The link works \
+                  once, for an hour.",
+    send_link: "Send me a link",
+    choose_title: "Choose your password",
+    choose_lede: "One step more: choose the password you will sign in with, and your address is \
+                  confirmed.",
+    finish_signing_up: "Finish signing up",
+    reset_title: "Choose a new password",
+    reset_lede: "Once it is set, every device signed in to this account is signed out, and you \
+                 sign in again with the new one.",
+    set_new_password: "Set the new password",
+    password_again: "The same password again",
+    password_too_short: "That password is shorter than ten characters.",
+    passwords_differ: "The two passwords are not the same.",
+    stale_title: "That link has run out",
+    stale_confirm_body: "A link works once, for an hour. If you have confirmed already, simply \
+                         sign in; otherwise ask for a new one.",
+    stale_reset_body: "A link works once, for an hour. Ask for a new one.",
+    ask_for_new: "Ask for a new link",
+    password_changed: "Password changed. Sign in with the new one.",
+    trouble_title: "That did not work",
+    trouble_body: "The account service could not be reached just now, and nothing was changed. \
+                   Try again shortly.",
+    unfinished_body: "Your address is confirmed, but the password could not be saved. Use \
+                      \"Forgot your password?\" on the front page to choose one.",
 
     your_timetables: "Your timetables",
     one_link_each: "One link per school. Each keeps its own clock.",
@@ -303,6 +371,8 @@ pub static ENGLISH: Words = Words {
     waiting_title: "Waiting to be let in",
     waiting_body: "Your account has been created. An administrator has to admit it before you \
                    can add a school.",
+    no_access_title: "No access",
+    no_access_body: "This account no longer has access to the service.",
 
     key_lede: "A key is asked for after your password. It is a second factor, not a replacement: \
                this account service offers no passwordless sign-in yet.",
@@ -342,6 +412,44 @@ pub static GERMAN: Words = Words {
                     zu lesen. Es ist verschlüsselt und der Schlüssel liegt getrennt von der \
                     Datenbank — aber das solltest du wissen, bevor du es aus der Hand gibst, \
                     und in der Hausordnung deiner Schule nachsehen:",
+
+    signup_mail_hint: "Ein Link geht an diese Adresse. Dein Passwort wählst du, wenn du ihn \
+                       öffnest.",
+    forgot_password: "Passwort vergessen?",
+    no_mail_came: "Keine Mail bekommen? Noch einmal senden",
+    send_again: "Noch einmal senden",
+    inbox_title: "Sieh in dein Postfach",
+    inbox_body: "Ein Link ist an diese Adresse unterwegs, außer sie hat hier schon ein Konto — \
+                 dann melde dich einfach an. Der Link gilt einmal, eine Stunde lang. Kommt \
+                 nichts, sieh im Spam-Ordner nach, bevor du ihn noch einmal anforderst.",
+    forgot_title: "Ein neues Passwort",
+    forgot_lede: "Gib die Adresse an, mit der du dich registriert hast, und ein Link für ein \
+                  neues Passwort geht an sie.",
+    forgot_body: "Wenn diese Adresse hier ein Konto hat, ist eine Mail unterwegs. Der Link gilt \
+                  einmal, eine Stunde lang.",
+    send_link: "Link senden",
+    choose_title: "Wähle dein Passwort",
+    choose_lede: "Noch ein Schritt: wähle das Passwort, mit dem du dich anmelden wirst, und \
+                  deine Adresse ist bestätigt.",
+    finish_signing_up: "Registrierung abschließen",
+    reset_title: "Wähle ein neues Passwort",
+    reset_lede: "Sobald es gesetzt ist, wird jedes an diesem Konto angemeldete Gerät abgemeldet, \
+                 und du meldest dich mit dem neuen wieder an.",
+    set_new_password: "Neues Passwort setzen",
+    password_again: "Dasselbe Passwort noch einmal",
+    password_too_short: "Das Passwort ist kürzer als zehn Zeichen.",
+    passwords_differ: "Die beiden Passwörter stimmen nicht überein.",
+    stale_title: "Dieser Link ist abgelaufen",
+    stale_confirm_body: "Ein Link gilt einmal, eine Stunde lang. Hast du schon bestätigt, melde \
+                         dich einfach an; sonst fordere einen neuen an.",
+    stale_reset_body: "Ein Link gilt einmal, eine Stunde lang. Fordere einen neuen an.",
+    ask_for_new: "Neuen Link anfordern",
+    password_changed: "Passwort geändert. Melde dich mit dem neuen an.",
+    trouble_title: "Das hat nicht geklappt",
+    trouble_body: "Der Kontodienst war gerade nicht erreichbar, und es wurde nichts geändert. \
+                   Versuch es gleich noch einmal.",
+    unfinished_body: "Deine Adresse ist bestätigt, aber das Passwort konnte nicht gespeichert \
+                      werden. Wähle über „Passwort vergessen?“ auf der Startseite eines.",
 
     your_timetables: "Deine Stundenpläne",
     one_link_each: "Ein Link je Schule. Jede behält ihre eigene Zeitzone.",
@@ -436,6 +544,8 @@ pub static GERMAN: Words = Words {
     waiting_title: "Warten auf Freischaltung",
     waiting_body: "Dein Konto wurde angelegt. Eine Administratorin oder ein Administrator muss \
                    es freischalten, bevor du eine Schule hinzufügen kannst.",
+    no_access_title: "Kein Zugang",
+    no_access_body: "Dieses Konto hat keinen Zugang mehr zu diesem Dienst.",
 
     key_lede: "Ein Schlüssel wird nach dem Passwort verlangt. Er ist ein zweiter Faktor, kein \
                Ersatz: dieser Kontodienst bietet noch keine Anmeldung ohne Passwort.",

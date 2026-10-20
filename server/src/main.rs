@@ -184,7 +184,10 @@ async fn main() -> Result<()> {
 async fn serve(state: AppState) -> Result<()> {
     tracing::info!(config = ?state.config, "starting");
     if state.mail.is_none() {
-        tracing::info!("no SMTP_URL; nobody will be told anything by email");
+        tracing::info!(
+            "no SMTP_URL; nobody will be told anything by email, and sign-ups will wait for \
+             an administrator"
+        );
     }
     let scheduler = tokio::spawn(sync::run(state.clone()));
 
@@ -193,6 +196,10 @@ async fn serve(state: AppState) -> Result<()> {
         .route("/", get(web::index))
         .route("/signup", post(web::sign_up))
         .route("/login", post(web::sign_in))
+        .route("/confirm", get(web::confirm_page).post(web::confirm))
+        .route("/confirm/again", post(web::confirm_again))
+        .route("/forgot", get(web::forgot_page).post(web::forgot))
+        .route("/reset", get(web::reset_page).post(web::reset))
         .route("/logout", post(web::sign_out))
         .route("/links", post(web::add_link))
         .route("/links/{id}/feeds", post(web::new_feed))

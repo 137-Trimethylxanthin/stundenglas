@@ -107,7 +107,7 @@ pub async fn serve(
 /// The headers are only as honest as whoever set them; they are trusted here
 /// because the alternative, in front of Cloudflare, is to count the whole
 /// world as one caller.
-fn caller(headers: &HeaderMap, peer: std::net::SocketAddr) -> std::net::IpAddr {
+pub(crate) fn caller(headers: &HeaderMap, peer: std::net::SocketAddr) -> std::net::IpAddr {
     for name in ["cf-connecting-ip", "x-real-ip"] {
         if let Some(found) = headers.get(name).and_then(|v| v.to_str().ok())
             && let Ok(address) = found.trim().parse()

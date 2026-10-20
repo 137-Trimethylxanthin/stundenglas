@@ -36,7 +36,7 @@ pub async fn begin(
     Path(account): Path<Uuid>,
 ) -> Response {
     let lang = crate::words::Lang::of(&jar, &headers);
-    let Some(user) = crate::web::signed_in(&state, &jar).await else {
+    let Some(user) = crate::web::member(&state, &jar).await else {
         return Redirect::to("/").into_response();
     };
     let Some(client) = state.config.google.clone() else {
@@ -121,6 +121,10 @@ pub async fn callback(
             "Sign in as the person who began the connection, and start it again.",
         );
     }
+    // Begun before a ban, finished after it: the ban wins.
+    if crate::web::member(&app, &jar).await.is_none() {
+        return Redirect::to("/").into_response();
+    }
 
     match finish(&app, &code, account).await {
         Ok(()) => {
@@ -181,7 +185,7 @@ pub async fn unlink(
     jar: CookieJar,
     Path(account): Path<Uuid>,
 ) -> Response {
-    if let Some(user) = crate::web::signed_in(&state, &jar).await
+    if let Some(user) = crate::web::member(&state, &jar).await
         && db::owns(&state.pool, user.id, account).await.unwrap_or(false)
     {
         let _ = sqlx::query("delete from google_links where untis_account_id = $1")

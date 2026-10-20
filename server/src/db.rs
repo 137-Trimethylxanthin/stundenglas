@@ -994,7 +994,6 @@ pub async fn name_of(pool: &PgPool, account: Uuid) -> Result<Option<String>> {
 
 /// The account behind an address, and whether its email is confirmed. Reads
 /// `auth.users` itself, comparing in lower case.
-#[allow(dead_code)] // the sign-up and reset paths shall take it up
 pub async fn auth_user_by_email(pool: &PgPool, email: &str) -> Result<Option<(Uuid, bool)>> {
     let row = sqlx::query(
         "select id, email_confirmed_at is not null as confirmed
