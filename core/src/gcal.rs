@@ -548,6 +548,8 @@ pub fn plan(want: &crate::Timetable, existing: &HashMap<String, Existing>, zone:
     let everything = want
         .lessons
         .iter()
+        // The exam standeth in the lesson's hours, so the lesson goeth.
+        .filter(|lesson| !want.exams.iter().any(|exam| exam.covers(lesson)))
         .map(|lesson| desired_of(lesson, zone))
         .chain(want.exams.iter().map(|exam| desired_of_exam(exam, zone)))
         .chain(want.homework.iter().filter_map(|piece| desired_of_homework(piece, zone)))
@@ -734,6 +736,50 @@ mod tests {
             fingerprint_in(&tuesday),
             "work that moved a day must be updated, not left where it was"
         );
+    }
+
+    fn a_lesson(id: i64, from: u32, to: u32) -> crate::Lesson {
+        let at = |h: u32| {
+            crate::DEFAULT_TZ
+                .from_local_datetime(&a_day().and_hms_opt(h, 0, 0).unwrap())
+                .earliest()
+                .unwrap()
+                .fixed_offset()
+        };
+        crate::Lesson {
+            ids: vec![id],
+            start: at(from),
+            end: at(to),
+            status: crate::Status::Regular,
+            is_event: false,
+            subjects: vec!["M".into()],
+            subject_long: String::new(),
+            info: vec![],
+            teachers: vec![],
+            rooms: vec![],
+            classes: vec![],
+            teachers_removed: vec![],
+            rooms_removed: vec![],
+            lesson_info: String::new(),
+            lesson_text: String::new(),
+            substitution_text: String::new(),
+            notes: String::new(),
+        }
+    }
+
+    #[test]
+    fn an_exam_taketh_the_place_of_the_lesson_it_falleth_in() {
+        // The exam runs from eight to ten; one lesson ends inside it, one after.
+        let want = Timetable {
+            lessons: vec![a_lesson(1, 9, 10), a_lesson(2, 10, 11)],
+            exams: vec![an_exam()],
+            ..Default::default()
+        };
+        let run = plan(&want, &HashMap::new(), crate::DEFAULT_TZ);
+        let ids: Vec<&str> = run.inserts.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids.len(), 2, "the exam and the lesson after it: {ids:?}");
+        assert!(ids.contains(&an_exam().gcal_id().as_str()));
+        assert!(ids.contains(&desired_of(&a_lesson(2, 10, 11), crate::DEFAULT_TZ).id.as_str()));
     }
 
     #[test]

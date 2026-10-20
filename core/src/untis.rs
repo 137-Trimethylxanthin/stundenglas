@@ -249,6 +249,13 @@ impl Exam {
         out.trim().to_owned()
     }
 
+    /// Whether this exam taketh some of that lesson's hours. Whoever sitteth
+    /// the exam is not in the lesson, and showing both would book the same
+    /// hour twice; any overlap will do, as an exam may run across two.
+    pub fn covers(&self, lesson: &Lesson) -> bool {
+        lesson.start < self.end && lesson.end > self.start
+    }
+
     pub fn description(&self) -> String {
         let mut lines = Vec::new();
         if !self.text.is_empty() {

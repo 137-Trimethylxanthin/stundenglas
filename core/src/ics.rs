@@ -61,6 +61,10 @@ impl Feed<'_> {
         line(&mut out, &format!("REFRESH-INTERVAL;VALUE=DURATION:{ttl}"));
         line(&mut out, &format!("X-PUBLISHED-TTL:{ttl}"));
 
+        // Only an exam this feed showeth may take a lesson's place: one left
+        // out with its subject would otherwise leave the hour empty.
+        let exams: Vec<&Exam> =
+            exams.iter().filter(|e| !self.hidden(std::slice::from_ref(&e.subject))).collect();
         for lesson in lessons {
             if lesson.cancelled() && !self.keep_cancelled {
                 continue;
@@ -68,12 +72,12 @@ impl Feed<'_> {
             if self.hidden(&lesson.subjects) {
                 continue;
             }
+            if exams.iter().any(|exam| exam.covers(lesson)) {
+                continue;
+            }
             self.event(&mut out, lesson, stamp);
         }
         for exam in exams {
-            if self.hidden(std::slice::from_ref(&exam.subject)) {
-                continue;
-            }
             self.exam(&mut out, exam, stamp);
         }
         if self.with_holidays {
@@ -475,6 +479,45 @@ mod tests {
         assert!(out.contains("LOCATION:A1"));
     }
 
+    /// A lesson in the two hours after `exam()`, so the two do not meet.
+    fn after_the_exam(subject: &str) -> Lesson {
+        let mut l = lesson(Status::Regular, subject);
+        l.start += chrono::Duration::hours(2);
+        l.end += chrono::Duration::hours(2);
+        l
+    }
+
+    #[test]
+    fn an_exam_taketh_the_place_of_the_lesson_it_falleth_in() {
+        let out = Feed::default().render(
+            &Timetable {
+                lessons: vec![lesson(Status::Regular, "D"), after_the_exam("D")],
+                exams: vec![exam()],
+                ..Default::default()
+            },
+            Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
+        );
+        assert_eq!(out.matches("BEGIN:VEVENT").count(), 2, "the exam and the later lesson");
+        assert!(out.contains("SUMMARY:📝"));
+        assert_eq!(out.matches("DTSTART:20260921T060000Z").count(), 1, "8 o'clock is booked once");
+    }
+
+    #[test]
+    fn an_exam_left_out_leaveth_its_lesson_be() {
+        let hide_m = vec!["M".to_owned()];
+        let feed = Feed { hide_subjects: &hide_m, ..Feed::default() };
+        let out = feed.render(
+            &Timetable {
+                lessons: vec![lesson(Status::Regular, "D")],
+                exams: vec![exam()],
+                ..Default::default()
+            },
+            Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap(),
+        );
+        assert!(!out.contains("SUMMARY:📝"));
+        assert_eq!(out.matches("BEGIN:VEVENT").count(), 1, "else the hour would stand empty");
+    }
+
     #[test]
     fn nothing_ringeth_unless_asked() {
         let out = Feed::default().render(
@@ -534,7 +577,7 @@ mod tests {
         let feed = Feed { hide_subjects: &hide_d, ..Feed::default() };
         let out = feed.render(
             &Timetable {
-                lessons: vec![lesson(Status::Regular, "D"), lesson(Status::Regular, "M")],
+                lessons: vec![after_the_exam("D"), after_the_exam("M")],
                 exams: vec![exam()],
                 homework: vec![homework()],
                 ..Default::default()
@@ -551,7 +594,7 @@ mod tests {
         let feed = Feed { hide_subjects: &hide_m, ..Feed::default() };
         let out = feed.render(
             &Timetable {
-                lessons: vec![lesson(Status::Regular, "D"), lesson(Status::Regular, "M")],
+                lessons: vec![after_the_exam("D"), after_the_exam("M")],
                 exams: vec![exam()],
                 homework: vec![homework()],
                 ..Default::default()
@@ -590,7 +633,7 @@ mod tests {
         let feed = Feed::default();
         let out = feed.render(
             &Timetable {
-                lessons: vec![lesson(Status::Regular, "D")],
+                lessons: vec![after_the_exam("D")],
                 exams: vec![exam()],
                 homework: vec![homework()],
                 ..Default::default()

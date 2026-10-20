@@ -31,7 +31,7 @@ It is deliberately more careful than the export WebUntis itself would give you:
 | **Substitutions** | tells *"X is covering for Y"* apart from *"Y is away and nobody is covering"* |
 | **Leave of absence** | lessons inside an approved absence are dropped, so an excused day shows empty. Overlap-based, so a half-day leave clears only its own hours |
 | **Shared lessons** | a lesson shared between classes is marked changed whenever any class joins or leaves — only a change of teacher or room is flagged |
-| **Exams** | from the endpoint the timetable does not carry, marked 📝, and the only thing here that may ring: a reminder per link, a day before or an hour |
+| **Exams** | from the endpoint the timetable does not carry, marked 📝, and the only thing here that may ring: a reminder per link, a day before or an hour. The lessons an exam falls in are left out, so its hours are booked once |
 | **Homework** | on the day it is due, whole-day and transparent, because it occupies a day without blocking an hour |
 | **Holidays** | so an empty week reads as a holiday rather than as a week nobody fetched |
 | **Several schools** | one account may link many, each with its own timezone |
