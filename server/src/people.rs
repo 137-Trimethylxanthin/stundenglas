@@ -112,7 +112,6 @@ pub async fn admit(pool: &PgPool, who: Uuid) -> Result<()> {
 
 /// Bar one, or lift the bar. A ban also shutteth every open session. An admin
 /// may not be barred, and this doth nothing to one.
-#[allow(dead_code)] // the admin and sign-up paths shall take it up
 pub async fn set_banned(pool: &PgPool, who: Uuid, banned: bool) -> Result<()> {
     let done = sqlx::query(
         "update profiles

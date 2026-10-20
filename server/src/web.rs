@@ -2161,6 +2161,21 @@ fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
 
+/// What the admin page saith of one person. With mail, an unconfirmed address
+/// is the first thing to know; without it, approval is what is awaited.
+fn standing_of(p: &people::Profile, confirmed: bool, mail: bool) -> String {
+    let since = |at: chrono::DateTime<chrono::Utc>| at.format("%d %b %H:%M").to_string();
+    if let Some(at) = p.banned_at {
+        format!("banned since {}", since(at))
+    } else if mail && !confirmed {
+        "not confirmed yet".to_string()
+    } else if people::is_in(p) {
+        "in".to_string()
+    } else {
+        format!("waiting since {}", since(p.created_at))
+    }
+}
+
 pub async fn admin_page(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -2174,8 +2189,15 @@ pub async fn admin_page(
     if !people::profile(&state.pool, user.id).await.is_some_and(|p| p.is_admin) {
         return (StatusCode::NOT_FOUND, "no such page").into_response();
     }
+    let mail = state.mail.is_some();
     let folk = people::everyone(&state.pool).await.unwrap_or_default();
+    let confirmed = if mail {
+        db::confirmed_users(&state.pool).await.unwrap_or_default()
+    } else {
+        Default::default()
+    };
     let waiting = folk.iter().filter(|p| !p.approved).count();
+    let banned = folk.iter().filter(|p| p.banned_at.is_some()).count();
 
     page(
         lang,
@@ -2185,21 +2207,36 @@ pub async fn admin_page(
             h1 { "Who may join" }
             p.meta { a href="/admin/health" { (lang.words().how_it_fares) } }
             p.lede {
-                @if waiting == 0 { "Nobody is waiting." }
-                @else if waiting == 1 { "One person is waiting." }
-                @else { (waiting) " people are waiting." }
+                @if mail {
+                    @if banned == 0 { "Nobody is banned." }
+                    @else if banned == 1 { "One person is banned." }
+                    @else { (banned) " people are banned." }
+                } @else {
+                    @if waiting == 0 { "Nobody is waiting." }
+                    @else if waiting == 1 { "One person is waiting." }
+                    @else { (waiting) " people are waiting." }
+                }
             }
             @for person in &folk {
                 .card {
                     h3 { (person.email) }
                     p.meta {
                         @if person.is_admin { "administrator · " }
-                        @if person.approved { "approved" } @else { "waiting since " }
-                        @if !person.approved { (person.created_at.format("%d %b %H:%M").to_string()) }
+                        (standing_of(person, confirmed.contains(&person.user_id), mail))
                     }
                     @if !person.is_admin {
                         .actions {
-                            @if person.approved {
+                            @if mail {
+                                @if person.banned_at.is_some() {
+                                    form method="post" action={ "/admin/" (person.user_id) "/unban" } {
+                                        button type="submit" { "Undo ban" }
+                                    }
+                                } @else {
+                                    form method="post" action={ "/admin/" (person.user_id) "/ban" } {
+                                        button type="submit" { "Ban" }
+                                    }
+                                }
+                            } @else if person.approved {
                                 form method="post" action={ "/admin/" (person.user_id) "/revoke" } {
                                     button type="submit" { "Revoke" }
                                 }
@@ -2229,11 +2266,21 @@ pub async fn admin_decide(
     if !people::profile(&state.pool, user.id).await.is_some_and(|p| p.is_admin) {
         return (StatusCode::NOT_FOUND, "no such page").into_response();
     }
-    let admitting = what == "approve";
-    let _ = people::set_approved(&state.pool, who, user.id, admitting).await;
-    if admitting {
-        // They signed up and were told to wait; this is the end of the waiting.
-        let _ = crate::post::tell(&state, who, crate::post::Notice::Admitted, None).await;
+    let mail = state.mail.is_some();
+    match (what.as_str(), mail) {
+        // With mail, the administrator may bar and unbar, and admit no one.
+        ("ban" | "unban", true) => {
+            let _ = people::set_banned(&state.pool, who, what == "ban").await;
+        }
+        ("approve" | "revoke", false) => {
+            let admitting = what == "approve";
+            let _ = people::set_approved(&state.pool, who, user.id, admitting).await;
+            if admitting {
+                // They signed up and were told to wait; this is the end of the waiting.
+                let _ = crate::post::tell(&state, who, crate::post::Notice::Admitted, None).await;
+            }
+        }
+        _ => {}
     }
     Redirect::to("/admin").into_response()
 }
@@ -2797,5 +2844,27 @@ mod return_tests {
         for elsewhere in ["https://evil.example/", "//evil.example", "/admin", "", "x#pw-1"] {
             assert!(super::return_target(elsewhere).is_none(), "{elsewhere} must lead nowhere");
         }
+    }
+
+    #[test]
+    fn person_state_words() {
+        use chrono::TimeZone;
+        let at = chrono::Utc.with_ymd_and_hms(2026, 3, 4, 5, 6, 0).unwrap();
+        let p = |approved, banned: bool| crate::people::Profile {
+            user_id: super::Uuid::nil(),
+            email: String::new(),
+            approved,
+            is_admin: false,
+            banned_at: banned.then_some(at),
+            created_at: at,
+        };
+        assert_eq!(super::standing_of(&p(true, false), false, true), "not confirmed yet");
+        assert_eq!(super::standing_of(&p(true, false), true, true), "in");
+        assert_eq!(super::standing_of(&p(true, true), true, true), "banned since 04 Mar 05:06");
+        assert_eq!(
+            super::standing_of(&p(false, false), false, false),
+            "waiting since 04 Mar 05:06"
+        );
+        assert_eq!(super::standing_of(&p(true, false), false, false), "in");
     }
 }

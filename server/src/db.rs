@@ -9,6 +9,7 @@ use sqlx::{PgPool, Row};
 use stundenglas_core::{Credentials, DEFAULT_TZ, Timetable};
 use uuid::Uuid;
 
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use crate::crypto::{Sealed, Sealer};
@@ -1004,6 +1005,15 @@ pub async fn auth_user_by_email(pool: &PgPool, email: &str) -> Result<Option<(Uu
     .await
     .context("looking up the account by address")?;
     Ok(row.map(|r| (r.get("id"), r.get("confirmed"))))
+}
+
+/// Everyone whose email is confirmed, in one query.
+pub async fn confirmed_users(pool: &PgPool) -> Result<HashSet<Uuid>> {
+    let rows = sqlx::query("select id from auth.users where email_confirmed_at is not null")
+        .fetch_all(pool)
+        .await
+        .context("listing the confirmed accounts")?;
+    Ok(rows.iter().map(|r| r.get("id")).collect())
 }
 
 #[cfg(test)]
