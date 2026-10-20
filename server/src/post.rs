@@ -251,8 +251,34 @@ fn mail_kind(kind: Token) -> &'static str {
     }
 }
 
-async fn counts(pool: &PgPool, email: &str, ip: Option<IpAddr>) -> Result<Counts> {
-    let ip = ip.map(|ip| ip.to_string());
+/// One network, one bucket: an IPv6 visitor commandeth a whole /64, so the
+/// low half is dropped; an IPv4 address stayeth as it is.
+fn bucket(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & (u128::MAX << 64)).into()),
+    }
+}
+
+/// The one lock that maketh counting and reserving a single act.
+const MAIL_LOCK: i64 = 0x5347_4d41_494c;
+
+/// Count what hath been sent and, if the limits allow, write down this mail
+/// beforehand, all under one lock so that no two requests count alike.
+/// None when a limit is reached.
+async fn reserve(
+    pool: &PgPool,
+    kind: Token,
+    email: &str,
+    ip: Option<IpAddr>,
+) -> Result<Option<i64>> {
+    let ip = ip.map(|ip| bucket(ip).to_string());
+    let mut tx = pool.begin().await.context("beginning the count")?;
+    sqlx::query("select pg_advisory_xact_lock($1)")
+        .bind(MAIL_LOCK)
+        .execute(&mut *tx)
+        .await
+        .context("taking the mail lock")?;
     let (address_minute, address_day, ip_hour, all_day): (i64, i64, i64, i64) = sqlx::query_as(
         "select
             count(*) filter (where address = $1 and sent_at > now() - interval '1 minute'),
@@ -264,11 +290,37 @@ async fn counts(pool: &PgPool, email: &str, ip: Option<IpAddr>) -> Result<Counts
           where sent_at > now() - interval '1 day'",
     )
     .bind(email)
-    .bind(ip)
-    .fetch_one(pool)
+    .bind(&ip)
+    .fetch_one(&mut *tx)
     .await
     .context("counting recent mail")?;
-    Ok(Counts { address_minute, address_day, ip_hour, all_day })
+    let seen = Counts { address_minute, address_day, ip_hour, all_day };
+    if !within_limits(&seen) {
+        if seen.all_day >= 150 {
+            tracing::warn!(sent_today = seen.all_day, "the daily mail limit is reached");
+        }
+        return Ok(None);
+    }
+    let (id,): (i64,) = sqlx::query_as(
+        "insert into mail_sends (address, ip, kind) values ($1, $2::inet, $3) returning id",
+    )
+    .bind(email)
+    .bind(&ip)
+    .bind(mail_kind(kind))
+    .fetch_one(&mut *tx)
+    .await
+    .context("reserving the mail")?;
+    tx.commit().await.context("committing the reservation")?;
+    Ok(Some(id))
+}
+
+/// Give back a reservation whose mail never left. Best effort.
+async fn release(pool: &PgPool, id: i64) {
+    if let Err(err) =
+        sqlx::query("delete from mail_sends where id = $1").bind(id).execute(pool).await
+    {
+        tracing::warn!(id, "could not release an unsent mail's place: {err:#}");
+    }
 }
 
 /// Mint a token for this address and mail the link. False when nothing went:
@@ -283,15 +335,33 @@ pub async fn send_token_mail(
     lang: Lang,
 ) -> Result<bool> {
     let Some(mailer) = &state.mail else { return Ok(false) };
+    let email = crate::auth::normalise_address(email);
+    let email = email.as_str();
 
-    let seen = counts(&state.pool, email, ip).await?;
-    if !within_limits(&seen) {
-        if seen.all_day >= 150 {
-            tracing::warn!(sent_today = seen.all_day, "the daily mail limit is reached");
+    // The place is taken before anything is sent, so that requests which come
+    // together cannot all pass the count; it is given back if the mail fails.
+    let Some(id) = reserve(&state.pool, kind, email, ip).await? else { return Ok(false) };
+
+    match mint_and_send(state, mailer, kind, email, lang).await {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            release(&state.pool, id).await;
+            Ok(false)
         }
-        return Ok(false);
+        Err(err) => {
+            release(&state.pool, id).await;
+            Err(err)
+        }
     }
+}
 
+async fn mint_and_send(
+    state: &AppState,
+    mailer: &Mailer,
+    kind: Token,
+    email: &str,
+    lang: Lang,
+) -> Result<bool> {
     let Some(hash) = crate::auth::mint(state, kind, email).await? else { return Ok(false) };
     let link = link_for(&state.config.public_url, kind, &hash);
 
@@ -304,22 +374,12 @@ pub async fn send_token_mail(
         .context("composing the message")?;
 
     mailer.transport.send(message).await.context("sending the message")?;
-
-    // Only after the send hath succeeded is it counted, lest a failing relay
-    // eat the visitor's allowance for mail that never left.
-    sqlx::query("insert into mail_sends (address, ip, kind) values ($1, $2::inet, $3)")
-        .bind(email)
-        .bind(ip.map(|ip| ip.to_string()))
-        .bind(mail_kind(kind))
-        .execute(&state.pool)
-        .await
-        .context("noting the mail sent")?;
     Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Counts, Notice, body, link_for, subject, within_limits};
+    use super::{Counts, Notice, body, bucket, link_for, subject, within_limits};
     use crate::auth::Token;
     use crate::words::Lang;
 
@@ -392,5 +452,14 @@ mod tests {
         assert!(!within_limits(&c(0, 0, 10, 0)));
         assert!(!within_limits(&c(0, 0, 0, 150)));
         assert!(within_limits(&c(0, 4, 9, 149)));
+    }
+
+    #[test]
+    fn an_ipv6_network_is_one_bucket_and_ipv4_hosts_are_not() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert_eq!(bucket(ip("2001:db8:1:2:3:4:5:6")), bucket(ip("2001:db8:1:2:ffff::1")));
+        assert_ne!(bucket(ip("2001:db8:1:2::1")), bucket(ip("2001:db8:1:3::1")));
+        assert_ne!(bucket(ip("192.0.2.1")), bucket(ip("192.0.2.2")));
+        assert_eq!(bucket(ip("2001:db8:1:2:3:4:5:6")), ip("2001:db8:1:2::"));
     }
 }
