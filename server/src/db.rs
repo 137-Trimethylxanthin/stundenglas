@@ -647,6 +647,35 @@ pub async fn forget_stale(pool: &PgPool, days: i64) -> Result<u64> {
     Ok(done.rows_affected())
 }
 
+/// Accounts made by address and never confirmed within these days. An
+/// administrator is never among them: that account is the way back in.
+pub async fn unconfirmed_older_than(pool: &PgPool, days: i64) -> Result<Vec<Uuid>> {
+    let rows = sqlx::query_scalar::<_, Uuid>(
+        "select u.id from auth.users u
+           left join profiles p on p.user_id = u.id
+          where u.email_confirmed_at is null
+            and u.created_at < now() - make_interval(days => $1::int)
+            and coalesce(p.is_admin, false) = false",
+    )
+    .bind(days as i32)
+    .fetch_all(pool)
+    .await
+    .context("looking for unconfirmed sign-ups")?;
+    Ok(rows)
+}
+
+/// The mail log is wanted only for the limits, which look back a day.
+pub async fn prune_mail_sends(pool: &PgPool, days: i64) -> Result<u64> {
+    let done = sqlx::query(
+        "delete from mail_sends where sent_at < now() - make_interval(days => $1::int)",
+    )
+    .bind(days as i32)
+    .execute(pool)
+    .await
+    .context("pruning the mail log")?;
+    Ok(done.rows_affected())
+}
+
 /// Whether this user owneth that school link. Asked before anything is changed.
 pub async fn owns(pool: &PgPool, user_id: Uuid, account: Uuid) -> Result<bool> {
     let found = sqlx::query("select 1 from untis_accounts where id = $1 and user_id = $2")

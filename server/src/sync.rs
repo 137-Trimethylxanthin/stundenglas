@@ -25,11 +25,44 @@ pub async fn run(state: AppState) {
             Ok(n) => tracing::info!(count = n, "forgot stale timetables"),
             Err(err) => tracing::warn!("could not forget stale timetables: {err:#}"),
         }
+        forget_the_unconfirmed(&state).await;
         if let Err(err) = once(state.clone()).await {
             tracing::error!("sync round failed: {err:#}");
         }
         tell_the_stalled(&state).await;
         remind_the_refused(&state).await;
+    }
+}
+
+/// A sign-up that was mailed a link and never followed it is forgotten after a
+/// week, with all it owned. Only when mail is configured, else nobody could
+/// have been asked to confirm. The mail log is pruned here too.
+async fn forget_the_unconfirmed(state: &AppState) {
+    match crate::db::prune_mail_sends(&state.pool, 2).await {
+        Ok(_) => {}
+        Err(err) => tracing::warn!("could not prune the mail log: {err:#}"),
+    }
+    if state.mail.is_none() {
+        return;
+    }
+    let stale = match crate::db::unconfirmed_older_than(&state.pool, 7).await {
+        Ok(found) => found,
+        Err(err) => {
+            tracing::warn!("could not look for unconfirmed sign-ups: {err:#}");
+            return;
+        }
+    };
+    let mut gone = 0;
+    for who in stale {
+        match crate::auth::delete_user(state, who).await {
+            Ok(()) => gone += 1,
+            Err(err) => {
+                tracing::warn!(user = %who, "could not forget an unconfirmed sign-up: {err:#}")
+            }
+        }
+    }
+    if gone > 0 {
+        tracing::info!(count = gone, "forgot unconfirmed sign-ups");
     }
 }
 

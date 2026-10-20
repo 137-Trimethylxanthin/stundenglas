@@ -103,7 +103,7 @@ export SUPABASE_URL=…              SUPABASE_ANON_KEY=…
 export SUPABASE_SERVICE_KEY=…      PUBLIC_URL=https://your.host
 # optional, for pushing into Google Calendar rather than being polled:
 export GOOGLE_CLIENT_ID=…          GOOGLE_CLIENT_SECRET=…
-# optional, to tell people when something needs them:
+# optional, to confirm sign-ups and reset passwords by mail, and to tell people when something needs them:
 export SMTP_URL=smtps://user:pass@smtp.example.test:465
 export MAIL_FROM="stundenglas <noreply@example.test>"
 # optional: how long a timetable nobody refreshes is kept (default 180 days)
@@ -121,17 +121,30 @@ placing it yourself.
 
 ### Who gets in
 
-Signing up is open; being let in is not. A new account waits until an
-administrator approves it, and until then can do nothing at all — not even add
-a school. Name the administrators by address:
+With `SMTP_URL` set, signing up asks only for an address. A link is mailed
+there, and on it the password is chosen; following it is what lets them in. An
+administrator can only ban an account, which stops its pages, its calendar
+links, WebUntis and Google. "Forgot your password?" sends a link by mail too.
+Mail is rationed: one a minute and five a day per address, ten an hour per
+network, and 150 a day in all. A sign-up never confirmed is forgotten after a
+week. Supabase must have `ENABLE_EMAIL_AUTOCONFIRM=false` when `SMTP_URL` is
+set, or it will confirm everyone itself.
+
+Name the administrators by address:
 
 ```sh
 export ADMIN_EMAILS=you@example.test,someone@example.test
 ```
 
-Those addresses are admitted the moment they sign up, and see a page listing
-everyone waiting, and another showing how every link is faring: who is failing,
-who is waiting on a password, whose calendar nobody has ever fetched.
+Those addresses are administrators once they have confirmed, like anyone, and
+see a page listing every account, and another showing how every link is faring:
+who is failing, who is waiting on a password, whose calendar nobody has ever
+fetched.
+
+Without `SMTP_URL`, the old way holds: the password is chosen at sign-up, and a
+new account waits until an administrator lets it in, able to do nothing at all
+until then, not even add a school. Addresses in `ADMIN_EMAILS` are let in at
+once.
 
 ### Security keys
 
