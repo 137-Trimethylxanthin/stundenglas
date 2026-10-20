@@ -5,6 +5,8 @@
 //! adds is the case where nobody is looking at the page — a password the
 //! school has refused, which stops the timetable until its owner acts.
 
+use std::net::IpAddr;
+
 use anyhow::{Context, Result};
 use lettre::message::header::ContentType;
 use lettre::transport::smtp::AsyncSmtpTransport;
@@ -13,6 +15,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::auth::Token;
+use crate::words::Lang;
 
 /// What a notice is about, and how often it may be repeated.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -168,9 +172,156 @@ impl Mailer {
     }
 }
 
+/// What the mail saith in the subject, bare; the sender prefixeth the name.
+pub fn subject(kind: Token, lang: Lang) -> &'static str {
+    match (kind, lang) {
+        (Token::Confirm, Lang::De) => "Bestätige deine Adresse",
+        (Token::Confirm, Lang::En) => "Confirm your address",
+        (Token::Reset, Lang::De) => "Neues Passwort",
+        (Token::Reset, Lang::En) => "A new password",
+    }
+}
+
+/// The mail's words, with the link in them. Each saith that the link lasteth
+/// an hour, and that ignoring the mail changeth nothing.
+pub fn body(kind: Token, lang: Lang, link: &str) -> String {
+    match (kind, lang) {
+        (Token::Confirm, Lang::De) => format!(
+            "Jemand, hoffentlich du, hat sich mit dieser Adresse bei stundenglas angemeldet.\n\n\
+             Um fertig zu werden, öffne diesen Link und wähle dort dein Passwort \
+             (er gilt eine Stunde):\n{link}\n\n\
+             Warst du das nicht, ignoriere diese Nachricht. Ohne den Link passiert nichts.\n"
+        ),
+        (Token::Confirm, Lang::En) => format!(
+            "Someone, hopefully you, signed up at stundenglas with this address.\n\n\
+             To finish, open this link and choose your password there \
+             (it is valid for one hour):\n{link}\n\n\
+             If it was not you, ignore this message. Nothing happens without the link.\n"
+        ),
+        (Token::Reset, Lang::De) => format!(
+            "Du (hoffentlich) hast darum gebeten, ein neues Passwort zu wählen.\n\n\
+             Öffne den Link, um es zu wählen (er gilt eine Stunde):\n{link}\n\n\
+             Hast du nicht darum gebeten, ignoriere diese Nachricht; dein Passwort \
+             bleibt, wie es ist.\n"
+        ),
+        (Token::Reset, Lang::En) => format!(
+            "You (hopefully) asked to choose a new password.\n\n\
+             Open the link to choose it (it is valid for one hour):\n{link}\n\n\
+             If you did not ask, ignore this message and your password stays as it is.\n"
+        ),
+    }
+}
+
+/// Where the mail sendeth them: the public address, the page, the token
+/// percent-encoded so that nothing in it may be mistaken for the URL's own marks.
+pub fn link_for(public_url: &str, kind: Token, token_hash: &str) -> String {
+    let page = match kind {
+        Token::Confirm => "confirm",
+        Token::Reset => "reset",
+    };
+    let mut encoded = String::with_capacity(token_hash.len());
+    for byte in token_hash.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    format!("{}/{page}?t={encoded}", public_url.trim_end_matches('/'))
+}
+
+/// How much hath been sent lately, to this address, this network, and in all.
+pub struct Counts {
+    pub address_minute: i64,
+    pub address_day: i64,
+    pub ip_hour: i64,
+    pub all_day: i64,
+}
+
+/// One mail a minute and five a day to an address, ten an hour to a network,
+/// a hundred and fifty a day in all: the relay's goodwill is not endless.
+pub fn within_limits(c: &Counts) -> bool {
+    c.address_minute < 1 && c.address_day < 5 && c.ip_hour < 10 && c.all_day < 150
+}
+
+fn mail_kind(kind: Token) -> &'static str {
+    match kind {
+        Token::Confirm => "confirm",
+        Token::Reset => "reset",
+    }
+}
+
+async fn counts(pool: &PgPool, email: &str, ip: Option<IpAddr>) -> Result<Counts> {
+    let ip = ip.map(|ip| ip.to_string());
+    let (address_minute, address_day, ip_hour, all_day): (i64, i64, i64, i64) = sqlx::query_as(
+        "select
+            count(*) filter (where address = $1 and sent_at > now() - interval '1 minute'),
+            count(*) filter (where address = $1),
+            count(*) filter (where $2::inet is not null and ip = $2::inet
+                               and sent_at > now() - interval '1 hour'),
+            count(*)
+           from mail_sends
+          where sent_at > now() - interval '1 day'",
+    )
+    .bind(email)
+    .bind(ip)
+    .fetch_one(pool)
+    .await
+    .context("counting recent mail")?;
+    Ok(Counts { address_minute, address_day, ip_hour, all_day })
+}
+
+/// Mint a token for this address and mail the link. False when nothing went:
+/// no mailer, a limit reached, or no such account (which the caller must not
+/// let the visitor tell apart from success).
+#[allow(dead_code)] // the sign-up and reset pages shall call it
+pub async fn send_token_mail(
+    state: &AppState,
+    kind: Token,
+    email: &str,
+    ip: Option<IpAddr>,
+    lang: Lang,
+) -> Result<bool> {
+    let Some(mailer) = &state.mail else { return Ok(false) };
+
+    let seen = counts(&state.pool, email, ip).await?;
+    if !within_limits(&seen) {
+        if seen.all_day >= 150 {
+            tracing::warn!(sent_today = seen.all_day, "the daily mail limit is reached");
+        }
+        return Ok(false);
+    }
+
+    let Some(hash) = crate::auth::mint(state, kind, email).await? else { return Ok(false) };
+    let link = link_for(&state.config.public_url, kind, &hash);
+
+    let message = Message::builder()
+        .from(mailer.from.parse().context("MAIL_FROM is not an address")?)
+        .to(email.parse().context("that address is not usable")?)
+        .subject(format!("stundenglas — {}", subject(kind, lang)))
+        .header(ContentType::TEXT_PLAIN)
+        .body(body(kind, lang, &link))
+        .context("composing the message")?;
+
+    mailer.transport.send(message).await.context("sending the message")?;
+
+    // Only after the send hath succeeded is it counted, lest a failing relay
+    // eat the visitor's allowance for mail that never left.
+    sqlx::query("insert into mail_sends (address, ip, kind) values ($1, $2::inet, $3)")
+        .bind(email)
+        .bind(ip.map(|ip| ip.to_string()))
+        .bind(mail_kind(kind))
+        .execute(&state.pool)
+        .await
+        .context("noting the mail sent")?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Notice;
+    use super::{Counts, Notice, body, link_for, subject, within_limits};
+    use crate::auth::Token;
+    use crate::words::Lang;
 
     #[test]
     fn every_notice_says_where_to_go_and_what_it_is_about() {
@@ -200,5 +351,46 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), kinds.len());
+    }
+
+    #[test]
+    fn bodies_carry_the_link_in_both_tongues() {
+        let link = "https://example.test/confirm?t=abc";
+        for kind in [Token::Confirm, Token::Reset] {
+            for lang in [Lang::De, Lang::En] {
+                assert!(body(kind, lang, link).contains(link));
+                assert!(!subject(kind, lang).is_empty());
+            }
+        }
+        assert!(body(Token::Confirm, Lang::De, "x").contains("eine Stunde"));
+        assert!(body(Token::Confirm, Lang::En, "x").contains("one hour"));
+    }
+
+    #[test]
+    fn link_for_joins_cleanly() {
+        assert_eq!(
+            link_for("https://untis.maxi.co.at/", Token::Reset, "a b"),
+            "https://untis.maxi.co.at/reset?t=a%20b"
+        );
+        assert_eq!(
+            link_for("https://x.test", Token::Confirm, "a+b/c=d-e_f"),
+            "https://x.test/confirm?t=a%2Bb%2Fc%3Dd-e_f"
+        );
+    }
+
+    #[test]
+    fn within_limits_edges() {
+        let c = |address_minute, address_day, ip_hour, all_day| Counts {
+            address_minute,
+            address_day,
+            ip_hour,
+            all_day,
+        };
+        assert!(within_limits(&c(0, 0, 0, 0)));
+        assert!(!within_limits(&c(1, 0, 0, 0)));
+        assert!(!within_limits(&c(0, 5, 0, 0)));
+        assert!(!within_limits(&c(0, 0, 10, 0)));
+        assert!(!within_limits(&c(0, 0, 0, 150)));
+        assert!(within_limits(&c(0, 4, 9, 149)));
     }
 }
