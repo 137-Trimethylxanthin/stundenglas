@@ -1726,6 +1726,13 @@ pub async fn confirm(
         tracing::error!(user = %who.user, "confirmed, but the password was refused: {err:#}");
         return say(lang, w.trouble_title, w.unfinished_body);
     }
+    // Should a reset token be spent here, the password was changed all the
+    // same; so every other session is shut, as a reset would shut them. For a
+    // new account there is none.
+    if let Err(err) = auth::close_all_sessions(&state.pool, who.user).await {
+        tracing::error!(user = %who.user, "confirmed, but the old sessions stay open: {err:#}");
+        return say(lang, w.trouble_title, w.trouble_body);
+    }
     if let Err(err) = people::admit(&state.pool, who.user).await {
         tracing::error!(user = %who.user, "confirmed, but could not be let in: {err:#}");
     }
@@ -1865,9 +1872,8 @@ pub async fn reset(
             return say(lang, w.trouble_title, w.trouble_body);
         }
     };
-    if let Err(err) = auth::set_password(&state, who.user, &form.password).await {
-        tracing::error!(user = %who.user, "a reset password was refused: {err:#}");
-        return page(
+    let unfinished = || {
+        page(
             lang,
             w.trouble_title,
             None,
@@ -1877,9 +1883,18 @@ pub async fn reset(
                 p { a href="/forgot" { (w.ask_for_new) } }
             },
         )
-        .into_response();
+        .into_response()
+    };
+    if let Err(err) = auth::set_password(&state, who.user, &form.password).await {
+        tracing::error!(user = %who.user, "a reset password was refused: {err:#}");
+        return unfinished();
     }
-    auth::close_all_sessions(&state.pool, who.user).await;
+    // A reset is for shutting out whoever else hath the password; it is not
+    // called done while any of their sessions might still be open.
+    if let Err(err) = auth::close_all_sessions(&state.pool, who.user).await {
+        tracing::error!(user = %who.user, "a password was reset, but the sessions stay open: {err:#}");
+        return unfinished();
+    }
     tracing::info!(user = %who.user, "password reset by mail; every session closed");
     Redirect::to("/?changed=1").into_response()
 }
@@ -2163,6 +2178,71 @@ fn plural(count: usize) -> &'static str {
 
 /// What the admin page saith of one person. With mail, an unconfirmed address
 /// is the first thing to know; without it, approval is what is awaited.
+/// What an administrator may do to one account, named as the path nameth it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Choice {
+    Ban,
+    Unban,
+    Approve,
+    Revoke,
+}
+
+impl Choice {
+    fn from_path(what: &str) -> Option<Self> {
+        match what {
+            "ban" => Some(Choice::Ban),
+            "unban" => Some(Choice::Unban),
+            "approve" => Some(Choice::Approve),
+            "revoke" => Some(Choice::Revoke),
+            _ => None,
+        }
+    }
+
+    fn path(self) -> &'static str {
+        match self {
+            Choice::Ban => "ban",
+            Choice::Unban => "unban",
+            Choice::Approve => "approve",
+            Choice::Revoke => "revoke",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Choice::Ban => "Ban",
+            Choice::Unban => "Undo ban",
+            Choice::Approve => "Let them in",
+            Choice::Revoke => "Revoke",
+        }
+    }
+
+    /// With mail, one may bar and admit no one; without, admit and revoke. A
+    /// ban, however it came, may always be lifted.
+    fn allowed(self, mail: bool) -> bool {
+        match self {
+            Choice::Unban => true,
+            Choice::Ban => mail,
+            Choice::Approve | Choice::Revoke => !mail,
+        }
+    }
+}
+
+/// The one thing offered for an account, if any. One banned is offered only
+/// the lifting of it, whether mail be configured or no.
+fn choice_for(p: &people::Profile, mail: bool) -> Option<Choice> {
+    if p.is_admin {
+        None
+    } else if p.banned_at.is_some() {
+        Some(Choice::Unban)
+    } else if mail {
+        Some(Choice::Ban)
+    } else if p.approved {
+        Some(Choice::Revoke)
+    } else {
+        Some(Choice::Approve)
+    }
+}
+
 fn standing_of(p: &people::Profile, confirmed: bool, mail: bool) -> String {
     let since = |at: chrono::DateTime<chrono::Utc>| at.format("%d %b %H:%M").to_string();
     if let Some(at) = p.banned_at {
@@ -2192,7 +2272,11 @@ pub async fn admin_page(
     let mail = state.mail.is_some();
     let folk = people::everyone(&state.pool).await.unwrap_or_default();
     let confirmed = if mail {
-        db::confirmed_users(&state.pool).await.unwrap_or_default()
+        db::confirmed_users(&state.pool).await.unwrap_or_else(|err| {
+            // The page is still drawn, but everyone will look unconfirmed.
+            tracing::warn!("could not list the confirmed accounts: {err:#}");
+            Default::default()
+        })
     } else {
         Default::default()
     };
@@ -2224,26 +2308,10 @@ pub async fn admin_page(
                         @if person.is_admin { "administrator · " }
                         (standing_of(person, confirmed.contains(&person.user_id), mail))
                     }
-                    @if !person.is_admin {
+                    @if let Some(choice) = choice_for(person, mail) {
                         .actions {
-                            @if mail {
-                                @if person.banned_at.is_some() {
-                                    form method="post" action={ "/admin/" (person.user_id) "/unban" } {
-                                        button type="submit" { "Undo ban" }
-                                    }
-                                } @else {
-                                    form method="post" action={ "/admin/" (person.user_id) "/ban" } {
-                                        button type="submit" { "Ban" }
-                                    }
-                                }
-                            } @else if person.approved {
-                                form method="post" action={ "/admin/" (person.user_id) "/revoke" } {
-                                    button type="submit" { "Revoke" }
-                                }
-                            } @else {
-                                form method="post" action={ "/admin/" (person.user_id) "/approve" } {
-                                    button type="submit" { "Let them in" }
-                                }
+                            form method="post" action={ "/admin/" (person.user_id) "/" (choice.path()) } {
+                                button type="submit" { (choice.label()) }
                             }
                         }
                     }
@@ -2266,21 +2334,23 @@ pub async fn admin_decide(
     if !people::profile(&state.pool, user.id).await.is_some_and(|p| p.is_admin) {
         return (StatusCode::NOT_FOUND, "no such page").into_response();
     }
-    let mail = state.mail.is_some();
-    match (what.as_str(), mail) {
-        // With mail, the administrator may bar and unbar, and admit no one.
-        ("ban" | "unban", true) => {
-            let _ = people::set_banned(&state.pool, who, what == "ban").await;
+    let Some(choice) = Choice::from_path(&what).filter(|c| c.allowed(state.mail.is_some())) else {
+        return Redirect::to("/admin").into_response();
+    };
+    match choice {
+        Choice::Ban | Choice::Unban => {
+            if let Err(err) = people::set_banned(&state.pool, who, choice == Choice::Ban).await {
+                tracing::error!(user = %who, "could not change a ban: {err:#}");
+            }
         }
-        ("approve" | "revoke", false) => {
-            let admitting = what == "approve";
+        Choice::Approve | Choice::Revoke => {
+            let admitting = choice == Choice::Approve;
             let _ = people::set_approved(&state.pool, who, user.id, admitting).await;
             if admitting {
                 // They signed up and were told to wait; this is the end of the waiting.
                 let _ = crate::post::tell(&state, who, crate::post::Notice::Admitted, None).await;
             }
         }
-        _ => {}
     }
     Redirect::to("/admin").into_response()
 }
@@ -2866,5 +2936,56 @@ mod return_tests {
             "waiting since 04 Mar 05:06"
         );
         assert_eq!(super::standing_of(&p(true, false), false, false), "in");
+    }
+
+    fn someone(approved: bool, banned: bool, is_admin: bool) -> crate::people::Profile {
+        crate::people::Profile {
+            user_id: super::Uuid::nil(),
+            email: String::new(),
+            approved,
+            is_admin,
+            banned_at: banned.then(chrono::Utc::now),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn one_banned_is_offered_only_the_undoing_whatever_the_mail() {
+        use super::{Choice, choice_for};
+        for mail in [true, false] {
+            for approved in [true, false] {
+                let p = someone(approved, true, false);
+                assert_eq!(choice_for(&p, mail), Some(Choice::Unban), "mail {mail}");
+            }
+        }
+        assert_eq!(choice_for(&someone(true, false, false), true), Some(Choice::Ban));
+        assert_eq!(choice_for(&someone(false, false, false), true), Some(Choice::Ban));
+        assert_eq!(choice_for(&someone(true, false, false), false), Some(Choice::Revoke));
+        assert_eq!(choice_for(&someone(false, false, false), false), Some(Choice::Approve));
+        assert_eq!(choice_for(&someone(true, false, true), true), None);
+        assert_eq!(choice_for(&someone(true, false, true), false), None);
+    }
+
+    #[test]
+    fn a_ban_is_made_only_with_mail_but_lifted_without() {
+        use super::Choice;
+        assert!(Choice::Unban.allowed(true));
+        assert!(Choice::Unban.allowed(false));
+        assert!(Choice::Ban.allowed(true));
+        assert!(!Choice::Ban.allowed(false));
+        assert!(!Choice::Approve.allowed(true));
+        assert!(!Choice::Revoke.allowed(true));
+        assert!(Choice::Approve.allowed(false));
+        assert!(Choice::Revoke.allowed(false));
+    }
+
+    #[test]
+    fn a_choice_is_named_as_its_path() {
+        use super::Choice;
+        for c in [Choice::Ban, Choice::Unban, Choice::Approve, Choice::Revoke] {
+            assert_eq!(Choice::from_path(c.path()), Some(c));
+        }
+        assert_eq!(Choice::from_path("delete"), None);
+        assert_eq!(Choice::from_path(""), None);
     }
 }

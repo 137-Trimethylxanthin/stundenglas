@@ -142,9 +142,10 @@ pub async fn accounts_of(pool: &PgPool, user_id: Uuid) -> Result<Vec<UntisAccoun
     Ok(rows.iter().map(account_from).collect())
 }
 
-/// The queries that hand an account, or its calendar, to the world. Each
-/// joineth profiles and asketh whether the owner is in, that a ban may reach
-/// them all; they are built once, that the test may read what is really sent.
+/// The queries that hand an account, or its calendar, to the world, or that
+/// mail its owner about it. Each joineth profiles and asketh whether the owner
+/// is in, that a ban may reach them all; they are built once, that the test
+/// may read what is really sent.
 static ACCOUNTS_TO_SYNC_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         "select a.id, a.server, a.school, a.username, a.display_name, a.enabled,
@@ -192,6 +193,21 @@ static FEED_BY_TOKEN_SQL: LazyLock<String> = LazyLock::new(|| {
            join profiles p on p.user_id = a.user_id
            left join sync_state s on s.untis_account_id = f.untis_account_id
           where f.token = $1 and a.enabled and {}",
+        people::ADMITTED_SQL
+    )
+});
+
+static STALLED_SINCE_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "select a.id, a.user_id
+           from untis_accounts a
+           join profiles p on p.user_id = a.user_id
+           join sync_state s on s.untis_account_id = a.id
+          where a.enabled
+            and not a.credentials_rejected
+            and {}
+            and s.consecutive_fails > 0
+            and coalesce(s.last_ok_at, s.updated_at) < now() - make_interval(hours => $1::int)",
         people::ADMITTED_SQL
     )
 });
@@ -648,20 +664,40 @@ pub async fn forget_stale(pool: &PgPool, days: i64) -> Result<u64> {
 }
 
 /// Accounts made by address and never confirmed within these days. An
-/// administrator is never among them: that account is the way back in.
+/// administrator is never among them: that account is the way back in. Nor
+/// is one banned: its ban is kept where it can be seen and lifted.
 pub async fn unconfirmed_older_than(pool: &PgPool, days: i64) -> Result<Vec<Uuid>> {
     let rows = sqlx::query_scalar::<_, Uuid>(
         "select u.id from auth.users u
            left join profiles p on p.user_id = u.id
           where u.email_confirmed_at is null
             and u.created_at < now() - make_interval(days => $1::int)
-            and coalesce(p.is_admin, false) = false",
+            and coalesce(p.is_admin, false) = false
+            and p.banned_at is null",
     )
     .bind(days as i32)
     .fetch_all(pool)
     .await
     .context("looking for unconfirmed sign-ups")?;
     Ok(rows)
+}
+
+/// Asked again just before an unconfirmed account is forgotten, for its owner
+/// may have followed the link since it was found, or been banned.
+pub async fn still_unconfirmed(pool: &PgPool, user: Uuid) -> Result<bool> {
+    sqlx::query_scalar::<_, bool>(
+        "select exists (
+             select 1 from auth.users u
+               left join profiles p on p.user_id = u.id
+              where u.id = $1
+                and u.email_confirmed_at is null
+                and coalesce(p.is_admin, false) = false
+                and p.banned_at is null)",
+    )
+    .bind(user)
+    .fetch_one(pool)
+    .await
+    .context("asking again whether a sign-up is unconfirmed")
 }
 
 /// The mail log is wanted only for the limits, which look back a day.
@@ -980,21 +1016,13 @@ pub async fn health(pool: &PgPool) -> Result<Vec<Health>> {
 
 /// Links that have not refreshed in this many hours, and whose they are. A
 /// refused password is left out: it has had a word of its own, and saying both
-/// would be saying the same thing twice.
+/// would be saying the same thing twice. One banned is told nothing.
 pub async fn stalled_since(pool: &PgPool, hours: i64) -> Result<Vec<(Uuid, Uuid)>> {
-    let rows = sqlx::query(
-        "select a.id, a.user_id
-           from untis_accounts a
-           join sync_state s on s.untis_account_id = a.id
-          where a.enabled
-            and not a.credentials_rejected
-            and s.consecutive_fails > 0
-            and coalesce(s.last_ok_at, s.updated_at) < now() - make_interval(hours => $1::int)",
-    )
-    .bind(hours as i32)
-    .fetch_all(pool)
-    .await
-    .context("looking for stalled links")?;
+    let rows = sqlx::query(STALLED_SINCE_SQL.as_str())
+        .bind(hours as i32)
+        .fetch_all(pool)
+        .await
+        .context("looking for stalled links")?;
     Ok(rows.iter().map(|r| (r.get("id"), r.get("user_id"))).collect())
 }
 
@@ -1050,11 +1078,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ban_gate_is_in_every_outward_query() {
+    fn ban_gate_stands_before_calendars_school_google_and_mail() {
         for (name, sql) in [
             ("accounts_to_sync", ACCOUNTS_TO_SYNC_SQL.as_str()),
             ("refused_to_remind", REFUSED_TO_REMIND_SQL.as_str()),
             ("feed_by_token", FEED_BY_TOKEN_SQL.as_str()),
+            ("stalled_since", STALLED_SINCE_SQL.as_str()),
         ] {
             assert!(sql.contains(people::ADMITTED_SQL), "{name} lacketh the gate");
             assert!(

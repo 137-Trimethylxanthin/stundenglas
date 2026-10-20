@@ -54,6 +54,15 @@ async fn forget_the_unconfirmed(state: &AppState) {
     };
     let mut gone = 0;
     for who in stale {
+        // They may have followed the link since they were found.
+        match crate::db::still_unconfirmed(&state.pool, who).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(err) => {
+                tracing::warn!(user = %who, "could not ask again about a sign-up: {err:#}");
+                continue;
+            }
+        }
         match crate::auth::delete_user(state, who).await {
             Ok(()) => gone += 1,
             Err(err) => {

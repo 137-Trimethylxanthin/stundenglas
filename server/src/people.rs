@@ -34,8 +34,10 @@ fn profile_from(row: &sqlx::postgres::PgRow) -> Profile {
     }
 }
 
-/// Called the moment an account is made. An address named in ADMIN_EMAILS is
-/// admitted at once and may admit others; everyone else waits.
+/// Called the moment an account is made, and at every sign-in. An address
+/// named in ADMIN_EMAILS is admitted at once and may admit others; everyone
+/// else waits. An address once banned is banned again from the first moment,
+/// though the account that earned the ban be long deleted.
 pub async fn on_signup(
     pool: &PgPool,
     user: Uuid,
@@ -44,12 +46,19 @@ pub async fn on_signup(
 ) -> Result<Profile> {
     let privileged = admin_emails.iter().any(|a| a.eq_ignore_ascii_case(email));
     let row = sqlx::query(
-        "insert into profiles (user_id, email, approved, is_admin, approved_at)
-         values ($1, $2, $3, $3, case when $3 then now() else null end)
+        "insert into profiles (user_id, email, approved, is_admin, approved_at, banned_at)
+         values ($1, $2, $3, $3, case when $3 then now() else null end,
+                 case when $3 then null
+                      else (select b.banned_at from banned_addresses b
+                             where b.address = lower(btrim($2)))
+                 end)
          on conflict (user_id) do update
             set email = excluded.email,
                 is_admin = profiles.is_admin or excluded.is_admin,
-                approved = profiles.approved or excluded.approved
+                approved = profiles.approved or excluded.approved,
+                banned_at = coalesce(
+                    profiles.banned_at,
+                    case when profiles.is_admin then null else excluded.banned_at end)
          returning user_id, email, approved, is_admin, banned_at, created_at",
     )
     .bind(user)
@@ -110,20 +119,43 @@ pub async fn admit(pool: &PgPool, who: Uuid) -> Result<()> {
     Ok(())
 }
 
-/// Bar one, or lift the bar. A ban also shutteth every open session. An admin
-/// may not be barred, and this doth nothing to one.
+/// Bar one, or lift the bar. A ban also shutteth every open session, and is
+/// written against the address too, that deleting the account and making it
+/// anew may not shake it off; lifting it forgetteth the address. An admin may
+/// not be barred, and this doth nothing to one.
 pub async fn set_banned(pool: &PgPool, who: Uuid, banned: bool) -> Result<()> {
-    let done = sqlx::query(
-        "update profiles
-            set banned_at = case when $2 then now() else null end
-          where user_id = $1 and not is_admin",
+    let touched: i64 = sqlx::query_scalar(
+        "with done as (
+             update profiles
+                set banned_at = case when $2 then now() else null end
+              where user_id = $1 and not is_admin
+             returning email, banned_at
+         ), marked as (
+             insert into banned_addresses (address, banned_at)
+             select lower(btrim(email)), banned_at from done
+              where $2 and coalesce(btrim(email), '') <> ''
+             on conflict (address) do update set banned_at = excluded.banned_at
+             returning 1
+         ), cleared as (
+             delete from banned_addresses b
+              using done
+              where not $2 and b.address = lower(btrim(done.email))
+             returning 1
+         )
+         select count(*) from done",
     )
     .bind(who)
     .bind(banned)
-    .execute(pool)
-    .await?;
-    if banned && done.rows_affected() > 0 {
-        crate::auth::close_all_sessions(pool, who).await;
+    .fetch_one(pool)
+    .await
+    .context("recording the ban")?;
+    if banned
+        && touched > 0
+        && let Err(err) = crate::auth::close_all_sessions(pool, who).await
+    {
+        // The ban is recorded, and every request asketh afresh whether one is
+        // in; a session left open is shut at its next knock.
+        tracing::warn!(user = %who, "banned, but the sessions were not closed: {err:#}");
     }
     Ok(())
 }

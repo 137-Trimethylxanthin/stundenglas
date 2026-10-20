@@ -344,9 +344,15 @@ pub async fn close_session(pool: &PgPool, token: &str) {
         .await;
 }
 
-/// Shut every session a person hath, as when they are banned.
-pub async fn close_all_sessions(pool: &PgPool, user: Uuid) {
-    let _ = sqlx::query("delete from sessions where user_id = $1").bind(user).execute(pool).await;
+/// Shut every session a person hath, as when they are banned or their
+/// password is reset.
+pub async fn close_all_sessions(pool: &PgPool, user: Uuid) -> Result<()> {
+    sqlx::query("delete from sessions where user_id = $1")
+        .bind(user)
+        .execute(pool)
+        .await
+        .context("closing every session")?;
+    Ok(())
 }
 
 /// Sweep away what hath expired, so the table doth not grow for ever.
